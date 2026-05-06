@@ -1,0 +1,7 @@
+results/
+logs/
+gridpacks/
+MadGraph/
+__pycache__/
+*.pyc
+.madbench_state/

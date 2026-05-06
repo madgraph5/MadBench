@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "madbench"
+version = "0.1.0"
+description = "Lightweight benchmarking framework for MadGraph performance tests"
+requires-python = ">=3.9"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+plot = ["plotly>=5.0", "pandas>=1.5"]
+dev = ["pytest>=7.0", "ruff"]
+all = ["madbench[plot]"]
+
+[project.scripts]
+madbench = "madbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+madbench = ["templates/*"]
