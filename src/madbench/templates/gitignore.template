@@ -1,5 +1,6 @@
 results/
 logs/
+scratch/
 gridpacks/
 MadGraph/
 __pycache__/

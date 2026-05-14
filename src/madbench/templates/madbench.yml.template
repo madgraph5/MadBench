@@ -1,11 +1,11 @@
 # MadBench workspace configuration
 workspace:
   scripts_dir: scripts
-  configs_dir: configs
   tests_dir: tests
   plots_dir: plots
   results_dir: results
   logs_dir: logs
+  scratch_dir: scratch
 
 defaults: {}
   # madgraph: MadGraph/dev

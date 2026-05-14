@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -16,11 +17,11 @@ class WorkspaceConfig:
 
     root: Path
     scripts_dir: Path
-    configs_dir: Path
     tests_dir: Path
     plots_dir: Path
     results_dir: Path
     logs_dir: Path
+    scratch_dir: Path
     defaults: dict = field(default_factory=dict)
 
 
@@ -60,11 +61,11 @@ def _parse_workspace(root: Path, marker: Path) -> WorkspaceConfig:
     return WorkspaceConfig(
         root=root,
         scripts_dir=resolve("scripts_dir", "scripts"),
-        configs_dir=resolve("configs_dir", "configs"),
         tests_dir=resolve("tests_dir", "tests"),
         plots_dir=resolve("plots_dir", "plots"),
         results_dir=resolve("results_dir", "results"),
         logs_dir=resolve("logs_dir", "logs"),
+        scratch_dir=resolve("scratch_dir", "scratch"),
         defaults=defaults,
     )
 
@@ -88,26 +89,60 @@ def resolve_script(ws: WorkspaceConfig, script_name: str) -> Path:
     return script_path
 
 
-def resolve_configs(ws: WorkspaceConfig, config_names: list[str]) -> list[Path]:
-    """Resolve config names relative to ws.configs_dir."""
-    resolved = []
-    missing = []
-    for name in config_names:
-        p = (ws.configs_dir / name).resolve()
-        if not p.exists():
-            missing.append(str(p))
-        else:
-            resolved.append(p)
-    if missing:
-        raise FileNotFoundError(
-            "Config file(s) not found:\n" + "\n".join(f"  {m}" for m in missing)
-        )
-    return resolved
-
-
 def resolve_plot_module(ws: WorkspaceConfig, plot_name: str) -> Optional[Path]:
     """Resolve a plot module name to plots/<name>.py. Return None if not declared."""
     if not plot_name:
         return None
     p = (ws.plots_dir / f"{plot_name}.py").resolve()
     return p if p.exists() else None
+
+
+def stage_inputs(
+    workspace_root: Path,
+    patterns: list[str],
+    dest_dir: Path,
+) -> list[Path]:
+    """Copy workspace-relative paths/globs into ``dest_dir`` preserving structure.
+
+    Each pattern is interpreted relative to ``workspace_root`` and expanded with
+    ``Path.glob``. Matched files are copied to ``dest_dir/<their workspace-relative
+    path>``; matched directories are copied recursively. Returns the list of
+    destination paths created.
+
+    Raises FileNotFoundError if a pattern matches nothing (catches typos).
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+
+    for pattern in patterns:
+        # Path.glob with a fixed (non-glob) pattern returns nothing, so detect
+        # the literal case and handle it separately.
+        if any(ch in pattern for ch in "*?["):
+            matches = sorted(workspace_root.glob(pattern))
+        else:
+            literal = (workspace_root / pattern).resolve()
+            matches = [literal] if literal.exists() else []
+
+        if not matches:
+            raise FileNotFoundError(
+                f"inputs pattern matched nothing: {pattern!r} "
+                f"(workspace root: {workspace_root})"
+            )
+
+        for src in matches:
+            try:
+                rel = src.resolve().relative_to(workspace_root.resolve())
+            except ValueError:
+                raise ValueError(
+                    f"inputs pattern {pattern!r} matched a path outside the "
+                    f"workspace: {src}"
+                )
+            target = dest_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, target)
+            created.append(target)
+
+    return created

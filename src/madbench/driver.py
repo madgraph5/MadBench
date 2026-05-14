@@ -2,20 +2,30 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import json
+import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
-
 from .utils import detect_hardware, get_git_sha, get_timestamp
-from .workspace import WorkspaceConfig, find_workspace, resolve_configs, resolve_plot_module, resolve_script
+from .workspace import (
+    WorkspaceConfig,
+    find_workspace,
+    resolve_plot_module,
+    resolve_script,
+    stage_inputs,
+)
 from ._logging import TeeLogger, bundle_logs
+from .results import append_row, select_results_csv
 
 
 _REQUIRED_FIELDS = {"name", "script", "args", "result_group"}
+
+OUTPUT_FILE_NAME = ".madbench_output.json"
 
 
 @dataclass
@@ -25,11 +35,14 @@ class TestDefinition:
     name: str
     description: str
     script: str
-    configs: list[str]
-    args: dict[str, Any]       # values can be scalars or lists
+    args: dict[str, Any]              # values can be scalars or lists
     result_group: str
-    plot: Optional[str]
-    raw: dict                  # the full parsed YAML, stored in metadata
+    inputs: list[str] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    output_files: list[str] = field(default_factory=list)
+    workdir: Optional[str] = None
+    plot: Optional[str] = None
+    raw: dict = field(default_factory=dict)
     zip_groups: list[list[str]] = field(default_factory=list)
     # Each inner list is a group of arg names whose list values are zipped
     # together (must be equal length). Each group contributes a single axis
@@ -53,6 +66,14 @@ def _normalize_zip_groups(raw_zip: Any) -> list[list[str]]:
         "'zip' must be a list of arg names (single group) "
         "or a list of lists of arg names (multiple groups)"
     )
+
+
+def _as_str_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise ValueError(f"{field_name!r} must be a list of strings")
+    return list(value)
 
 
 class MadBench:
@@ -79,6 +100,8 @@ class MadBench:
 
         `test_path` can be absolute or relative to cwd.
         """
+        import yaml
+
         path = test_path if test_path.is_absolute() else Path.cwd() / test_path
         if not path.exists():
             raise FileNotFoundError(f"Test file not found: {path}")
@@ -97,134 +120,44 @@ class MadBench:
             name=raw["name"],
             description=raw.get("description", ""),
             script=raw["script"],
-            configs=raw.get("configs", []) or [],
             args=raw["args"] or {},
             result_group=raw["result_group"],
+            inputs=_as_str_list(raw.get("inputs"), "inputs"),
+            outputs=_as_str_list(raw.get("outputs"), "outputs"),
+            output_files=_as_str_list(raw.get("output_files"), "output_files"),
+            workdir=raw.get("workdir"),
             plot=raw.get("plot"),
             raw=raw,
             zip_groups=_normalize_zip_groups(raw.get("zip")),
         )
 
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
-        """Build the list of commands to execute.
-
-        Arguments are passed as positional args in the order they appear
-        in the YAML ``args`` dict. List-valued args produce one command per
-        value; multiple list-valued args produce the cartesian product.
-
-        Args listed in a ``zip`` group vary together (one axis of the
-        product) instead of independently. Members of a zip group must all
-        be lists of equal length.
-
-        Example — pure cartesian::
-
-            args:
-              ncores: [1, 2]
-              nevents: [100, 200]
-              seed: 42
-
-        Produces 4 commands: (1, 100, 42), (1, 200, 42), (2, 100, 42),
-        (2, 200, 42).
-
-        Example — zip group + cartesian::
-
-            args:
-              ncores: [1, 2, 4]
-              nevents: [1000, 1000000]
-              timeout: [10, 600]
-              seed: 42
-            zip: [nevents, timeout]
-
-        Produces 3 * 2 = 6 commands; ``nevents`` and ``timeout`` always
-        appear paired ((1000, 10) or (1000000, 600)).
-        """
+        """Build the list of commands to execute (positional args only)."""
         script_path = resolve_script(self.workspace, test.script)
-
-        self._validate_zip_groups(test)
-
-        # Map each zipped arg name to its group index; zipped args do not
-        # form independent axes.
-        name_to_group: dict[str, int] = {}
-        for i, group in enumerate(test.zip_groups):
-            for name in group:
-                name_to_group[name] = i
-
-        # Build axes in args insertion order. A zip group is placed at the
-        # position of its first member; later members of the same group are
-        # absorbed. Each axis yields a list of {arg_name: value} mappings.
-        axes: list[list[dict[str, Any]]] = []
-        emitted_groups: set[int] = set()
-        for k, v in test.args.items():
-            if k in name_to_group:
-                gi = name_to_group[k]
-                if gi in emitted_groups:
-                    continue
-                emitted_groups.add(gi)
-                group = test.zip_groups[gi]
-                tuples = zip(*(test.args[n] for n in group))
-                axes.append([dict(zip(group, t)) for t in tuples])
-            elif isinstance(v, list):
-                axes.append([{k: item} for item in v])
-            # scalars contribute no axis
-
-        commands = []
-        for combo in itertools.product(*axes):
-            overrides: dict[str, Any] = {}
-            for piece in combo:
-                overrides.update(piece)
-            positional = [
-                str(overrides.get(k, v)) for k, v in test.args.items()
-            ]
-            commands.append([str(script_path)] + positional)
-
-        return commands
-
-    @staticmethod
-    def _validate_zip_groups(test: TestDefinition) -> None:
-        seen: dict[str, int] = {}
-        for i, group in enumerate(test.zip_groups):
-            if not group:
-                raise ValueError(f"zip group at index {i} is empty")
-            for name in group:
-                if name in seen:
-                    raise ValueError(
-                        f"arg {name!r} appears in more than one zip group "
-                        f"(groups {seen[name]} and {i})"
-                    )
-                seen[name] = i
-                if name not in test.args:
-                    raise ValueError(
-                        f"zip group references unknown arg {name!r}; "
-                        f"known args: {list(test.args)}"
-                    )
-                if not isinstance(test.args[name], list):
-                    raise ValueError(
-                        f"zip group member {name!r} must be a list, "
-                        f"got {type(test.args[name]).__name__}"
-                    )
-            lengths = {len(test.args[n]) for n in group}
-            if len(lengths) > 1:
-                detail = ", ".join(f"{n}={len(test.args[n])}" for n in group)
-                raise ValueError(
-                    f"zip group {group} has mismatched lengths: {detail}"
-                )
+        combos = self._build_arg_combos(test)
+        return [
+            [str(script_path)] + [str(combo[k]) for k in test.args]
+            for combo in combos
+        ]
 
     def run(self, test_path: Path, dry_run: bool = False) -> None:
         """Main entry point. Loads the test, builds commands, runs them."""
         test = self.load_test(test_path)
-
-        # Resolve script and configs early (fail fast)
         script_path = resolve_script(self.workspace, test.script)
-        config_paths = resolve_configs(self.workspace, test.configs)
 
-        commands = self.build_commands(test)
+        combos = self._build_arg_combos(test)
+        commands = [
+            [str(script_path)] + [str(combo[k]) for k in test.args]
+            for combo in combos
+        ]
 
-        # Prepare directories
-        result_dir = self.workspace.results_dir / test.result_group
         timestamp = get_timestamp()
+        workdir_base = self._resolve_workdir(test)
+        run_dir = workdir_base / f"{test.name}_{timestamp}"
+        inputs_dir = run_dir / "inputs"
+        result_dir = self.workspace.results_dir / test.result_group
         run_log_dir = self.workspace.logs_dir / f"{test.name}_{timestamp}"
 
-        # Gather metadata
         git_sha = get_git_sha(self.workspace.root)
         hardware = detect_hardware()
         metadata: dict[str, Any] = {
@@ -236,29 +169,27 @@ class MadBench:
             "test_definition": test.raw,
             "commands": [" ".join(cmd) for cmd in commands],
             "script": str(script_path),
-            "configs": [str(p) for p in config_paths],
+            "run_dir": str(run_dir),
             "result_dir": str(result_dir),
             "dry_run": dry_run,
         }
 
         if dry_run:
-            print("[madbench] DRY RUN — no files will be created or scripts executed")
-            print(f"[madbench] Test: {test.name}")
-            print(f"[madbench] Script: {script_path}")
-            if config_paths:
-                print(f"[madbench] Configs: {[str(p) for p in config_paths]}")
-            print(f"[madbench] Result dir: {result_dir}")
-            print(f"[madbench] Commands ({len(commands)}):")
-            for cmd in commands:
-                print(f"  {' '.join(cmd)}")
-            print(f"[madbench] Metadata:")
-            import yaml as _yaml
-            print(_yaml.dump(metadata, default_flow_style=False, allow_unicode=True))
+            self._print_dry_run(test, script_path, run_dir, result_dir, commands, metadata)
             return
 
-        # Create directories
+        # Prepare run dir + inputs (once per madbench run)
+        run_dir.mkdir(parents=True, exist_ok=True)
         result_dir.mkdir(parents=True, exist_ok=True)
         run_log_dir.mkdir(parents=True, exist_ok=True)
+        if test.inputs:
+            stage_inputs(self.workspace.root, test.inputs, inputs_dir)
+        else:
+            inputs_dir.mkdir(parents=True, exist_ok=True)
+
+        # CSV setup
+        csv_header = self._csv_header(test)
+        csv_path, write_header = select_results_csv(result_dir, csv_header)
 
         main_log = run_log_dir / "main.log"
         archive_path = self.workspace.logs_dir / f"{test.name}_{timestamp}.tar.gz"
@@ -268,16 +199,32 @@ class MadBench:
 
         try:
             with TeeLogger(main_log) as tee:
-                for i, cmd in enumerate(commands, 1):
-                    header = f"=== Running ({i}/{len(commands)}): {' '.join(cmd)} ==="
+                for i, (cmd, combo) in enumerate(zip(commands, combos), 1):
+                    invocation_id = f"invocation_{i:03d}"
+                    invocation_dir = run_dir / invocation_id
+                    invocation_dir.mkdir(parents=True, exist_ok=True)
+                    output_file = invocation_dir / OUTPUT_FILE_NAME
+
+                    env = os.environ.copy()
+                    env["MADBENCH_WORKDIR"] = str(invocation_dir)
+                    env["MADBENCH_INPUTS"] = str(inputs_dir)
+                    env["MADBENCH_OUTPUT_FILE"] = str(output_file)
+
+                    header = (
+                        f"=== Running ({i}/{len(commands)}): {' '.join(cmd)} "
+                        f"[{invocation_id}] ==="
+                    )
                     print(header)
 
+                    invocation_ts = get_timestamp()
                     cmd_start = time.monotonic()
                     try:
                         proc = subprocess.Popen(
                             cmd,
                             stdout=tee.write_fd,
                             stderr=subprocess.STDOUT,
+                            cwd=invocation_dir,
+                            env=env,
                             close_fds=True,
                         )
                         exit_code = proc.wait()
@@ -285,31 +232,60 @@ class MadBench:
                         proc.terminate()
                         proc.wait()
                         exit_code = -2
+                        wall_time = time.monotonic() - cmd_start
+                        self._finalize_invocation(
+                            test, combo, invocation_id, invocation_dir, output_file,
+                            result_dir, csv_path, csv_header, write_header,
+                            invocation_ts, exit_code, wall_time,
+                        )
+                        results.append({
+                            "command": " ".join(cmd),
+                            "invocation_id": invocation_id,
+                            "exit_code": exit_code,
+                            "wall_time": round(wall_time, 2),
+                        })
+                        write_header = False
                         print("\n[madbench] Interrupted by user.")
-                        results.append({"command": " ".join(cmd), "exit_code": exit_code, "wall_time": time.monotonic() - cmd_start})
                         raise
 
                     wall_time = time.monotonic() - cmd_start
-                    results.append({"command": " ".join(cmd), "exit_code": exit_code, "wall_time": round(wall_time, 2)})
+                    self._finalize_invocation(
+                        test, combo, invocation_id, invocation_dir, output_file,
+                        result_dir, csv_path, csv_header, write_header,
+                        invocation_ts, exit_code, wall_time,
+                    )
+                    write_header = False
+                    results.append({
+                        "command": " ".join(cmd),
+                        "invocation_id": invocation_id,
+                        "exit_code": exit_code,
+                        "wall_time": round(wall_time, 2),
+                    })
 
         except KeyboardInterrupt:
             print("[madbench] Interrupted — bundling partial logs...")
         finally:
             metadata["results"] = results
             metadata["total_wall_time"] = round(time.monotonic() - wall_start, 2)
+            metadata["csv_path"] = str(csv_path)
             bundle_logs(run_log_dir, main_log, metadata, archive_path)
 
-        # Summary
         total_time = time.monotonic() - wall_start
         print(f"\n[madbench] Run complete in {total_time:.1f}s")
         for r in results:
             status = "OK" if r["exit_code"] == 0 else f"FAILED (exit {r['exit_code']})"
-            print(f"  [{status}] {r['command']}  ({r['wall_time']}s)")
+            print(f"  [{status}] {r['invocation_id']}  {r['command']}  ({r['wall_time']}s)")
+        print(f"[madbench] Workdir: {run_dir}")
+        print(f"[madbench] Results CSV: {csv_path}")
         print(f"[madbench] Log archive: {archive_path}")
 
     def plot(self, test_path: Path) -> None:
-        """Load the test, find its plot module, import it, call plot()
-        with the result path, and display the figure with plotly.io.show().
+        """Load the test, import its plot module, call ``plot(result_path)``,
+        and display the figure with ``plotly.io.show()``.
+
+        ``result_path`` is ``results/<result_group>/``; modules typically
+        read ``result_path / 'results.csv'`` but may also descend into the
+        per-invocation subdirectories for additional files.
         """
         try:
             import plotly.io as pio
@@ -358,7 +334,6 @@ class MadBench:
             try:
                 test = self.load_test(yml_file)
             except (ValueError, KeyError):
-                # Malformed YAML — still report the file
                 results.append({
                     "name": yml_file.stem,
                     "path": str(yml_file),
@@ -382,3 +357,221 @@ class MadBench:
             })
 
         return results
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_arg_combos(self, test: TestDefinition) -> list[dict[str, Any]]:
+        """Return one dict per invocation, mapping every arg name to its
+        resolved value for that sweep point. Scalars carry through unchanged;
+        list-valued args expand into cartesian product; zip groups contribute
+        a single paired axis.
+        """
+        self._validate_zip_groups(test)
+
+        name_to_group: dict[str, int] = {}
+        for i, group in enumerate(test.zip_groups):
+            for name in group:
+                name_to_group[name] = i
+
+        axes: list[list[dict[str, Any]]] = []
+        emitted_groups: set[int] = set()
+        for k, v in test.args.items():
+            if k in name_to_group:
+                gi = name_to_group[k]
+                if gi in emitted_groups:
+                    continue
+                emitted_groups.add(gi)
+                group = test.zip_groups[gi]
+                tuples = zip(*(test.args[n] for n in group))
+                axes.append([dict(zip(group, t)) for t in tuples])
+            elif isinstance(v, list):
+                axes.append([{k: item} for item in v])
+
+        combos = []
+        for combo in itertools.product(*axes):
+            overrides: dict[str, Any] = {}
+            for piece in combo:
+                overrides.update(piece)
+            resolved = {k: overrides.get(k, v) for k, v in test.args.items()}
+            combos.append(resolved)
+        return combos
+
+    @staticmethod
+    def _validate_zip_groups(test: TestDefinition) -> None:
+        seen: dict[str, int] = {}
+        for i, group in enumerate(test.zip_groups):
+            if not group:
+                raise ValueError(f"zip group at index {i} is empty")
+            for name in group:
+                if name in seen:
+                    raise ValueError(
+                        f"arg {name!r} appears in more than one zip group "
+                        f"(groups {seen[name]} and {i})"
+                    )
+                seen[name] = i
+                if name not in test.args:
+                    raise ValueError(
+                        f"zip group references unknown arg {name!r}; "
+                        f"known args: {list(test.args)}"
+                    )
+                if not isinstance(test.args[name], list):
+                    raise ValueError(
+                        f"zip group member {name!r} must be a list, "
+                        f"got {type(test.args[name]).__name__}"
+                    )
+            lengths = {len(test.args[n]) for n in group}
+            if len(lengths) > 1:
+                detail = ", ".join(f"{n}={len(test.args[n])}" for n in group)
+                raise ValueError(
+                    f"zip group {group} has mismatched lengths: {detail}"
+                )
+
+    def _resolve_workdir(self, test: TestDefinition) -> Path:
+        if not test.workdir:
+            return self.workspace.scratch_dir
+        p = Path(test.workdir)
+        if not p.is_absolute():
+            p = self.workspace.root / p
+        return p.resolve()
+
+    def _csv_header(self, test: TestDefinition) -> list[str]:
+        return (
+            ["timestamp"]
+            + list(test.args.keys())
+            + list(test.outputs)
+            + ["exit_code", "wall_time", "invocation_id"]
+        )
+
+    def _finalize_invocation(
+        self,
+        test: TestDefinition,
+        combo: dict[str, Any],
+        invocation_id: str,
+        invocation_dir: Path,
+        output_file: Path,
+        result_dir: Path,
+        csv_path: Path,
+        csv_header: list[str],
+        write_header: bool,
+        invocation_ts: str,
+        exit_code: int,
+        wall_time: float,
+    ) -> None:
+        """Post-script: read outputs JSON, copy output_files, append CSV row."""
+        output_values = self._read_outputs_json(test, output_file)
+        self._copy_output_files(test, combo, invocation_dir, result_dir / invocation_id)
+
+        row: dict[str, Any] = {
+            "timestamp": invocation_ts,
+            "exit_code": exit_code,
+            "wall_time": round(wall_time, 2),
+            "invocation_id": invocation_id,
+        }
+        for k in test.args:
+            row[k] = combo[k]
+        for k in test.outputs:
+            row[k] = output_values.get(k, "")
+
+        append_row(csv_path, csv_header, row, write_header)
+
+    def _read_outputs_json(
+        self,
+        test: TestDefinition,
+        output_file: Path,
+    ) -> dict[str, Any]:
+        if not test.outputs:
+            return {}
+        if not output_file.exists():
+            print(
+                f"[madbench] WARN: declared 'outputs' but {output_file.name} "
+                f"was not written by the script ({output_file})"
+            )
+            return {}
+        try:
+            values = json.loads(output_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[madbench] WARN: failed to parse {output_file}: {e}")
+            return {}
+        if not isinstance(values, dict):
+            print(
+                f"[madbench] WARN: {output_file} must contain a JSON object, "
+                f"got {type(values).__name__}"
+            )
+            return {}
+
+        declared = set(test.outputs)
+        provided = set(values.keys())
+        missing = declared - provided
+        extra = provided - declared
+        if missing:
+            print(
+                f"[madbench] WARN: output keys missing from {output_file.name}: "
+                f"{sorted(missing)}"
+            )
+        if extra:
+            print(
+                f"[madbench] WARN: keys in {output_file.name} not declared in "
+                f"'outputs': {sorted(extra)}"
+            )
+        return values
+
+    def _copy_output_files(
+        self,
+        test: TestDefinition,
+        combo: dict[str, Any],
+        invocation_dir: Path,
+        dest_dir: Path,
+    ) -> None:
+        if not test.output_files:
+            return
+        for pattern in test.output_files:
+            try:
+                resolved = pattern.format_map(combo)
+            except KeyError as e:
+                print(
+                    f"[madbench] WARN: output_files entry {pattern!r} "
+                    f"references unknown arg {e}"
+                )
+                continue
+            src = invocation_dir / resolved
+            if not src.exists():
+                print(f"[madbench] WARN: declared output_file missing: {src}")
+                continue
+            target = dest_dir / resolved
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, target)
+
+    def _print_dry_run(
+        self,
+        test: TestDefinition,
+        script_path: Path,
+        run_dir: Path,
+        result_dir: Path,
+        commands: list[list[str]],
+        metadata: dict,
+    ) -> None:
+        import yaml as _yaml
+
+        print("[madbench] DRY RUN — no files will be created or scripts executed")
+        print(f"[madbench] Test: {test.name}")
+        print(f"[madbench] Script: {script_path}")
+        print(f"[madbench] Run dir: {run_dir}")
+        print(f"[madbench] Result dir: {result_dir}")
+        if test.inputs:
+            print(f"[madbench] Inputs (staged into {run_dir / 'inputs'}):")
+            for pat in test.inputs:
+                print(f"  {pat}")
+        if test.outputs:
+            print(f"[madbench] Outputs (CSV columns): {test.outputs}")
+        if test.output_files:
+            print(f"[madbench] Output files (per invocation): {test.output_files}")
+        print(f"[madbench] Commands ({len(commands)}):")
+        for cmd in commands:
+            print(f"  {' '.join(cmd)}")
+        print("[madbench] Metadata:")
+        print(_yaml.dump(metadata, default_flow_style=False, allow_unicode=True))

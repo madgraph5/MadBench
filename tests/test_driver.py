@@ -15,23 +15,23 @@ def make_workspace(tmp_path: Path) -> Path:
     config = {
         "workspace": {
             "scripts_dir": "scripts",
-            "configs_dir": "configs",
             "tests_dir": "tests",
             "plots_dir": "plots",
             "results_dir": "results",
             "logs_dir": "logs",
+            "scratch_dir": "scratch",
         },
         "defaults": {},
     }
     (tmp_path / "madbench.yml").write_text(yaml.dump(config))
-    for d in ["scripts", "configs", "tests", "plots", "results", "logs"]:
+    for d in ["scripts", "tests", "plots", "results", "logs", "scratch"]:
         (tmp_path / d).mkdir()
     return tmp_path
 
 
-def make_script(ws_root: Path, name: str = "hello.sh") -> Path:
+def make_script(ws_root: Path, name: str = "hello.sh", body: str | None = None) -> Path:
     script = ws_root / "scripts" / name
-    script.write_text("#!/bin/bash\necho \"hello $@\"\n")
+    script.write_text(body or "#!/bin/bash\necho \"hello $@\"\n")
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return script
 
@@ -56,7 +56,6 @@ def test_load_test_basic(tmp_path):
         "name": "mytest",
         "description": "A test",
         "script": "hello.sh",
-        "configs": [],
         "args": {"ncores": 1, "nevents": 100},
         "result_group": "mygroup",
     }
@@ -66,6 +65,34 @@ def test_load_test_basic(tmp_path):
     assert td.name == "mytest"
     assert td.script == "hello.sh"
     assert td.args == {"ncores": 1, "nevents": 100}
+    assert td.inputs == []
+    assert td.outputs == []
+    assert td.output_files == []
+    assert td.workdir is None
+
+
+def test_load_test_with_new_fields(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "t",
+        "script": "hello.sh",
+        "args": {"seed": 42},
+        "result_group": "g",
+        "inputs": ["config/*", "data/x.txt"],
+        "outputs": ["throughput", "note"],
+        "output_files": ["out.log", "gridpack_{seed}/timings.txt"],
+        "workdir": "/tmp/madbench-test",
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    td = mb.load_test(test_file)
+
+    assert td.inputs == ["config/*", "data/x.txt"]
+    assert td.outputs == ["throughput", "note"]
+    assert td.output_files == ["out.log", "gridpack_{seed}/timings.txt"]
+    assert td.workdir == "/tmp/madbench-test"
 
 
 def test_load_test_missing_fields(tmp_path):
@@ -91,8 +118,8 @@ def test_build_commands_scalar_only(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"ncores": 4, "nevents": 100, "seed": 42},
-        result_group="grp", plot=None, raw={},
+        args={"ncores": 4, "nevents": 100, "seed": 42},
+        result_group="grp",
     )
     cmds = mb.build_commands(td)
     assert len(cmds) == 1
@@ -107,8 +134,8 @@ def test_build_commands_one_list(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"ncores": [1, 2, 4], "nevents": 100},
-        result_group="grp", plot=None, raw={},
+        args={"ncores": [1, 2, 4], "nevents": 100},
+        result_group="grp",
     )
     cmds = mb.build_commands(td)
     assert len(cmds) == 3
@@ -125,8 +152,8 @@ def test_build_commands_cartesian(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"ncores": [1, 2], "nevents": [100, 200], "seed": 42},
-        result_group="grp", plot=None, raw={},
+        args={"ncores": [1, 2], "nevents": [100, 200], "seed": 42},
+        result_group="grp",
     )
     cmds = mb.build_commands(td)
     assert [c[1:] for c in cmds] == [
@@ -145,9 +172,8 @@ def test_build_commands_single_zip_group(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[],
         args={"nevents": [1000, 2000], "timeout": [10, 20], "seed": 42},
-        result_group="grp", plot=None, raw={},
+        result_group="grp",
         zip_groups=[["nevents", "timeout"]],
     )
     cmds = mb.build_commands(td)
@@ -165,18 +191,16 @@ def test_build_commands_zip_and_cartesian(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[],
         args={
             "ncores": [1, 2, 4],
             "nevents": [1000, 1_000_000],
             "timeout": [10, 600],
             "seed": 42,
         },
-        result_group="grp", plot=None, raw={},
+        result_group="grp",
         zip_groups=[["nevents", "timeout"]],
     )
     cmds = mb.build_commands(td)
-    # 3 (ncores) * 2 (zipped pair) = 6 runs; nevents/timeout always paired
     assert len(cmds) == 6
     pairs = {(c[2], c[3]) for c in cmds}
     assert pairs == {("1000", "10"), ("1000000", "600")}
@@ -192,18 +216,16 @@ def test_build_commands_multiple_zip_groups(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[],
         args={
             "a": [1, 2],
             "b": [10, 20],
             "c": ["x", "y", "z"],
             "d": ["X", "Y", "Z"],
         },
-        result_group="grp", plot=None, raw={},
+        result_group="grp",
         zip_groups=[["a", "b"], ["c", "d"]],
     )
     cmds = mb.build_commands(td)
-    # 2 * 3 = 6 runs
     assert len(cmds) == 6
     for c in cmds:
         a, b, cc, dd = c[1:]
@@ -219,8 +241,8 @@ def test_build_commands_zip_mismatched_length_raises(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"a": [1, 2], "b": [10, 20, 30]},
-        result_group="grp", plot=None, raw={},
+        args={"a": [1, 2], "b": [10, 20, 30]},
+        result_group="grp",
         zip_groups=[["a", "b"]],
     )
     with pytest.raises(ValueError, match="mismatched lengths"):
@@ -235,8 +257,8 @@ def test_build_commands_zip_unknown_arg_raises(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"a": [1, 2]},
-        result_group="grp", plot=None, raw={},
+        args={"a": [1, 2]},
+        result_group="grp",
         zip_groups=[["a", "missing"]],
     )
     with pytest.raises(ValueError, match="unknown arg"):
@@ -251,8 +273,8 @@ def test_build_commands_zip_scalar_member_raises(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"a": [1, 2], "b": 5},
-        result_group="grp", plot=None, raw={},
+        args={"a": [1, 2], "b": 5},
+        result_group="grp",
         zip_groups=[["a", "b"]],
     )
     with pytest.raises(ValueError, match="must be a list"):
@@ -267,8 +289,8 @@ def test_build_commands_zip_overlap_raises(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"a": [1, 2], "b": [3, 4], "c": [5, 6]},
-        result_group="grp", plot=None, raw={},
+        args={"a": [1, 2], "b": [3, 4], "c": [5, 6]},
+        result_group="grp",
         zip_groups=[["a", "b"], ["b", "c"]],
     )
     with pytest.raises(ValueError, match="more than one zip group"):
@@ -282,7 +304,6 @@ def test_load_test_zip_field_single_group(tmp_path):
 
     yaml_data = {
         "name": "z",
-        "description": "",
         "script": "hello.sh",
         "args": {"a": [1, 2], "b": [10, 20]},
         "result_group": "g",
@@ -300,7 +321,6 @@ def test_load_test_zip_field_multi_group(tmp_path):
 
     yaml_data = {
         "name": "z",
-        "description": "",
         "script": "hello.sh",
         "args": {"a": [1, 2], "b": [10, 20], "c": [3], "d": [30]},
         "result_group": "g",
@@ -326,7 +346,6 @@ def test_run_end_to_end(tmp_path):
         "name": "e2e_test",
         "description": "End-to-end smoke test",
         "script": "hello.sh",
-        "configs": [],
         "args": {"ncores": [1, 2], "nevents": 100},
         "result_group": "e2e",
     }
@@ -334,28 +353,28 @@ def test_run_end_to_end(tmp_path):
 
     mb.run(test_file)
 
-    # Check that a tar.gz was created in logs/
     archives = list((ws_root / "logs").glob("e2e_test_*.tar.gz"))
     assert len(archives) == 1
 
-    archive = archives[0]
-    with tarfile.open(archive) as tar:
+    with tarfile.open(archives[0]) as tar:
         names = tar.getnames()
         assert "main.log" in names
         assert "metadata.yml" in names
 
-        # Check metadata content
-        meta_f = tar.extractfile("metadata.yml")
-        assert meta_f is not None
-        meta = yaml.safe_load(meta_f.read())
+        meta = yaml.safe_load(tar.extractfile("metadata.yml").read())
         assert meta["test_name"] == "e2e_test"
         assert len(meta["commands"]) == 2
 
-        # Check main.log has output from both runs
-        log_f = tar.extractfile("main.log")
-        assert log_f is not None
-        log_content = log_f.read().decode()
+        log_content = tar.extractfile("main.log").read().decode()
         assert "hello" in log_content
+
+    # CSV exists with both invocations
+    csv_path = ws_root / "results" / "e2e" / "results.csv"
+    assert csv_path.exists()
+    lines = csv_path.read_text().splitlines()
+    assert len(lines) == 3  # header + 2 rows
+    assert "ncores" in lines[0]
+    assert "exit_code" in lines[0]
 
 
 def test_dry_run_no_side_effects(tmp_path, capsys):
@@ -366,22 +385,264 @@ def test_dry_run_no_side_effects(tmp_path, capsys):
 
     yaml_data = {
         "name": "dry_test",
-        "description": "",
         "script": "hello.sh",
-        "configs": [],
         "args": {"ncores": [1, 2], "nevents": 100},
         "result_group": "dry",
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file, dry_run=True)
 
-    # No archives or result dirs should have been created
     assert not any((ws_root / "logs").glob("*.tar.gz"))
     assert not (ws_root / "results" / "dry").exists()
+    assert not (ws_root / "scratch" / "dry_test").exists()
 
     captured = capsys.readouterr()
     assert "DRY RUN" in captured.out
     assert "hello.sh" in captured.out
+
+
+# -----------------------------------------------------------------------
+# inputs staging
+# -----------------------------------------------------------------------
+
+
+def test_run_stages_inputs(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    (ws_root / "config" / "Cards").mkdir(parents=True)
+    (ws_root / "config" / "Cards" / "card.dat").write_text("CARD")
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "staged",
+        "script": "hello.sh",
+        "args": {"x": 1},
+        "result_group": "g",
+        "inputs": ["config/Cards/*"],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    mb.run(test_file)
+
+    run_dirs = list((ws_root / "scratch").glob("staged_*"))
+    assert len(run_dirs) == 1
+    staged = run_dirs[0] / "inputs" / "config" / "Cards" / "card.dat"
+    assert staged.exists()
+    assert staged.read_text() == "CARD"
+
+
+# -----------------------------------------------------------------------
+# outputs JSON read and CSV
+# -----------------------------------------------------------------------
+
+
+def test_run_reads_outputs_json_and_writes_csv(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    # Script writes a JSON object to MADBENCH_OUTPUT_FILE
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"running with $@\"\n"
+            "echo \"{\\\"throughput\\\": $1, \\\"note\\\": \\\"ok\\\"}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "without",
+        "script": "hello.sh",
+        "args": {"throughput": [10, 20]},
+        "result_group": "g",
+        "outputs": ["throughput", "note"],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    mb.run(test_file)
+
+    csv_path = ws_root / "results" / "g" / "results.csv"
+    rows = csv_path.read_text().splitlines()
+    header = rows[0].split(",")
+    # arg `throughput` and output `throughput` collide on column name; this
+    # is by design (later declaration wins in dict, and we expect users to
+    # avoid the collision in practice). Just check that "note" landed.
+    assert "note" in header
+    # Both data rows have note=ok
+    assert "ok" in rows[1]
+    assert "ok" in rows[2]
+
+
+def test_run_missing_outputs_json_writes_blanks(tmp_path, capsys):
+    ws_root = make_workspace(tmp_path)
+    # Script does NOT write MADBENCH_OUTPUT_FILE
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "missing",
+        "script": "hello.sh",
+        "args": {"x": 1},
+        "result_group": "g",
+        "outputs": ["throughput"],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    mb.run(test_file)
+
+    csv_path = ws_root / "results" / "g" / "results.csv"
+    rows = csv_path.read_text().splitlines()
+    assert len(rows) == 2  # header + 1 row
+    # 'throughput' column exists, value is empty
+    header = rows[0].split(",")
+    throughput_idx = header.index("throughput")
+    cells = rows[1].split(",")
+    assert cells[throughput_idx] == ""
+
+    captured = capsys.readouterr()
+    assert "was not written" in captured.out
+
+
+# -----------------------------------------------------------------------
+# output_files copy
+# -----------------------------------------------------------------------
+
+
+def test_run_copies_output_files_with_arg_substitution(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "seed=$1\n"
+            "mkdir -p \"gridpack_${seed}\"\n"
+            "echo \"timings for $seed\" > \"gridpack_${seed}/timings.txt\"\n"
+        ),
+    )
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "copy_outputs",
+        "script": "hello.sh",
+        "args": {"seed": [1, 2]},
+        "result_group": "g",
+        "output_files": ["gridpack_{seed}/timings.txt"],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    mb.run(test_file)
+
+    inv1 = ws_root / "results" / "g" / "invocation_001" / "gridpack_1" / "timings.txt"
+    inv2 = ws_root / "results" / "g" / "invocation_002" / "gridpack_2" / "timings.txt"
+    assert inv1.exists() and inv1.read_text().strip() == "timings for 1"
+    assert inv2.exists() and inv2.read_text().strip() == "timings for 2"
+
+
+def test_run_missing_output_file_warns(tmp_path, capsys):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)  # writes nothing
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "missing_file",
+        "script": "hello.sh",
+        "args": {"x": 1},
+        "result_group": "g",
+        "output_files": ["does_not_exist.log"],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    mb.run(test_file)
+
+    captured = capsys.readouterr()
+    assert "output_file missing" in captured.out
+
+
+# -----------------------------------------------------------------------
+# env var wiring
+# -----------------------------------------------------------------------
+
+
+def test_run_sets_env_vars(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"WORKDIR=$MADBENCH_WORKDIR\"\n"
+            "echo \"INPUTS=$MADBENCH_INPUTS\"\n"
+            "echo \"OUTPUT_FILE=$MADBENCH_OUTPUT_FILE\"\n"
+            "echo \"CWD=$(pwd)\"\n"
+        ),
+    )
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "envcheck",
+        "script": "hello.sh",
+        "args": {"x": 1},
+        "result_group": "g",
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    mb.run(test_file)
+
+    archives = list((ws_root / "logs").glob("envcheck_*.tar.gz"))
+    with tarfile.open(archives[0]) as tar:
+        log = tar.extractfile("main.log").read().decode()
+
+    assert "WORKDIR=" in log and "/invocation_001" in log
+    assert "INPUTS=" in log and "/inputs" in log
+    assert "OUTPUT_FILE=" in log and ".madbench_output.json" in log
+    # cwd should equal the invocation workdir
+    workdir_line = [ln for ln in log.splitlines() if ln.startswith("WORKDIR=")][0]
+    cwd_line = [ln for ln in log.splitlines() if ln.startswith("CWD=")][0]
+    assert workdir_line.split("=", 1)[1] == cwd_line.split("=", 1)[1]
+
+
+# -----------------------------------------------------------------------
+# CSV header rollover
+# -----------------------------------------------------------------------
+
+
+def test_csv_header_rollover_when_schema_changes(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    # Run #1 with outputs=[a]
+    make_test_yaml(
+        ws_root,
+        {
+            "name": "schema",
+            "script": "hello.sh",
+            "args": {"x": 1},
+            "result_group": "g",
+            "outputs": ["a"],
+        },
+        name="schema1.yml",
+    )
+    mb.run(ws_root / "tests" / "schema1.yml")
+    assert (ws_root / "results" / "g" / "results.csv").exists()
+
+    # Run #2 with outputs=[a, b] — different header → rollover
+    make_test_yaml(
+        ws_root,
+        {
+            "name": "schema",
+            "script": "hello.sh",
+            "args": {"x": 1},
+            "result_group": "g",
+            "outputs": ["a", "b"],
+        },
+        name="schema2.yml",
+    )
+    mb.run(ws_root / "tests" / "schema2.yml")
+    assert (ws_root / "results" / "g" / "results.2.csv").exists()
+
+    h1 = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()[0]
+    h2 = (ws_root / "results" / "g" / "results.2.csv").read_text().splitlines()[0]
+    assert h1 != h2
 
 
 # -----------------------------------------------------------------------
@@ -397,9 +658,7 @@ def test_list_tests(tmp_path):
 
     yaml_data = {
         "name": "mytest",
-        "description": "",
         "script": "hello.sh",
-        "configs": [],
         "args": {"n": 1},
         "result_group": "grp",
     }

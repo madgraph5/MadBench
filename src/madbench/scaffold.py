@@ -7,11 +7,11 @@ _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 _WORKSPACE_DIRS = [
     "scripts",
-    "configs",
     "tests",
     "plots",
     "results",
     "logs",
+    "scratch",
     "analysis",
     "gridpacks",
     "MadGraph",
@@ -21,7 +21,7 @@ _WORKSPACE_DIRS = [
 def init_workspace(target: Path) -> None:
     """Create the workspace directory structure and madbench.yml in `target`.
 
-    Creates: scripts/, configs/, tests/, plots/, results/, logs/,
+    Creates: scripts/, tests/, plots/, results/, logs/, scratch/,
              analysis/, gridpacks/, MadGraph/
 
     Writes madbench.yml from template.
