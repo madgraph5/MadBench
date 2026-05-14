@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,29 @@ class TestDefinition:
     result_group: str
     plot: Optional[str]
     raw: dict                  # the full parsed YAML, stored in metadata
+    zip_groups: list[list[str]] = field(default_factory=list)
+    # Each inner list is a group of arg names whose list values are zipped
+    # together (must be equal length). Each group contributes a single axis
+    # to the cartesian product over the remaining list-valued args.
+
+
+def _normalize_zip_groups(raw_zip: Any) -> list[list[str]]:
+    """Accept ``[a, b]`` (single group) or ``[[a, b], [c, d]]`` (multi-group)."""
+    if not raw_zip:
+        return []
+    if not isinstance(raw_zip, list):
+        raise ValueError(
+            f"'zip' must be a list of arg names or a list of such lists, "
+            f"got {type(raw_zip).__name__}"
+        )
+    if all(isinstance(x, str) for x in raw_zip):
+        return [list(raw_zip)]
+    if all(isinstance(x, list) and all(isinstance(s, str) for s in x) for x in raw_zip):
+        return [list(x) for x in raw_zip]
+    raise ValueError(
+        "'zip' must be a list of arg names (single group) "
+        "or a list of lists of arg names (multiple groups)"
+    )
 
 
 class MadBench:
@@ -78,57 +102,112 @@ class MadBench:
             result_group=raw["result_group"],
             plot=raw.get("plot"),
             raw=raw,
+            zip_groups=_normalize_zip_groups(raw.get("zip")),
         )
 
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
         """Build the list of commands to execute.
 
         Arguments are passed as positional args in the order they appear
-        in the YAML ``args`` dict.
+        in the YAML ``args`` dict. List-valued args produce one command per
+        value; multiple list-valued args produce the cartesian product.
 
-        Only ONE arg may be a list. If multiple args are lists, raise
-        ValueError (cartesian product not yet supported).
+        Args listed in a ``zip`` group vary together (one axis of the
+        product) instead of independently. Members of a zip group must all
+        be lists of equal length.
 
-        Example::
+        Example — pure cartesian::
 
             args:
-              ncores: [1, 4]
-              nevents: 250000
+              ncores: [1, 2]
+              nevents: [100, 200]
               seed: 42
 
-        Produces::
+        Produces 4 commands: (1, 100, 42), (1, 200, 42), (2, 100, 42),
+        (2, 200, 42).
 
-            [["./scripts/run.sh", "1", "250000", "42"],
-             ["./scripts/run.sh", "4", "250000", "42"]]
+        Example — zip group + cartesian::
+
+            args:
+              ncores: [1, 2, 4]
+              nevents: [1000, 1000000]
+              timeout: [10, 600]
+              seed: 42
+            zip: [nevents, timeout]
+
+        Produces 3 * 2 = 6 commands; ``nevents`` and ``timeout`` always
+        appear paired ((1000, 10) or (1000000, 600)).
         """
         script_path = resolve_script(self.workspace, test.script)
 
-        list_args = {k: v for k, v in test.args.items() if isinstance(v, list)}
+        self._validate_zip_groups(test)
 
-        if len(list_args) > 1:
-            raise ValueError(
-                f"Multiple list-valued args are not yet supported: "
-                f"{list(list_args.keys())}. "
-                "Only one arg may be a list in v0.1."
-            )
+        # Map each zipped arg name to its group index; zipped args do not
+        # form independent axes.
+        name_to_group: dict[str, int] = {}
+        for i, group in enumerate(test.zip_groups):
+            for name in group:
+                name_to_group[name] = i
 
-        if not list_args:
-            # Single command
-            positional = [str(v) for v in test.args.values()]
-            return [[str(script_path)] + positional]
-
-        # Exactly one list-valued arg — iterate over its values
-        list_key = next(iter(list_args))
-        list_values = list_args[list_key]
+        # Build axes in args insertion order. A zip group is placed at the
+        # position of its first member; later members of the same group are
+        # absorbed. Each axis yields a list of {arg_name: value} mappings.
+        axes: list[list[dict[str, Any]]] = []
+        emitted_groups: set[int] = set()
+        for k, v in test.args.items():
+            if k in name_to_group:
+                gi = name_to_group[k]
+                if gi in emitted_groups:
+                    continue
+                emitted_groups.add(gi)
+                group = test.zip_groups[gi]
+                tuples = zip(*(test.args[n] for n in group))
+                axes.append([dict(zip(group, t)) for t in tuples])
+            elif isinstance(v, list):
+                axes.append([{k: item} for item in v])
+            # scalars contribute no axis
 
         commands = []
-        for item in list_values:
-            positional = []
-            for k, v in test.args.items():
-                positional.append(str(item) if k == list_key else str(v))
+        for combo in itertools.product(*axes):
+            overrides: dict[str, Any] = {}
+            for piece in combo:
+                overrides.update(piece)
+            positional = [
+                str(overrides.get(k, v)) for k, v in test.args.items()
+            ]
             commands.append([str(script_path)] + positional)
 
         return commands
+
+    @staticmethod
+    def _validate_zip_groups(test: TestDefinition) -> None:
+        seen: dict[str, int] = {}
+        for i, group in enumerate(test.zip_groups):
+            if not group:
+                raise ValueError(f"zip group at index {i} is empty")
+            for name in group:
+                if name in seen:
+                    raise ValueError(
+                        f"arg {name!r} appears in more than one zip group "
+                        f"(groups {seen[name]} and {i})"
+                    )
+                seen[name] = i
+                if name not in test.args:
+                    raise ValueError(
+                        f"zip group references unknown arg {name!r}; "
+                        f"known args: {list(test.args)}"
+                    )
+                if not isinstance(test.args[name], list):
+                    raise ValueError(
+                        f"zip group member {name!r} must be a list, "
+                        f"got {type(test.args[name]).__name__}"
+                    )
+            lengths = {len(test.args[n]) for n in group}
+            if len(lengths) > 1:
+                detail = ", ".join(f"{n}={len(test.args[n])}" for n in group)
+                raise ValueError(
+                    f"zip group {group} has mismatched lengths: {detail}"
+                )
 
     def run(self, test_path: Path, dry_run: bool = False) -> None:
         """Main entry point. Loads the test, builds commands, runs them."""

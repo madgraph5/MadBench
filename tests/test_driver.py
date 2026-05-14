@@ -117,7 +117,7 @@ def test_build_commands_one_list(tmp_path):
     assert cmds[2][1:] == ["4", "100"]
 
 
-def test_build_commands_multiple_lists_raises(tmp_path):
+def test_build_commands_cartesian(tmp_path):
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)
     ws = find_workspace(ws_root)
@@ -125,11 +125,190 @@ def test_build_commands_multiple_lists_raises(tmp_path):
 
     td = TestDefinition(
         name="t", description="", script="hello.sh",
-        configs=[], args={"ncores": [1, 2], "nevents": [100, 200]},
+        configs=[], args={"ncores": [1, 2], "nevents": [100, 200], "seed": 42},
         result_group="grp", plot=None, raw={},
     )
-    with pytest.raises(ValueError, match="not yet supported"):
+    cmds = mb.build_commands(td)
+    assert [c[1:] for c in cmds] == [
+        ["1", "100", "42"],
+        ["1", "200", "42"],
+        ["2", "100", "42"],
+        ["2", "200", "42"],
+    ]
+
+
+def test_build_commands_single_zip_group(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[],
+        args={"nevents": [1000, 2000], "timeout": [10, 20], "seed": 42},
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["nevents", "timeout"]],
+    )
+    cmds = mb.build_commands(td)
+    assert [c[1:] for c in cmds] == [
+        ["1000", "10", "42"],
+        ["2000", "20", "42"],
+    ]
+
+
+def test_build_commands_zip_and_cartesian(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[],
+        args={
+            "ncores": [1, 2, 4],
+            "nevents": [1000, 1_000_000],
+            "timeout": [10, 600],
+            "seed": 42,
+        },
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["nevents", "timeout"]],
+    )
+    cmds = mb.build_commands(td)
+    # 3 (ncores) * 2 (zipped pair) = 6 runs; nevents/timeout always paired
+    assert len(cmds) == 6
+    pairs = {(c[2], c[3]) for c in cmds}
+    assert pairs == {("1000", "10"), ("1000000", "600")}
+    ncores_vals = sorted({c[1] for c in cmds})
+    assert ncores_vals == ["1", "2", "4"]
+
+
+def test_build_commands_multiple_zip_groups(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[],
+        args={
+            "a": [1, 2],
+            "b": [10, 20],
+            "c": ["x", "y", "z"],
+            "d": ["X", "Y", "Z"],
+        },
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["a", "b"], ["c", "d"]],
+    )
+    cmds = mb.build_commands(td)
+    # 2 * 3 = 6 runs
+    assert len(cmds) == 6
+    for c in cmds:
+        a, b, cc, dd = c[1:]
+        assert (a, b) in {("1", "10"), ("2", "20")}
+        assert (cc, dd) in {("x", "X"), ("y", "Y"), ("z", "Z")}
+
+
+def test_build_commands_zip_mismatched_length_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[], args={"a": [1, 2], "b": [10, 20, 30]},
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["a", "b"]],
+    )
+    with pytest.raises(ValueError, match="mismatched lengths"):
         mb.build_commands(td)
+
+
+def test_build_commands_zip_unknown_arg_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[], args={"a": [1, 2]},
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["a", "missing"]],
+    )
+    with pytest.raises(ValueError, match="unknown arg"):
+        mb.build_commands(td)
+
+
+def test_build_commands_zip_scalar_member_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[], args={"a": [1, 2], "b": 5},
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["a", "b"]],
+    )
+    with pytest.raises(ValueError, match="must be a list"):
+        mb.build_commands(td)
+
+
+def test_build_commands_zip_overlap_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    td = TestDefinition(
+        name="t", description="", script="hello.sh",
+        configs=[], args={"a": [1, 2], "b": [3, 4], "c": [5, 6]},
+        result_group="grp", plot=None, raw={},
+        zip_groups=[["a", "b"], ["b", "c"]],
+    )
+    with pytest.raises(ValueError, match="more than one zip group"):
+        mb.build_commands(td)
+
+
+def test_load_test_zip_field_single_group(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "z",
+        "description": "",
+        "script": "hello.sh",
+        "args": {"a": [1, 2], "b": [10, 20]},
+        "result_group": "g",
+        "zip": ["a", "b"],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    td = mb.load_test(test_file)
+    assert td.zip_groups == [["a", "b"]]
+
+
+def test_load_test_zip_field_multi_group(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    ws = find_workspace(ws_root)
+    mb = MadBench(ws)
+
+    yaml_data = {
+        "name": "z",
+        "description": "",
+        "script": "hello.sh",
+        "args": {"a": [1, 2], "b": [10, 20], "c": [3], "d": [30]},
+        "result_group": "g",
+        "zip": [["a", "b"], ["c", "d"]],
+    }
+    test_file = make_test_yaml(ws_root, yaml_data)
+    td = mb.load_test(test_file)
+    assert td.zip_groups == [["a", "b"], ["c", "d"]]
 
 
 # -----------------------------------------------------------------------
