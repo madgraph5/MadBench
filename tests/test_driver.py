@@ -669,3 +669,290 @@ def test_list_tests(tmp_path):
     assert tests[0]["name"] == "mytest"
     assert not tests[0]["has_results"]
     assert not tests[0]["has_plot"]
+
+
+# -----------------------------------------------------------------------
+# mg_version sweep
+# -----------------------------------------------------------------------
+
+
+def test_load_test_mg_version_defaults_to_none(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    td = mb.load_test(test_file)
+    assert td.mg_version == ["none"]
+
+
+def test_load_test_mg_version_accepts_string(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": "v3.5.4",
+        },
+    )
+    td = mb.load_test(test_file)
+    assert td.mg_version == ["v3.5.4"]
+
+
+def test_load_test_mg_version_accepts_list(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v3.5.4", "dev_abc"],
+        },
+    )
+    td = mb.load_test(test_file)
+    assert td.mg_version == ["v3.5.4", "dev_abc"]
+
+
+def test_load_test_mg_version_invalid_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": 123,
+        },
+    )
+    with pytest.raises(ValueError, match="mg_version"):
+        mb.load_test(test_file)
+
+
+def test_build_commands_multiplied_by_mg_version(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh",
+            "args": {"x": [1, 2]},
+            "result_group": "g",
+            "mg_version": ["a", "b"],
+        },
+    )
+    td = mb.load_test(test_file)
+    cmds = mb.build_commands(td)
+    # 2 versions × 2 arg combos = 4 invocations. Outer is mg_version, so the
+    # first two share mg_version=a, next two share mg_version=b. Commands
+    # themselves repeat because mg_version doesn't appear positionally.
+    assert len(cmds) == 4
+    assert cmds[0][-1] == "1" and cmds[1][-1] == "2"
+    assert cmds[2][-1] == "1" and cmds[3][-1] == "2"
+
+
+def test_run_per_version_workdir_layout(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "wd", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v1", "v2"],
+        },
+    )
+    mb.run(test_file)
+
+    # One run_dir per version, each under scratch/<mg_version>/. Invocation
+    # IDs restart per version, so the same arg combo lands at the same ID
+    # across versions for easy cross-version comparison.
+    v1_dirs = list((ws_root / "scratch" / "v1").glob("wd_*"))
+    v2_dirs = list((ws_root / "scratch" / "v2").glob("wd_*"))
+    assert len(v1_dirs) == 1 and (v1_dirs[0] / "invocation_001").is_dir()
+    assert len(v2_dirs) == 1 and (v2_dirs[0] / "invocation_001").is_dir()
+    # No top-level wd_* dir when versions are set.
+    assert not list((ws_root / "scratch").glob("wd_*"))
+
+
+def test_run_no_version_segment_when_none(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "noversion", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    # Legacy layout preserved: scratch/<test>_<ts>/, no "none/" segment.
+    dirs = list((ws_root / "scratch").glob("noversion_*"))
+    assert len(dirs) == 1
+    assert not (ws_root / "scratch" / "none").exists()
+
+
+def test_run_exposes_mg_env_vars(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"MG_VERSION=$MG_VERSION\"\n"
+            "echo \"MG_BIN=$MG_BIN\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "envmg", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v3.5.4"],
+        },
+    )
+    mb.run(test_file)
+
+    archives = list((ws_root / "logs").glob("envmg_*.tar.gz"))
+    with tarfile.open(archives[0]) as tar:
+        log = tar.extractfile("main.log").read().decode()
+    assert "MG_VERSION=v3.5.4" in log
+    assert "MG_BIN=" in log
+    assert "MadGraph/v3.5.4/bin/mg5_aMC" in log
+
+
+def test_run_mg_bin_empty_when_version_is_none(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"MG_VERSION=$MG_VERSION\"\n"
+            "echo \"MG_BIN=[$MG_BIN]\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "envnone", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    archives = list((ws_root / "logs").glob("envnone_*.tar.gz"))
+    with tarfile.open(archives[0]) as tar:
+        log = tar.extractfile("main.log").read().decode()
+    assert "MG_VERSION=none" in log
+    assert "MG_BIN=[]" in log
+
+
+def test_run_csv_includes_mg_version_column(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "csvmg", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g", "mg_version": ["a", "b"],
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    assert "mg_version" in header
+    mgv_idx = header.index("mg_version")
+    # 4 data rows: outer order is mg_version, so a,a,b,b
+    data_mgvs = [r.split(",")[mgv_idx] for r in rows[1:]]
+    assert data_mgvs == ["a", "a", "b", "b"]
+
+
+def test_run_csv_mg_version_column_when_unset(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "csvnone", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    assert "mg_version" in header
+    mgv_idx = header.index("mg_version")
+    assert rows[1].split(",")[mgv_idx] == "none"
+
+
+def test_run_invocation_ids_align_across_versions(tmp_path):
+    """The same arg combo gets the same invocation_id under each mg_version."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body="#!/bin/bash\necho \"$1 $MG_VERSION\" > marker.txt\n",
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "align", "script": "hello.sh", "args": {"x": [10, 20, 30]},
+            "result_group": "g", "mg_version": ["v1", "v2"],
+        },
+    )
+    mb.run(test_file)
+
+    v1_root = next((ws_root / "scratch" / "v1").glob("align_*"))
+    v2_root = next((ws_root / "scratch" / "v2").glob("align_*"))
+    for inv, expected_x in [("invocation_001", "10"), ("invocation_002", "20"), ("invocation_003", "30")]:
+        v1_marker = (v1_root / inv / "marker.txt").read_text().strip()
+        v2_marker = (v2_root / inv / "marker.txt").read_text().strip()
+        assert v1_marker == f"{expected_x} v1"
+        assert v2_marker == f"{expected_x} v2"
+
+
+def test_run_output_files_scoped_per_version(tmp_path):
+    """Same invocation_id across versions writes to different result subdirs."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"$MG_VERSION\" > out.log\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "outv", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v1", "v2"],
+            "output_files": ["out.log"],
+        },
+    )
+    mb.run(test_file)
+
+    v1_out = (ws_root / "results" / "g" / "v1" / "invocation_001" / "out.log").read_text().strip()
+    v2_out = (ws_root / "results" / "g" / "v2" / "invocation_001" / "out.log").read_text().strip()
+    assert v1_out == "v1"
+    assert v2_out == "v2"
+
+
+def test_run_inputs_staged_per_version(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    (ws_root / "config").mkdir()
+    (ws_root / "config" / "card.dat").write_text("CARD")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "inputsmg", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v1", "v2"],
+            "inputs": ["config/card.dat"],
+        },
+    )
+    mb.run(test_file)
+
+    v1_dir = next((ws_root / "scratch" / "v1").glob("inputsmg_*"))
+    v2_dir = next((ws_root / "scratch" / "v2").glob("inputsmg_*"))
+    assert (v1_dir / "inputs" / "config" / "card.dat").read_text() == "CARD"
+    assert (v2_dir / "inputs" / "config" / "card.dat").read_text() == "CARD"

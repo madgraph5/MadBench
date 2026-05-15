@@ -28,6 +28,9 @@ _REQUIRED_FIELDS = {"name", "script", "args", "result_group"}
 OUTPUT_FILE_NAME = ".madbench_output.json"
 
 
+MG_VERSION_NONE = "none"
+
+
 @dataclass
 class TestDefinition:
     """Parsed content of a test YAML file."""
@@ -47,6 +50,10 @@ class TestDefinition:
     # Each inner list is a group of arg names whose list values are zipped
     # together (must be equal length). Each group contributes a single axis
     # to the cartesian product over the remaining list-valued args.
+    mg_version: list[str] = field(default_factory=lambda: [MG_VERSION_NONE])
+    # Outer sweep dimension. Each entry is a folder name under MadGraph/.
+    # The sentinel "none" means MadGraph is not selected for this run — no
+    # workdir segment, MG_BIN exposed as empty, MG_VERSION="none" in the CSV.
 
 
 def _normalize_zip_groups(raw_zip: Any) -> list[list[str]]:
@@ -74,6 +81,21 @@ def _as_str_list(value: Any, field_name: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
         raise ValueError(f"{field_name!r} must be a list of strings")
     return list(value)
+
+
+def _normalize_mg_version(raw: Any) -> list[str]:
+    """Accept None / str / list[str]. Empty/missing → [MG_VERSION_NONE]."""
+    if raw is None:
+        return [MG_VERSION_NONE]
+    if isinstance(raw, str):
+        return [raw] if raw else [MG_VERSION_NONE]
+    if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
+        return list(raw) if raw else [MG_VERSION_NONE]
+    raise ValueError(
+        "'mg_version' must be a string or a list of strings (folder names "
+        "under MadGraph/), got "
+        f"{type(raw).__name__}"
+    )
 
 
 class MadBench:
@@ -129,15 +151,20 @@ class MadBench:
             plot=raw.get("plot"),
             raw=raw,
             zip_groups=_normalize_zip_groups(raw.get("zip")),
+            mg_version=_normalize_mg_version(raw.get("mg_version")),
         )
 
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
-        """Build the list of commands to execute (positional args only)."""
+        """Build the list of commands to execute (positional args only).
+
+        Returns one command per sweep point. ``mg_version`` does not appear
+        in the script arguments — it is exposed to the script via env vars
+        — so commands repeat across mg_versions when more than one is set.
+        """
         script_path = resolve_script(self.workspace, test.script)
-        combos = self._build_arg_combos(test)
         return [
             [str(script_path)] + [str(combo[k]) for k in test.args]
-            for combo in combos
+            for combo, _ in self._build_sweep_points(test)
         ]
 
     def run(self, test_path: Path, dry_run: bool = False) -> None:
@@ -145,16 +172,18 @@ class MadBench:
         test = self.load_test(test_path)
         script_path = resolve_script(self.workspace, test.script)
 
-        combos = self._build_arg_combos(test)
+        sweep_points = self._build_sweep_points(test)
         commands = [
             [str(script_path)] + [str(combo[k]) for k in test.args]
-            for combo in combos
+            for combo, _ in sweep_points
         ]
 
         timestamp = get_timestamp()
         workdir_base = self._resolve_workdir(test)
-        run_dir = workdir_base / f"{test.name}_{timestamp}"
-        inputs_dir = run_dir / "inputs"
+        run_dirs = {
+            mgv: self._version_run_dir(workdir_base, test.name, timestamp, mgv)
+            for mgv in test.mg_version
+        }
         result_dir = self.workspace.results_dir / test.result_group
         run_log_dir = self.workspace.logs_dir / f"{test.name}_{timestamp}"
 
@@ -169,23 +198,26 @@ class MadBench:
             "test_definition": test.raw,
             "commands": [" ".join(cmd) for cmd in commands],
             "script": str(script_path),
-            "run_dir": str(run_dir),
+            "mg_versions": list(test.mg_version),
+            "run_dirs": {mgv: str(p) for mgv, p in run_dirs.items()},
             "result_dir": str(result_dir),
             "dry_run": dry_run,
         }
 
         if dry_run:
-            self._print_dry_run(test, script_path, run_dir, result_dir, commands, metadata)
+            self._print_dry_run(test, script_path, run_dirs, result_dir, commands, metadata)
             return
 
-        # Prepare run dir + inputs (once per madbench run)
-        run_dir.mkdir(parents=True, exist_ok=True)
+        # Prepare per-version run dirs + inputs (once per version)
         result_dir.mkdir(parents=True, exist_ok=True)
         run_log_dir.mkdir(parents=True, exist_ok=True)
-        if test.inputs:
-            stage_inputs(self.workspace.root, test.inputs, inputs_dir)
-        else:
-            inputs_dir.mkdir(parents=True, exist_ok=True)
+        for mgv, rd in run_dirs.items():
+            rd.mkdir(parents=True, exist_ok=True)
+            inputs_dir = rd / "inputs"
+            if test.inputs:
+                stage_inputs(self.workspace.root, test.inputs, inputs_dir)
+            else:
+                inputs_dir.mkdir(parents=True, exist_ok=True)
 
         # CSV setup
         csv_header = self._csv_header(test)
@@ -197,70 +229,87 @@ class MadBench:
         results: list[dict] = []
         wall_start = time.monotonic()
 
+        n_per_version = len(sweep_points) // len(test.mg_version)
+        global_i = 0
+
         try:
             with TeeLogger(main_log) as tee:
-                for i, (cmd, combo) in enumerate(zip(commands, combos), 1):
-                    invocation_id = f"invocation_{i:03d}"
-                    invocation_dir = run_dir / invocation_id
-                    invocation_dir.mkdir(parents=True, exist_ok=True)
-                    output_file = invocation_dir / OUTPUT_FILE_NAME
+                for mgv in test.mg_version:
+                    run_dir = run_dirs[mgv]
+                    inputs_dir = run_dir / "inputs"
+                    result_version_dir = self._version_result_dir(result_dir, mgv)
 
-                    env = os.environ.copy()
-                    env["MADBENCH_WORKDIR"] = str(invocation_dir)
-                    env["MADBENCH_INPUTS"] = str(inputs_dir)
-                    env["MADBENCH_OUTPUT_FILE"] = str(output_file)
+                    for version_i in range(1, n_per_version + 1):
+                        global_i += 1
+                        combo, sweep_mgv = sweep_points[global_i - 1]
+                        assert sweep_mgv == mgv  # invariant: outer mg_version order
+                        cmd = commands[global_i - 1]
 
-                    header = (
-                        f"=== Running ({i}/{len(commands)}): {' '.join(cmd)} "
-                        f"[{invocation_id}] ==="
-                    )
-                    print(header)
+                        invocation_id = f"invocation_{version_i:03d}"
+                        invocation_dir = run_dir / invocation_id
+                        invocation_dir.mkdir(parents=True, exist_ok=True)
+                        output_file = invocation_dir / OUTPUT_FILE_NAME
 
-                    invocation_ts = get_timestamp()
-                    cmd_start = time.monotonic()
-                    try:
-                        proc = subprocess.Popen(
-                            cmd,
-                            stdout=tee.write_fd,
-                            stderr=subprocess.STDOUT,
-                            cwd=invocation_dir,
-                            env=env,
-                            close_fds=True,
+                        env = os.environ.copy()
+                        env["MADBENCH_WORKDIR"] = str(invocation_dir)
+                        env["MADBENCH_INPUTS"] = str(inputs_dir)
+                        env["MADBENCH_OUTPUT_FILE"] = str(output_file)
+                        env["MG_VERSION"] = mgv
+                        env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
+
+                        header = (
+                            f"=== Running ({global_i}/{len(commands)}): {' '.join(cmd)} "
+                            f"[{invocation_id} mg_version={mgv}] ==="
                         )
-                        exit_code = proc.wait()
-                    except KeyboardInterrupt:
-                        proc.terminate()
-                        proc.wait()
-                        exit_code = -2
+                        print(header)
+
+                        invocation_ts = get_timestamp()
+                        cmd_start = time.monotonic()
+                        try:
+                            proc = subprocess.Popen(
+                                cmd,
+                                stdout=tee.write_fd,
+                                stderr=subprocess.STDOUT,
+                                cwd=invocation_dir,
+                                env=env,
+                                close_fds=True,
+                            )
+                            exit_code = proc.wait()
+                        except KeyboardInterrupt:
+                            proc.terminate()
+                            proc.wait()
+                            exit_code = -2
+                            wall_time = time.monotonic() - cmd_start
+                            self._finalize_invocation(
+                                test, combo, mgv, invocation_id, invocation_dir, output_file,
+                                result_version_dir, csv_path, csv_header, write_header,
+                                invocation_ts, exit_code, wall_time,
+                            )
+                            results.append({
+                                "command": " ".join(cmd),
+                                "invocation_id": invocation_id,
+                                "mg_version": mgv,
+                                "exit_code": exit_code,
+                                "wall_time": round(wall_time, 2),
+                            })
+                            write_header = False
+                            print("\n[madbench] Interrupted by user.")
+                            raise
+
                         wall_time = time.monotonic() - cmd_start
                         self._finalize_invocation(
-                            test, combo, invocation_id, invocation_dir, output_file,
-                            result_dir, csv_path, csv_header, write_header,
+                            test, combo, mgv, invocation_id, invocation_dir, output_file,
+                            result_version_dir, csv_path, csv_header, write_header,
                             invocation_ts, exit_code, wall_time,
                         )
+                        write_header = False
                         results.append({
                             "command": " ".join(cmd),
                             "invocation_id": invocation_id,
+                            "mg_version": mgv,
                             "exit_code": exit_code,
                             "wall_time": round(wall_time, 2),
                         })
-                        write_header = False
-                        print("\n[madbench] Interrupted by user.")
-                        raise
-
-                    wall_time = time.monotonic() - cmd_start
-                    self._finalize_invocation(
-                        test, combo, invocation_id, invocation_dir, output_file,
-                        result_dir, csv_path, csv_header, write_header,
-                        invocation_ts, exit_code, wall_time,
-                    )
-                    write_header = False
-                    results.append({
-                        "command": " ".join(cmd),
-                        "invocation_id": invocation_id,
-                        "exit_code": exit_code,
-                        "wall_time": round(wall_time, 2),
-                    })
 
         except KeyboardInterrupt:
             print("[madbench] Interrupted — bundling partial logs...")
@@ -274,8 +323,12 @@ class MadBench:
         print(f"\n[madbench] Run complete in {total_time:.1f}s")
         for r in results:
             status = "OK" if r["exit_code"] == 0 else f"FAILED (exit {r['exit_code']})"
-            print(f"  [{status}] {r['invocation_id']}  {r['command']}  ({r['wall_time']}s)")
-        print(f"[madbench] Workdir: {run_dir}")
+            print(
+                f"  [{status}] {r['invocation_id']}  mg_version={r['mg_version']}  "
+                f"{r['command']}  ({r['wall_time']}s)"
+            )
+        for mgv, rd in run_dirs.items():
+            print(f"[madbench] Workdir [mg_version={mgv}]: {rd}")
         print(f"[madbench] Results CSV: {csv_path}")
         print(f"[madbench] Log archive: {archive_path}")
 
@@ -362,6 +415,14 @@ class MadBench:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _build_sweep_points(
+        self, test: TestDefinition,
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Cartesian (mg_version × arg_combos) with mg_version as the outer
+        loop. Returns (arg_combo, mg_version) tuples in invocation order."""
+        combos = self._build_arg_combos(test)
+        return [(combo, mgv) for mgv in test.mg_version for combo in combos]
+
     def _build_arg_combos(self, test: TestDefinition) -> list[dict[str, Any]]:
         """Return one dict per invocation, mapping every arg name to its
         resolved value for that sweep point. Scalars carry through unchanged;
@@ -436,9 +497,35 @@ class MadBench:
             p = self.workspace.root / p
         return p.resolve()
 
+    def _version_run_dir(
+        self, workdir_base: Path, test_name: str, timestamp: str, mg_version: str,
+    ) -> Path:
+        """Per-mg_version run dir. The version segment is dropped when
+        ``mg_version`` is the "none" sentinel so version-less tests keep the
+        ``<workdir>/<test>_<ts>/`` layout they always had."""
+        if mg_version == MG_VERSION_NONE:
+            return workdir_base / f"{test_name}_{timestamp}"
+        return workdir_base / mg_version / f"{test_name}_{timestamp}"
+
+    def _resolve_mg_bin(self, mg_version: str) -> Optional[Path]:
+        """Return MadGraph/<mg_version>/bin/mg5_aMC, or None when version is
+        the "none" sentinel. Does not check existence — that is the caller's
+        job once MG is actually required (step 2: proc_card generation)."""
+        if mg_version == MG_VERSION_NONE:
+            return None
+        return self.workspace.root / "MadGraph" / mg_version / "bin" / "mg5_aMC"
+
+    def _version_result_dir(self, result_dir: Path, mg_version: str) -> Path:
+        """Per-mg_version slice of the result dir for ``output_files`` copies.
+        The version segment is dropped when ``mg_version`` is "none" so
+        version-less tests keep the ``results/<group>/<invocation>/`` layout."""
+        if mg_version == MG_VERSION_NONE:
+            return result_dir
+        return result_dir / mg_version
+
     def _csv_header(self, test: TestDefinition) -> list[str]:
         return (
-            ["timestamp"]
+            ["timestamp", "mg_version"]
             + list(test.args.keys())
             + list(test.outputs)
             + ["exit_code", "wall_time", "invocation_id"]
@@ -448,10 +535,11 @@ class MadBench:
         self,
         test: TestDefinition,
         combo: dict[str, Any],
+        mg_version: str,
         invocation_id: str,
         invocation_dir: Path,
         output_file: Path,
-        result_dir: Path,
+        result_version_dir: Path,
         csv_path: Path,
         csv_header: list[str],
         write_header: bool,
@@ -459,12 +547,19 @@ class MadBench:
         exit_code: int,
         wall_time: float,
     ) -> None:
-        """Post-script: read outputs JSON, copy output_files, append CSV row."""
+        """Post-script: read outputs JSON, copy output_files, append CSV row.
+
+        ``result_version_dir`` is the per-mg_version slice of the result dir
+        (``results/<group>`` or ``results/<group>/<mg_version>`` depending on
+        whether a version was set), so per-version output_files don't clobber
+        each other when invocation_ids are shared.
+        """
         output_values = self._read_outputs_json(test, output_file)
-        self._copy_output_files(test, combo, invocation_dir, result_dir / invocation_id)
+        self._copy_output_files(test, combo, invocation_dir, result_version_dir / invocation_id)
 
         row: dict[str, Any] = {
             "timestamp": invocation_ts,
+            "mg_version": mg_version,
             "exit_code": exit_code,
             "wall_time": round(wall_time, 2),
             "invocation_id": invocation_id,
@@ -550,7 +645,7 @@ class MadBench:
         self,
         test: TestDefinition,
         script_path: Path,
-        run_dir: Path,
+        run_dirs: dict[str, Path],
         result_dir: Path,
         commands: list[list[str]],
         metadata: dict,
@@ -560,10 +655,12 @@ class MadBench:
         print("[madbench] DRY RUN — no files will be created or scripts executed")
         print(f"[madbench] Test: {test.name}")
         print(f"[madbench] Script: {script_path}")
-        print(f"[madbench] Run dir: {run_dir}")
+        print(f"[madbench] mg_versions: {list(run_dirs.keys())}")
+        for mgv, rd in run_dirs.items():
+            print(f"[madbench] Run dir [mg_version={mgv}]: {rd}")
         print(f"[madbench] Result dir: {result_dir}")
         if test.inputs:
-            print(f"[madbench] Inputs (staged into {run_dir / 'inputs'}):")
+            print("[madbench] Inputs (staged per mg_version into <run_dir>/inputs):")
             for pat in test.inputs:
                 print(f"  {pat}")
         if test.outputs:
