@@ -42,6 +42,22 @@ def make_test_yaml(ws_root: Path, data: dict, name: str = "test.yml") -> Path:
     return test_file
 
 
+def run_dir(ws_root: Path, result_group: str, test_name: str) -> Path:
+    """Return the single per-run subfolder created by a madbench run.
+
+    Each ``madbench run`` writes its outputs into
+    ``results/<result_group>/<test_name>_<timestamp>_<hostname>/``. Tests
+    almost always invoke exactly one run per ``test_name`` per result_group,
+    so we glob and assert uniqueness.
+    """
+    matches = list((ws_root / "results" / result_group).glob(f"{test_name}_*"))
+    assert len(matches) == 1, (
+        f"Expected exactly one per-run subdir for {test_name!r} in {result_group!r}, "
+        f"found {[str(m) for m in matches]}"
+    )
+    return matches[0]
+
+
 # -----------------------------------------------------------------------
 # load_test
 # -----------------------------------------------------------------------
@@ -368,8 +384,8 @@ def test_run_end_to_end(tmp_path):
         log_content = tar.extractfile("main.log").read().decode()
         assert "hello" in log_content
 
-    # CSV exists with both invocations
-    csv_path = ws_root / "results" / "e2e" / "results.csv"
+    # CSV exists with both invocations, inside the per-run subdir.
+    csv_path = run_dir(ws_root, "e2e", "e2e_test") / "results.csv"
     assert csv_path.exists()
     lines = csv_path.read_text().splitlines()
     assert len(lines) == 3  # header + 2 rows
@@ -460,7 +476,7 @@ def test_run_reads_outputs_json_and_writes_csv(tmp_path):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    csv_path = ws_root / "results" / "g" / "results.csv"
+    csv_path = run_dir(ws_root, "g", "without") / "results.csv"
     rows = csv_path.read_text().splitlines()
     header = rows[0].split(",")
     # arg `throughput` and output `throughput` collide on column name; this
@@ -489,7 +505,7 @@ def test_run_missing_outputs_json_writes_blanks(tmp_path, capsys):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    csv_path = ws_root / "results" / "g" / "results.csv"
+    csv_path = run_dir(ws_root, "g", "missing") / "results.csv"
     rows = csv_path.read_text().splitlines()
     assert len(rows) == 2  # header + 1 row
     # 'throughput' column exists, value is empty
@@ -531,8 +547,9 @@ def test_run_copies_artifacts_with_arg_substitution(tmp_path):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    inv1 = ws_root / "results" / "g" / "invocation_001" / "01" / "gridpack_1" / "timings.txt"
-    inv2 = ws_root / "results" / "g" / "invocation_002" / "01" / "gridpack_2" / "timings.txt"
+    rd = run_dir(ws_root, "g", "copy_outputs")
+    inv1 = rd / "invocation_001" / "01" / "gridpack_1" / "timings.txt"
+    inv2 = rd / "invocation_002" / "01" / "gridpack_2" / "timings.txt"
     assert inv1.exists() and inv1.read_text().strip() == "timings for 1"
     assert inv2.exists() and inv2.read_text().strip() == "timings for 2"
 
@@ -604,45 +621,45 @@ def test_run_sets_env_vars(tmp_path):
 # -----------------------------------------------------------------------
 
 
-def test_csv_header_rollover_when_schema_changes(tmp_path):
+def test_two_runs_produce_isolated_subdirs(tmp_path):
+    """Per-run isolation: re-running a test in the same result_group with
+    different schemas produces two distinct subdirs, each with its own
+    results.csv. The old rollover mechanism (results.2.csv at the
+    result_group root) is therefore not exercised in the normal flow."""
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)
     ws = find_workspace(ws_root)
     mb = MadBench(ws)
 
-    # Run #1 with outputs=[a]
     make_test_yaml(
         ws_root,
         {
-            "name": "schema",
-            "script": "hello.sh",
-            "args": {"x": 1},
-            "result_group": "g",
-            "outputs": ["a"],
+            "name": "schema", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "outputs": ["a"],
         },
         name="schema1.yml",
     )
     mb.run(ws_root / "tests" / "schema1.yml")
-    assert (ws_root / "results" / "g" / "results.csv").exists()
+    import time as _t
+    _t.sleep(1.1)  # force distinct timestamps
 
-    # Run #2 with outputs=[a, b] — different header → rollover
     make_test_yaml(
         ws_root,
         {
-            "name": "schema",
-            "script": "hello.sh",
-            "args": {"x": 1},
-            "result_group": "g",
-            "outputs": ["a", "b"],
+            "name": "schema", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "outputs": ["a", "b"],
         },
         name="schema2.yml",
     )
     mb.run(ws_root / "tests" / "schema2.yml")
-    assert (ws_root / "results" / "g" / "results.2.csv").exists()
 
-    h1 = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()[0]
-    h2 = (ws_root / "results" / "g" / "results.2.csv").read_text().splitlines()[0]
-    assert h1 != h2
+    subdirs = sorted((ws_root / "results" / "g").glob("schema_*"))
+    assert len(subdirs) == 2
+    h1 = (subdirs[0] / "results.csv").read_text().splitlines()[0]
+    h2 = (subdirs[1] / "results.csv").read_text().splitlines()[0]
+    assert h1 != h2  # different schemas, in different subdirs
+    # The old result_group-level results.csv must not exist any more.
+    assert not (ws_root / "results" / "g" / "results.csv").exists()
 
 
 # -----------------------------------------------------------------------
@@ -857,7 +874,7 @@ def test_run_csv_includes_mg_version_column(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "csvmg") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "mg_version" in header
     mgv_idx = header.index("mg_version")
@@ -876,7 +893,7 @@ def test_run_csv_mg_version_column_when_unset(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "csvnone") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "mg_version" in header
     mgv_idx = header.index("mg_version")
@@ -930,10 +947,87 @@ def test_run_artifacts_scoped_per_version(tmp_path):
     )
     mb.run(test_file)
 
-    v1_out = (ws_root / "results" / "g" / "v1" / "invocation_001" / "01" / "out.log").read_text().strip()
-    v2_out = (ws_root / "results" / "g" / "v2" / "invocation_001" / "01" / "out.log").read_text().strip()
+    rd = run_dir(ws_root, "g", "outv")
+    v1_out = (rd / "v1" / "invocation_001" / "01" / "out.log").read_text().strip()
+    v2_out = (rd / "v2" / "invocation_001" / "01" / "out.log").read_text().strip()
     assert v1_out == "v1"
     assert v2_out == "v2"
+
+
+# -----------------------------------------------------------------------
+# Per-run environment metadata (metadata.yml inside per-run subdir)
+# -----------------------------------------------------------------------
+
+
+def test_run_dir_naming(tmp_path):
+    """The per-run subfolder under results/<group>/ encodes test, timestamp,
+    and hostname — enough to identify the run by path alone."""
+    import socket
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "named", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    rd = run_dir(ws_root, "g", "named")
+    name = rd.name
+    assert name.startswith("named_")
+    assert name.endswith(f"_{socket.gethostname()}")
+
+
+def test_run_writes_metadata_yml(tmp_path):
+    """Each run writes its own metadata.yml inside the per-run subdir
+    capturing the environment that produced the rows in this subdir."""
+    import socket
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "runmeta", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    rd = run_dir(ws_root, "g", "runmeta")
+    meta = yaml.safe_load((rd / "metadata.yml").read_text())
+    assert meta["test_name"] == "runmeta"
+    assert meta["hostname"] == socket.gethostname()
+    assert "timestamp" in meta
+    assert "hardware" in meta and "gpus" in meta["hardware"]
+    assert isinstance(meta["mg_versions"], list)
+    assert meta["repeat"] == 1
+
+
+def test_two_runs_create_separate_subdirs(tmp_path):
+    """Successive runs in the same result_group create separate
+    self-contained subdirs — no shared file is read/written by either."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    make_test_yaml(
+        ws_root,
+        {"name": "twice", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        name="twice.yml",
+    )
+    test_file = ws_root / "tests" / "twice.yml"
+
+    mb.run(test_file)
+    import time as _t
+    _t.sleep(1.1)  # ensure a distinct timestamp on the second run
+    mb.run(test_file)
+
+    subdirs = sorted((ws_root / "results" / "g").glob("twice_*"))
+    assert len(subdirs) == 2
+    for sd in subdirs:
+        assert (sd / "results.csv").exists()
+        assert (sd / "metadata.yml").exists()
+    # Timestamps must differ — proves runs are isolated, not overwriting.
+    m1 = yaml.safe_load((subdirs[0] / "metadata.yml").read_text())
+    m2 = yaml.safe_load((subdirs[1] / "metadata.yml").read_text())
+    assert m1["timestamp"] != m2["timestamp"]
 
 
 def _install_mock_mg(ws_root: Path, version: str, body: str | None = None) -> Path:
@@ -1082,7 +1176,7 @@ def test_run_proc_cards_requires_mg_version(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "needsmg") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1108,7 +1202,7 @@ def test_run_proc_cards_missing_mg_binary(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "noghost") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1142,7 +1236,7 @@ def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
     mb.run(test_file)
 
     assert not marker.exists()  # script never ran
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "mgfail") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1168,7 +1262,7 @@ def test_run_proc_cards_one_version_fails_others_continue(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "mixed") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     mgv_idx = header.index("mg_version")
@@ -1298,7 +1392,7 @@ def test_run_csv_has_repetition_column_with_row_per_rep(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "csvr") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "repetition" in header
     rep_idx = header.index("repetition")
@@ -1333,7 +1427,7 @@ def test_run_artifacts_scoped_per_rep(tmp_path):
     )
     mb.run(test_file)
 
-    inv = ws_root / "results" / "g" / "invocation_001"
+    inv = run_dir(ws_root, "g", "outr") / "invocation_001"
     assert (inv / "01" / "out.log").read_text().strip() == "01"
     assert (inv / "02" / "out.log").read_text().strip() == "02"
 
@@ -1360,7 +1454,7 @@ def test_run_summary_csv_mean_std_n_successful(tmp_path):
     )
     mb.run(test_file)
 
-    summary = ws_root / "results" / "g" / "summary.csv"
+    summary = run_dir(ws_root, "g", "sum") / "summary.csv"
     assert summary.exists()
     rows = summary.read_text().splitlines()
     header = rows[0].split(",")
@@ -1398,7 +1492,7 @@ def test_run_summary_excludes_failed_reps_from_average(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "mix") / "summary.csv").read_text().splitlines()
     header = rows[0].split(",")
     cells = dict(zip(header, rows[1].split(",")))
     assert cells["n_successful"] == "2"
@@ -1421,7 +1515,7 @@ def test_run_summary_handles_all_failures(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "allbad") / "summary.csv").read_text().splitlines()
     header = rows[0].split(",")
     cells = dict(zip(header, rows[1].split(",")))
     assert cells["n_successful"] == "0"
@@ -1449,7 +1543,7 @@ def test_run_summary_skips_non_numeric_outputs(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "mixed_outs") / "summary.csv").read_text().splitlines()
     header = rows[0].split(",")
     cells = dict(zip(header, rows[1].split(",")))
     assert float(cells["throughput_mean"]) == 50.0
@@ -1477,7 +1571,7 @@ def test_run_summary_one_row_per_arg_combo(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "g", "multi") / "summary.csv").read_text().splitlines()
     # Header + 2 arg-combos = 3 lines
     assert len(rows) == 3
     header = rows[0].split(",")

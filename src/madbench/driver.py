@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .utils import detect_hardware, get_git_sha, get_timestamp
+from .utils import detect_hardware, format_hardware_summary, get_git_sha, get_timestamp
 from .workspace import (
     WorkspaceConfig,
     find_workspace,
@@ -215,11 +215,22 @@ class MadBench:
             mgv: self._version_run_dir(workdir_base, test.name, timestamp, mgv)
             for mgv in test.mg_version
         }
-        result_dir = self.workspace.results_dir / test.result_group
-        run_log_dir = self.workspace.logs_dir / f"{test.name}_{timestamp}"
 
         git_sha = get_git_sha(self.workspace.root)
         hardware = detect_hardware()
+        hostname = hardware["hostname"]
+
+        # Per-run result dir. Every madbench run produces its own subfolder
+        # under results/<group>/, fully self-contained: own results.csv,
+        # summary.csv, metadata.yml, and artifacts subtree. Two machines (or
+        # two consecutive runs on one machine) never write to the same file,
+        # so syncing a centralized results/ repo from multiple hosts cannot
+        # produce git conflicts within an existing run. Cross-run aggregation
+        # is the job of post-processing scripts.
+        result_group_dir = self.workspace.results_dir / test.result_group
+        result_dir = result_group_dir / f"{test.name}_{timestamp}_{hostname}"
+        run_log_dir = self.workspace.logs_dir / f"{test.name}_{timestamp}"
+
         metadata: dict[str, Any] = {
             "test_name": test.name,
             "description": test.description,
@@ -269,6 +280,7 @@ class MadBench:
 
         try:
             with TeeLogger(main_log) as tee:
+                print(f"[madbench] Host: {format_hardware_summary(hardware)}")
                 for mgv in test.mg_version:
                     run_dir = run_dirs[mgv]
                     inputs_dir = run_dir / "inputs"
@@ -403,6 +415,11 @@ class MadBench:
             metadata["csv_path"] = str(csv_path)
             if summary_csv_path is not None:
                 metadata["summary_csv_path"] = str(summary_csv_path)
+            metadata_yml_path = self._write_run_metadata(
+                test, timestamp, hostname, git_sha, hardware,
+                run_dirs, result_dir,
+            )
+            metadata["metadata_yml_path"] = str(metadata_yml_path)
             bundle_logs(run_log_dir, main_log, metadata, archive_path)
 
         total_time = time.monotonic() - wall_start
@@ -421,45 +438,21 @@ class MadBench:
         print(f"[madbench] Log archive: {archive_path}")
 
     def plot(self, test_path: Path) -> None:
-        """Load the test, import its plot module, call ``plot(result_path)``,
-        and display the figure with ``plotly.io.show()``.
+        """Plotting is deprecated for now.
 
-        ``result_path`` is ``results/<result_group>/``; modules typically
-        read ``result_path / 'results.csv'`` but may also descend into the
-        per-invocation subdirectories for additional files.
+        With the per-run result layout each ``madbench run`` produces its own
+        ``<test>_<timestamp>_<hostname>/results.csv`` rather than a single
+        accumulating CSV per ``result_group``. Plotting therefore needs a
+        cross-run aggregation step that hasn't been designed yet, so the
+        command short-circuits with a notice instead of guessing a layout.
         """
-        try:
-            import plotly.io as pio
-        except ImportError:
-            print("[madbench] plotly is not installed. Run: pip install 'madbench[plot]'")
-            return
-
-        test = self.load_test(test_path)
-
-        if not test.plot:
-            print(f"[madbench] Test '{test.name}' has no plot module defined.")
-            return
-
-        plot_path = resolve_plot_module(self.workspace, test.plot)
-        if plot_path is None:
-            print(f"[madbench] Plot module not found: {self.workspace.plots_dir / test.plot}.py")
-            return
-
-        spec = importlib.util.spec_from_file_location(test.plot, plot_path)
-        if spec is None or spec.loader is None:
-            print(f"[madbench] Failed to load plot module: {plot_path}")
-            return
-
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-
-        if not hasattr(module, "plot"):
-            print(f"[madbench] Plot module {plot_path} must define a 'plot(result_path)' function.")
-            return
-
-        result_path = self.workspace.results_dir / test.result_group
-        fig = module.plot(result_path)
-        pio.show(fig)
+        print(
+            "[madbench] 'plot' is deprecated and not currently supported. "
+            "Each madbench run now writes its own results CSV under "
+            "results/<group>/<test>_<timestamp>_<hostname>/; a future "
+            "release will reintroduce plotting once the cross-run "
+            "aggregation story is settled."
+        )
 
     def list_tests(self) -> list[dict]:
         """List all .yml files in the tests/ directory.
@@ -683,7 +676,8 @@ class MadBench:
         """Header for summary.csv: per-(mg_version, arg-combo) stats. Each
         numeric column from ``outputs`` (plus ``wall_time``) becomes a
         ``_mean``/``_std`` pair; ``n_successful`` records the count actually
-        averaged."""
+        averaged. Hostname is not in this CSV — it lives once in the
+        sibling metadata.yml since every row belongs to the same run."""
         cols = ["timestamp", "mg_version"] + list(test.args.keys())
         for k in test.outputs + ["wall_time"]:
             cols.extend([f"{k}_mean", f"{k}_std"])
@@ -765,6 +759,42 @@ class MadBench:
 
         append_row(csv_path, csv_header, row, write_header)
         return row
+
+    def _write_run_metadata(
+        self,
+        test: TestDefinition,
+        timestamp: str,
+        hostname: str,
+        git_sha: Optional[str],
+        hardware: dict,
+        run_dirs: dict[str, Path],
+        result_dir: Path,
+    ) -> Path:
+        """Write ``metadata.yml`` inside the per-run result dir.
+
+        One file per ``madbench run`` invocation, sibling of the run's own
+        ``results.csv`` and ``summary.csv``. The per-run dir name encodes
+        ``<test>_<timestamp>_<hostname>``, so the file is path-independent —
+        no other run writes here, no merging needed. Cross-run aggregation
+        is a post-processing concern (walk ``<result_group>/*/metadata.yml``)."""
+        import yaml as _yaml
+
+        run_meta: dict[str, Any] = {
+            "test_name": test.name,
+            "timestamp": timestamp,
+            "hostname": hostname,
+            "git_sha": git_sha,
+            "mg_versions": list(test.mg_version),
+            "repeat": test.repeat,
+            "hardware": hardware,
+            "run_dirs": {mgv: str(p) for mgv, p in run_dirs.items()},
+        }
+        result_dir.mkdir(parents=True, exist_ok=True)
+        path = result_dir / "metadata.yml"
+        path.write_text(
+            _yaml.safe_dump(run_meta, sort_keys=False, allow_unicode=True),
+        )
+        return path
 
     def _write_summary(
         self,
@@ -917,6 +947,7 @@ class MadBench:
         import yaml as _yaml
 
         print("[madbench] DRY RUN — no files will be created or scripts executed")
+        print(f"[madbench] Host: {format_hardware_summary(metadata['hardware'])}")
         print(f"[madbench] Test: {test.name}")
         print(f"[madbench] Script: {script_path}")
         print(f"[madbench] mg_versions: {list(run_dirs.keys())}")
