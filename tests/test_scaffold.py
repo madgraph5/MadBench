@@ -9,16 +9,27 @@ def test_init_workspace_creates_structure(tmp_path):
     assert (tmp_path / "madbench.yml").exists()
     assert (tmp_path / ".gitignore").exists()
 
-    for d in ["scripts", "tests", "plots", "results", "logs", "scratch", "analysis", "gridpacks", "MadGraph"]:
+    for d in ["scripts", "tests", "plots", "results", "logs", "scratch", "analysis", "inputs", "gridpacks", "MadGraph"]:
         assert (tmp_path / d).is_dir(), f"Expected directory: {d}"
 
 
-def test_init_workspace_idempotent(tmp_path, capsys):
-    init_workspace(tmp_path)
+def test_init_workspace_tops_up_missing_dirs(tmp_path):
+    """Re-running init on an existing workspace (e.g. a fresh clone) should
+    create the local-only dirs without rewriting the version-controlled files."""
+    import shutil as _shutil
+
     init_workspace(tmp_path)
 
-    captured = capsys.readouterr()
-    assert "already initialized" in captured.out
+    yml_before = (tmp_path / "madbench.yml").read_text()
+    (tmp_path / "madbench.yml").write_text(yml_before + "\n# user edit\n")
+    _shutil.rmtree(tmp_path / "scratch")
+    _shutil.rmtree(tmp_path / "MadGraph")
+
+    init_workspace(tmp_path)
+
+    assert (tmp_path / "scratch").is_dir()
+    assert (tmp_path / "MadGraph").is_dir()
+    assert (tmp_path / "madbench.yml").read_text().endswith("# user edit\n")
 
 
 def test_init_workspace_madbench_yml_content(tmp_path):
