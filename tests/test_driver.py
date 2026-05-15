@@ -936,6 +936,272 @@ def test_run_output_files_scoped_per_version(tmp_path):
     assert v2_out == "v2"
 
 
+def _install_mock_mg(ws_root: Path, version: str, body: str | None = None) -> Path:
+    """Create a fake MadGraph install at MadGraph/<version>/bin/mg5_aMC.
+
+    The default body parses the proc_card and emits one folder per ``output``
+    directive, mimicking the parts of MG behaviour MadBench actually cares
+    about.
+    """
+    bin_dir = ws_root / "MadGraph" / version / "bin"
+    bin_dir.mkdir(parents=True)
+    mg = bin_dir / "mg5_aMC"
+    mg.write_text(
+        body
+        or (
+            "#!/bin/bash\n"
+            "# Mock MadGraph: read proc card, mkdir each `output` target in cwd.\n"
+            "card=\"$1\"\n"
+            "while read -r line; do\n"
+            "    case \"$line\" in\n"
+            "        output\\ *) mkdir -p \"${line#output }\" ;;\n"
+            "    esac\n"
+            "done < \"$card\"\n"
+        )
+    )
+    mg.chmod(mg.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return mg
+
+
+def test_load_test_proc_cards_default_empty(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    td = mb.load_test(test_file)
+    assert td.proc_cards == []
+
+
+def test_load_test_proc_cards_parsed(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g",
+            "proc_cards": ["inputs/proc_a.dat", "inputs/proc_b.dat"],
+        },
+    )
+    td = mb.load_test(test_file)
+    assert td.proc_cards == ["inputs/proc_a.dat", "inputs/proc_b.dat"]
+
+
+def test_run_generates_process_dirs(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "ls \"$MADBENCH_PROCESSES\" > listing.txt\n"
+        ),
+    )
+    _install_mock_mg(ws_root, "v1")
+    (ws_root / "inputs").mkdir(exist_ok=True)
+    (ws_root / "inputs" / "card1.dat").write_text("output proc_a\n")
+    (ws_root / "inputs" / "card2.dat").write_text("output proc_b\n")
+
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "gen", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v1"],
+            "proc_cards": ["inputs/card1.dat", "inputs/card2.dat"],
+        },
+    )
+    mb.run(test_file)
+
+    run_dir = next((ws_root / "scratch" / "v1").glob("gen_*"))
+    assert (run_dir / "processes" / "proc_a").is_dir()
+    assert (run_dir / "processes" / "proc_b").is_dir()
+    # Script saw both via $MADBENCH_PROCESSES
+    listing = (run_dir / "invocation_001" / "listing.txt").read_text()
+    assert "proc_a" in listing and "proc_b" in listing
+
+
+def test_run_generates_once_per_version_not_per_invocation(tmp_path):
+    """proc_cards generation must run once per (mg_version, card), not once
+    per invocation. The mock MG appends to a counter file to verify."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    counter = ws_root / "mg_call_count.txt"
+    counter.write_text("0\n")
+    _install_mock_mg(
+        ws_root,
+        "v1",
+        body=(
+            "#!/bin/bash\n"
+            f"n=$(cat {counter} 2>/dev/null || echo 0)\n"
+            f"echo $((n + 1)) > {counter}\n"
+            "card=\"$1\"\n"
+            "while read -r line; do\n"
+            "    case \"$line\" in\n"
+            "        output\\ *) mkdir -p \"${line#output }\" ;;\n"
+            "    esac\n"
+            "done < \"$card\"\n"
+        ),
+    )
+    (ws_root / "inputs").mkdir(exist_ok=True)
+    (ws_root / "inputs" / "card.dat").write_text("output p\n")
+
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "once", "script": "hello.sh",
+            "args": {"x": [1, 2, 3]},  # 3 invocations
+            "result_group": "g", "mg_version": ["v1"],
+            "proc_cards": ["inputs/card.dat"],
+        },
+    )
+    mb.run(test_file)
+
+    # 1 version × 1 card = 1 MG call, regardless of 3 invocations
+    assert counter.read_text().strip() == "1"
+
+
+def test_run_proc_cards_requires_mg_version(tmp_path):
+    """proc_cards with mg_version=='none' is a configuration error — the
+    version's invocations get the proc-gen-failed exit code."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    (ws_root / "inputs").mkdir(exist_ok=True)
+    (ws_root / "inputs" / "card.dat").write_text("output p\n")
+
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "needsmg", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g",
+            "proc_cards": ["inputs/card.dat"],
+            # mg_version intentionally omitted → "none"
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    ec_idx = header.index("exit_code")
+    assert rows[1].split(",")[ec_idx] == "-3"
+
+
+def test_run_proc_cards_missing_mg_binary(tmp_path):
+    """When the MadGraph binary doesn't exist for the requested version,
+    invocations are recorded with the proc-gen-failed sentinel."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    (ws_root / "inputs").mkdir(exist_ok=True)
+    (ws_root / "inputs" / "card.dat").write_text("output p\n")
+    # NOTE: no mock MG installed for "ghost" version.
+
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "noghost", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["ghost"],
+            "proc_cards": ["inputs/card.dat"],
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    ec_idx = header.index("exit_code")
+    assert rows[1].split(",")[ec_idx] == "-3"
+
+
+def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
+    """When MG exits non-zero, the script does not run for that version."""
+    ws_root = make_workspace(tmp_path)
+    marker = ws_root / "script_ran.txt"
+    make_script(
+        ws_root,
+        body=f"#!/bin/bash\necho ran > {marker}\n",
+    )
+    _install_mock_mg(
+        ws_root,
+        "v1",
+        body="#!/bin/bash\necho 'pretend MG failure' >&2\nexit 7\n",
+    )
+    (ws_root / "inputs").mkdir(exist_ok=True)
+    (ws_root / "inputs" / "card.dat").write_text("output p\n")
+
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "mgfail", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v1"],
+            "proc_cards": ["inputs/card.dat"],
+        },
+    )
+    mb.run(test_file)
+
+    assert not marker.exists()  # script never ran
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    ec_idx = header.index("exit_code")
+    assert rows[1].split(",")[ec_idx] == "-3"
+
+
+def test_run_proc_cards_one_version_fails_others_continue(tmp_path):
+    """If proc-gen fails for one mg_version, the other versions still run."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    # v_good has a working mock MG; v_bad's binary will not exist.
+    _install_mock_mg(ws_root, "v_good")
+    (ws_root / "inputs").mkdir(exist_ok=True)
+    (ws_root / "inputs" / "card.dat").write_text("output p\n")
+
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "mixed", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "mg_version": ["v_good", "v_bad"],
+            "proc_cards": ["inputs/card.dat"],
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    ec_idx = header.index("exit_code")
+    mgv_idx = header.index("mg_version")
+    by_version = {r.split(",")[mgv_idx]: r.split(",")[ec_idx] for r in rows[1:]}
+    assert by_version["v_good"] == "0"
+    assert by_version["v_bad"] == "-3"
+
+
+def test_run_processes_env_var_set_even_without_proc_cards(tmp_path):
+    """$MADBENCH_PROCESSES is always exposed so scripts can rely on it."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"PROCESSES=$MADBENCH_PROCESSES\"\n"
+            "[ -d \"$MADBENCH_PROCESSES\" ] && echo \"DIR_EXISTS\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "penv", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    archives = list((ws_root / "logs").glob("penv_*.tar.gz"))
+    with tarfile.open(archives[0]) as tar:
+        log = tar.extractfile("main.log").read().decode()
+    assert "PROCESSES=" in log and "/processes" in log
+    assert "DIR_EXISTS" in log
+
+
 def test_run_inputs_staged_per_version(tmp_path):
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)

@@ -27,6 +27,10 @@ _REQUIRED_FIELDS = {"name", "script", "args", "result_group"}
 
 OUTPUT_FILE_NAME = ".madbench_output.json"
 
+# Distinct exit code recorded in the CSV when a version's proc_card
+# generation step failed and the script was therefore not run.
+PROC_GEN_FAILED_EXIT_CODE = -3
+
 
 MG_VERSION_NONE = "none"
 
@@ -54,6 +58,11 @@ class TestDefinition:
     # Outer sweep dimension. Each entry is a folder name under MadGraph/.
     # The sentinel "none" means MadGraph is not selected for this run — no
     # workdir segment, MG_BIN exposed as empty, MG_VERSION="none" in the CSV.
+    proc_cards: list[str] = field(default_factory=list)
+    # Workspace-relative paths to MadGraph proc-card files. When non-empty,
+    # MadGraph is invoked once per (mg_version, proc_card) with cwd set to
+    # <run_dir>/processes/ before the test script runs. Requires a real
+    # mg_version (i.e. not the "none" sentinel).
 
 
 def _normalize_zip_groups(raw_zip: Any) -> list[list[str]]:
@@ -152,6 +161,7 @@ class MadBench:
             raw=raw,
             zip_groups=_normalize_zip_groups(raw.get("zip")),
             mg_version=_normalize_mg_version(raw.get("mg_version")),
+            proc_cards=_as_str_list(raw.get("proc_cards"), "proc_cards"),
         )
 
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
@@ -208,7 +218,7 @@ class MadBench:
             self._print_dry_run(test, script_path, run_dirs, result_dir, commands, metadata)
             return
 
-        # Prepare per-version run dirs + inputs (once per version)
+        # Prepare per-version run dirs + inputs + processes (once per version)
         result_dir.mkdir(parents=True, exist_ok=True)
         run_log_dir.mkdir(parents=True, exist_ok=True)
         for mgv, rd in run_dirs.items():
@@ -218,6 +228,7 @@ class MadBench:
                 stage_inputs(self.workspace.root, test.inputs, inputs_dir)
             else:
                 inputs_dir.mkdir(parents=True, exist_ok=True)
+            (rd / "processes").mkdir(parents=True, exist_ok=True)
 
         # CSV setup
         csv_header = self._csv_header(test)
@@ -237,7 +248,14 @@ class MadBench:
                 for mgv in test.mg_version:
                     run_dir = run_dirs[mgv]
                     inputs_dir = run_dir / "inputs"
+                    processes_dir = run_dir / "processes"
                     result_version_dir = self._version_result_dir(result_dir, mgv)
+
+                    proc_gen_ok = True
+                    if test.proc_cards:
+                        proc_gen_ok = self._generate_processes(
+                            test, mgv, run_dir, tee.write_fd,
+                        )
 
                     for version_i in range(1, n_per_version + 1):
                         global_i += 1
@@ -250,9 +268,32 @@ class MadBench:
                         invocation_dir.mkdir(parents=True, exist_ok=True)
                         output_file = invocation_dir / OUTPUT_FILE_NAME
 
+                        if not proc_gen_ok:
+                            invocation_ts = get_timestamp()
+                            self._record_skipped_invocation(
+                                test, combo, mgv, invocation_id,
+                                csv_path, csv_header, write_header,
+                                invocation_ts,
+                            )
+                            write_header = False
+                            results.append({
+                                "command": " ".join(cmd),
+                                "invocation_id": invocation_id,
+                                "mg_version": mgv,
+                                "exit_code": PROC_GEN_FAILED_EXIT_CODE,
+                                "wall_time": 0.0,
+                            })
+                            print(
+                                f"[madbench] SKIP ({global_i}/{len(commands)}): "
+                                f"[{invocation_id} mg_version={mgv}] — proc_card "
+                                "generation failed for this version"
+                            )
+                            continue
+
                         env = os.environ.copy()
                         env["MADBENCH_WORKDIR"] = str(invocation_dir)
                         env["MADBENCH_INPUTS"] = str(inputs_dir)
+                        env["MADBENCH_PROCESSES"] = str(processes_dir)
                         env["MADBENCH_OUTPUT_FILE"] = str(output_file)
                         env["MG_VERSION"] = mgv
                         env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
@@ -515,6 +556,66 @@ class MadBench:
             return None
         return self.workspace.root / "MadGraph" / mg_version / "bin" / "mg5_aMC"
 
+    def _generate_processes(
+        self,
+        test: TestDefinition,
+        mg_version: str,
+        run_dir: Path,
+        tee_fd: int,
+    ) -> bool:
+        """Run MadGraph once per proc_card with cwd=<run_dir>/processes/.
+
+        Returns True on success, False on any failure (missing binary, missing
+        card, non-zero MG exit). Diagnostic messages are printed to stdout so
+        they end up in main.log via ``tee_fd``.
+        """
+        mg_bin = self._resolve_mg_bin(mg_version)
+        if mg_bin is None:
+            print(
+                "[madbench] ERROR: 'proc_cards' is set but mg_version is "
+                f"'{MG_VERSION_NONE}'. Set mg_version to a MadGraph install "
+                "folder to enable process generation."
+            )
+            return False
+        if not mg_bin.exists():
+            print(
+                f"[madbench] ERROR: MadGraph binary not found at {mg_bin} "
+                f"(required by mg_version='{mg_version}')."
+            )
+            return False
+
+        processes_dir = run_dir / "processes"
+        processes_dir.mkdir(parents=True, exist_ok=True)
+
+        for card in test.proc_cards:
+            card_path = (self.workspace.root / card).resolve()
+            if not card_path.exists():
+                print(f"[madbench] ERROR: proc_card not found: {card}")
+                return False
+            print(
+                f"[madbench] Generating processes from {card} "
+                f"(mg_version={mg_version})..."
+            )
+            try:
+                proc = subprocess.Popen(
+                    [str(mg_bin), str(card_path)],
+                    stdout=tee_fd,
+                    stderr=subprocess.STDOUT,
+                    cwd=processes_dir,
+                    close_fds=True,
+                )
+                exit_code = proc.wait()
+            except OSError as e:
+                print(f"[madbench] ERROR: failed to invoke MadGraph: {e}")
+                return False
+            if exit_code != 0:
+                print(
+                    f"[madbench] ERROR: MadGraph exited {exit_code} for "
+                    f"proc_card {card} (mg_version={mg_version})."
+                )
+                return False
+        return True
+
     def _version_result_dir(self, result_dir: Path, mg_version: str) -> Path:
         """Per-mg_version slice of the result dir for ``output_files`` copies.
         The version segment is dropped when ``mg_version`` is "none" so
@@ -568,6 +669,34 @@ class MadBench:
             row[k] = combo[k]
         for k in test.outputs:
             row[k] = output_values.get(k, "")
+
+        append_row(csv_path, csv_header, row, write_header)
+
+    def _record_skipped_invocation(
+        self,
+        test: TestDefinition,
+        combo: dict[str, Any],
+        mg_version: str,
+        invocation_id: str,
+        csv_path: Path,
+        csv_header: list[str],
+        write_header: bool,
+        invocation_ts: str,
+    ) -> None:
+        """Write a CSV row marking an invocation that was skipped because
+        proc_card generation failed for its mg_version. No script ran, so
+        outputs are blank and ``exit_code`` is the proc-gen sentinel."""
+        row: dict[str, Any] = {
+            "timestamp": invocation_ts,
+            "mg_version": mg_version,
+            "exit_code": PROC_GEN_FAILED_EXIT_CODE,
+            "wall_time": 0.0,
+            "invocation_id": invocation_id,
+        }
+        for k in test.args:
+            row[k] = combo[k]
+        for k in test.outputs:
+            row[k] = ""
 
         append_row(csv_path, csv_header, row, write_header)
 
@@ -663,6 +792,13 @@ class MadBench:
             print("[madbench] Inputs (staged per mg_version into <run_dir>/inputs):")
             for pat in test.inputs:
                 print(f"  {pat}")
+        if test.proc_cards:
+            print(
+                "[madbench] Proc cards (generated per mg_version into "
+                "<run_dir>/processes):"
+            )
+            for card in test.proc_cards:
+                print(f"  {card}")
         if test.outputs:
             print(f"[madbench] Outputs (CSV columns): {test.outputs}")
         if test.output_files:
