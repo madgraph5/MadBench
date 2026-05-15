@@ -531,8 +531,8 @@ def test_run_copies_output_files_with_arg_substitution(tmp_path):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    inv1 = ws_root / "results" / "g" / "invocation_001" / "gridpack_1" / "timings.txt"
-    inv2 = ws_root / "results" / "g" / "invocation_002" / "gridpack_2" / "timings.txt"
+    inv1 = ws_root / "results" / "g" / "invocation_001" / "01" / "gridpack_1" / "timings.txt"
+    inv2 = ws_root / "results" / "g" / "invocation_002" / "01" / "gridpack_2" / "timings.txt"
     assert inv1.exists() and inv1.read_text().strip() == "timings for 1"
     assert inv2.exists() and inv2.read_text().strip() == "timings for 2"
 
@@ -903,8 +903,8 @@ def test_run_invocation_ids_align_across_versions(tmp_path):
     v1_root = next((ws_root / "scratch" / "v1").glob("align_*"))
     v2_root = next((ws_root / "scratch" / "v2").glob("align_*"))
     for inv, expected_x in [("invocation_001", "10"), ("invocation_002", "20"), ("invocation_003", "30")]:
-        v1_marker = (v1_root / inv / "marker.txt").read_text().strip()
-        v2_marker = (v2_root / inv / "marker.txt").read_text().strip()
+        v1_marker = (v1_root / inv / "01" / "marker.txt").read_text().strip()
+        v2_marker = (v2_root / inv / "01" / "marker.txt").read_text().strip()
         assert v1_marker == f"{expected_x} v1"
         assert v2_marker == f"{expected_x} v2"
 
@@ -930,8 +930,8 @@ def test_run_output_files_scoped_per_version(tmp_path):
     )
     mb.run(test_file)
 
-    v1_out = (ws_root / "results" / "g" / "v1" / "invocation_001" / "out.log").read_text().strip()
-    v2_out = (ws_root / "results" / "g" / "v2" / "invocation_001" / "out.log").read_text().strip()
+    v1_out = (ws_root / "results" / "g" / "v1" / "invocation_001" / "01" / "out.log").read_text().strip()
+    v2_out = (ws_root / "results" / "g" / "v2" / "invocation_001" / "01" / "out.log").read_text().strip()
     assert v1_out == "v1"
     assert v2_out == "v2"
 
@@ -1017,7 +1017,7 @@ def test_run_generates_process_dirs(tmp_path):
     assert (run_dir / "processes" / "proc_a").is_dir()
     assert (run_dir / "processes" / "proc_b").is_dir()
     # Script saw both via $MADBENCH_PROCESSES
-    listing = (run_dir / "invocation_001" / "listing.txt").read_text()
+    listing = (run_dir / "invocation_001" / "01" / "listing.txt").read_text()
     assert "proc_a" in listing and "proc_b" in listing
 
 
@@ -1200,6 +1200,318 @@ def test_run_processes_env_var_set_even_without_proc_cards(tmp_path):
         log = tar.extractfile("main.log").read().decode()
     assert "PROCESSES=" in log and "/processes" in log
     assert "DIR_EXISTS" in log
+
+
+# -----------------------------------------------------------------------
+# repeat (statistical repetitions)
+# -----------------------------------------------------------------------
+
+
+def test_load_test_repeat_defaults_to_1(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    td = mb.load_test(test_file)
+    assert td.repeat == 1
+
+
+def test_load_test_repeat_invalid_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    for bad in [0, -1, "5", 1.5, True]:
+        test_file = make_test_yaml(
+            ws_root,
+            {
+                "name": "t", "script": "hello.sh", "args": {"x": 1},
+                "result_group": "g", "repeat": bad,
+            },
+            name=f"bad_{type(bad).__name__}_{bad}.yml".replace(" ", "_"),
+        )
+        with pytest.raises(ValueError, match="repeat"):
+            mb.load_test(test_file)
+
+
+def test_run_creates_rep_subdirs(tmp_path):
+    """Each repetition gets its own zero-padded subdir under invocation_NNN/."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"rep=$MADBENCH_REPETITION\" > rep_marker.txt\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "rep", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "repeat": 3,
+        },
+    )
+    mb.run(test_file)
+
+    run_dir = next((ws_root / "scratch").glob("rep_*"))
+    inv = run_dir / "invocation_001"
+    assert (inv / "01" / "rep_marker.txt").read_text().strip() == "rep=01"
+    assert (inv / "02" / "rep_marker.txt").read_text().strip() == "rep=02"
+    assert (inv / "03" / "rep_marker.txt").read_text().strip() == "rep=03"
+
+
+def test_run_rep_subdir_for_repeat_1(tmp_path):
+    """Even with repeat=1 (the default) we always nest into 01/ for
+    uniform structure across single- and multi-rep tests."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root, body="#!/bin/bash\necho hi > marker.txt\n")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "single", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    run_dir = next((ws_root / "scratch").glob("single_*"))
+    assert (run_dir / "invocation_001" / "01" / "marker.txt").exists()
+    # Nothing should have landed at the legacy flat location.
+    assert not (run_dir / "invocation_001" / "marker.txt").exists()
+
+
+def test_run_csv_has_repetition_column_with_row_per_rep(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"{\\\"v\\\": $1}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "csvr", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g", "outputs": ["v"], "repeat": 3,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "results.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    assert "repetition" in header
+    rep_idx = header.index("repetition")
+    inv_idx = header.index("invocation_id")
+    # 2 combos × 3 reps = 6 data rows. Each combo has reps 01, 02, 03.
+    assert len(rows) == 7
+    by_inv: dict[str, list[str]] = {}
+    for row in rows[1:]:
+        cells = row.split(",")
+        by_inv.setdefault(cells[inv_idx], []).append(cells[rep_idx])
+    assert by_inv["invocation_001"] == ["01", "02", "03"]
+    assert by_inv["invocation_002"] == ["01", "02", "03"]
+
+
+def test_run_output_files_scoped_per_rep(tmp_path):
+    """Same invocation across reps writes to different result subdirs."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"$MADBENCH_REPETITION\" > out.log\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "outr", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "output_files": ["out.log"], "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+
+    inv = ws_root / "results" / "g" / "invocation_001"
+    assert (inv / "01" / "out.log").read_text().strip() == "01"
+    assert (inv / "02" / "out.log").read_text().strip() == "02"
+
+
+def test_run_summary_csv_mean_std_n_successful(tmp_path):
+    """summary.csv aggregates numeric outputs across successful reps."""
+    ws_root = make_workspace(tmp_path)
+    # Script writes a value derived from the rep number so mean is predictable.
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "v=$((10 + 10#$MADBENCH_REPETITION))\n"
+            "echo \"{\\\"throughput\\\": $v}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "sum", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "outputs": ["throughput"], "repeat": 3,
+        },
+    )
+    mb.run(test_file)
+
+    summary = ws_root / "results" / "g" / "summary.csv"
+    assert summary.exists()
+    rows = summary.read_text().splitlines()
+    header = rows[0].split(",")
+    assert "throughput_mean" in header
+    assert "throughput_std" in header
+    assert "n_successful" in header
+    cells = dict(zip(header, rows[1].split(",")))
+    # throughput values were 11, 12, 13 → mean 12, sample std = 1
+    assert float(cells["throughput_mean"]) == 12.0
+    assert float(cells["throughput_std"]) == 1.0
+    assert cells["n_successful"] == "3"
+
+
+def test_run_summary_excludes_failed_reps_from_average(tmp_path):
+    """Failed reps don't pollute the mean; n_successful reflects the count
+    that actually contributed."""
+    ws_root = make_workspace(tmp_path)
+    # Reps 01 and 03 succeed with throughput=100; rep 02 exits non-zero
+    # without writing its outputs file.
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "if [ \"$MADBENCH_REPETITION\" = \"02\" ]; then exit 1; fi\n"
+            "echo '{\"throughput\": 100}' > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "mix", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "outputs": ["throughput"], "repeat": 3,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    cells = dict(zip(header, rows[1].split(",")))
+    assert cells["n_successful"] == "2"
+    assert float(cells["throughput_mean"]) == 100.0
+    # Sample std of [100, 100] is 0.0
+    assert float(cells["throughput_std"]) == 0.0
+
+
+def test_run_summary_handles_all_failures(tmp_path):
+    """A row with zero successful reps gets empty mean/std and n=0."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root, body="#!/bin/bash\nexit 1\n")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "allbad", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "outputs": ["throughput"], "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    cells = dict(zip(header, rows[1].split(",")))
+    assert cells["n_successful"] == "0"
+    assert cells["throughput_mean"] == ""
+    assert cells["throughput_std"] == ""
+
+
+def test_run_summary_skips_non_numeric_outputs(tmp_path):
+    """Non-numeric outputs produce empty mean/std cells (no crash)."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo '{\"throughput\": 50, \"note\": \"ok\"}' > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "mixed_outs", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "outputs": ["throughput", "note"], "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    cells = dict(zip(header, rows[1].split(",")))
+    assert float(cells["throughput_mean"]) == 50.0
+    assert cells["note_mean"] == ""
+    assert cells["note_std"] == ""
+
+
+def test_run_summary_one_row_per_arg_combo(tmp_path):
+    """Multiple arg combos each produce their own summary row."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"{\\\"v\\\": $1}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "multi", "script": "hello.sh", "args": {"x": [10, 20]},
+            "result_group": "g", "outputs": ["v"], "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (ws_root / "results" / "g" / "summary.csv").read_text().splitlines()
+    # Header + 2 arg-combos = 3 lines
+    assert len(rows) == 3
+    header = rows[0].split(",")
+    x_idx = header.index("x")
+    v_mean_idx = header.index("v_mean")
+    by_x = {r.split(",")[x_idx]: float(r.split(",")[v_mean_idx]) for r in rows[1:]}
+    assert by_x == {"10": 10.0, "20": 20.0}
+
+
+def test_run_other_reps_continue_when_one_fails(tmp_path):
+    """A failing rep doesn't poison its sibling reps."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "if [ \"$MADBENCH_REPETITION\" = \"02\" ]; then exit 1; fi\n"
+            "echo ok > marker.txt\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "isol", "script": "hello.sh", "args": {"x": 1},
+            "result_group": "g", "repeat": 3,
+        },
+    )
+    mb.run(test_file)
+
+    run_dir = next((ws_root / "scratch").glob("isol_*"))
+    assert (run_dir / "invocation_001" / "01" / "marker.txt").exists()
+    assert not (run_dir / "invocation_001" / "02" / "marker.txt").exists()
+    assert (run_dir / "invocation_001" / "03" / "marker.txt").exists()
 
 
 def test_run_inputs_staged_per_version(tmp_path):

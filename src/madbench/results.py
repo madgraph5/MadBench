@@ -11,21 +11,22 @@ RESULTS_EXT = ".csv"
 def select_results_csv(
     result_dir: Path,
     expected_header: list[str],
+    basename: str = RESULTS_BASENAME,
 ) -> tuple[Path, bool]:
-    """Pick the right results.csv to append to for ``expected_header``.
+    """Pick the right ``<basename>.csv`` to append to for ``expected_header``.
 
     Returns ``(path, must_write_header)``. The selected file is either:
 
-    - ``results.csv`` if it doesn't yet exist (header to be written),
-    - ``results.csv`` if its existing header matches ``expected_header``,
-    - the first ``results.N.csv`` (N >= 2) whose header matches, or
-    - the next unused ``results.N.csv`` if none match (header to be written).
+    - ``<basename>.csv`` if it doesn't yet exist (header to be written),
+    - ``<basename>.csv`` if its existing header matches ``expected_header``,
+    - the first ``<basename>.N.csv`` (N >= 2) whose header matches, or
+    - the next unused ``<basename>.N.csv`` if none match (header to be written).
 
     This keeps every CSV self-consistent: when the test's args or outputs
     change between runs, the new schema rolls over to a fresh file instead
     of silently misaligning columns.
     """
-    primary = result_dir / f"{RESULTS_BASENAME}{RESULTS_EXT}"
+    primary = result_dir / f"{basename}{RESULTS_EXT}"
     if not primary.exists():
         return primary, True
 
@@ -34,7 +35,7 @@ def select_results_csv(
 
     n = 2
     while True:
-        candidate = result_dir / f"{RESULTS_BASENAME}.{n}{RESULTS_EXT}"
+        candidate = result_dir / f"{basename}.{n}{RESULTS_EXT}"
         if not candidate.exists():
             return candidate, True
         if _read_header(candidate) == expected_header:

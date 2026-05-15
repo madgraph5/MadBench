@@ -63,6 +63,10 @@ class TestDefinition:
     # MadGraph is invoked once per (mg_version, proc_card) with cwd set to
     # <run_dir>/processes/ before the test script runs. Requires a real
     # mg_version (i.e. not the "none" sentinel).
+    repeat: int = 1
+    # Number of statistical repetitions per arg-combo. Each rep gets its own
+    # <invocation>/RR/ subdir (zero-padded), its own row in the main CSV, and
+    # contributes to the per-(mg_version, arg-combo) summary CSV.
 
 
 def _normalize_zip_groups(raw_zip: Any) -> list[list[str]]:
@@ -90,6 +94,17 @@ def _as_str_list(value: Any, field_name: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
         raise ValueError(f"{field_name!r} must be a list of strings")
     return list(value)
+
+
+def _normalize_repeat(raw: Any) -> int:
+    """Accept missing/None → 1, or a positive int. Reject anything else."""
+    if raw is None:
+        return 1
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"'repeat' must be a positive integer, got {type(raw).__name__}")
+    if raw < 1:
+        raise ValueError(f"'repeat' must be >= 1, got {raw}")
+    return raw
 
 
 def _normalize_mg_version(raw: Any) -> list[str]:
@@ -162,6 +177,7 @@ class MadBench:
             zip_groups=_normalize_zip_groups(raw.get("zip")),
             mg_version=_normalize_mg_version(raw.get("mg_version")),
             proc_cards=_as_str_list(raw.get("proc_cards"), "proc_cards"),
+            repeat=_normalize_repeat(raw.get("repeat")),
         )
 
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
@@ -241,7 +257,10 @@ class MadBench:
         wall_start = time.monotonic()
 
         n_per_version = len(sweep_points) // len(test.mg_version)
+        total_runs = len(sweep_points) * test.repeat
         global_i = 0
+        script_idx = 0
+        csv_rows: list[dict[str, Any]] = []
 
         try:
             with TeeLogger(main_log) as tee:
@@ -266,98 +285,119 @@ class MadBench:
                         invocation_id = f"invocation_{version_i:03d}"
                         invocation_dir = run_dir / invocation_id
                         invocation_dir.mkdir(parents=True, exist_ok=True)
-                        output_file = invocation_dir / OUTPUT_FILE_NAME
 
-                        if not proc_gen_ok:
+                        for rep_i in range(1, test.repeat + 1):
+                            script_idx += 1
+                            rep_id = f"{rep_i:02d}"
+                            rep_dir = invocation_dir / rep_id
+                            rep_dir.mkdir(parents=True, exist_ok=True)
+                            output_file = rep_dir / OUTPUT_FILE_NAME
+
+                            if not proc_gen_ok:
+                                invocation_ts = get_timestamp()
+                                row = self._record_skipped_invocation(
+                                    test, combo, mgv, invocation_id, rep_id,
+                                    csv_path, csv_header, write_header,
+                                    invocation_ts,
+                                )
+                                write_header = False
+                                csv_rows.append(row)
+                                results.append({
+                                    "command": " ".join(cmd),
+                                    "invocation_id": invocation_id,
+                                    "repetition": rep_id,
+                                    "mg_version": mgv,
+                                    "exit_code": PROC_GEN_FAILED_EXIT_CODE,
+                                    "wall_time": 0.0,
+                                })
+                                print(
+                                    f"[madbench] SKIP ({script_idx}/{total_runs}): "
+                                    f"[{invocation_id} rep={rep_id} mg_version={mgv}] — "
+                                    "proc_card generation failed for this version"
+                                )
+                                continue
+
+                            env = os.environ.copy()
+                            env["MADBENCH_WORKDIR"] = str(rep_dir)
+                            env["MADBENCH_INPUTS"] = str(inputs_dir)
+                            env["MADBENCH_PROCESSES"] = str(processes_dir)
+                            env["MADBENCH_OUTPUT_FILE"] = str(output_file)
+                            env["MADBENCH_REPETITION"] = rep_id
+                            env["MG_VERSION"] = mgv
+                            env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
+
+                            header = (
+                                f"=== Running ({script_idx}/{total_runs}): "
+                                f"{' '.join(cmd)} "
+                                f"[{invocation_id} rep={rep_id} mg_version={mgv}] ==="
+                            )
+                            print(header)
+
                             invocation_ts = get_timestamp()
-                            self._record_skipped_invocation(
-                                test, combo, mgv, invocation_id,
-                                csv_path, csv_header, write_header,
-                                invocation_ts,
+                            cmd_start = time.monotonic()
+                            try:
+                                proc = subprocess.Popen(
+                                    cmd,
+                                    stdout=tee.write_fd,
+                                    stderr=subprocess.STDOUT,
+                                    cwd=rep_dir,
+                                    env=env,
+                                    close_fds=True,
+                                )
+                                exit_code = proc.wait()
+                            except KeyboardInterrupt:
+                                proc.terminate()
+                                proc.wait()
+                                exit_code = -2
+                                wall_time = time.monotonic() - cmd_start
+                                row = self._finalize_invocation(
+                                    test, combo, mgv, invocation_id, rep_id,
+                                    rep_dir, output_file,
+                                    result_version_dir, csv_path, csv_header,
+                                    write_header, invocation_ts, exit_code, wall_time,
+                                )
+                                csv_rows.append(row)
+                                results.append({
+                                    "command": " ".join(cmd),
+                                    "invocation_id": invocation_id,
+                                    "repetition": rep_id,
+                                    "mg_version": mgv,
+                                    "exit_code": exit_code,
+                                    "wall_time": round(wall_time, 2),
+                                })
+                                write_header = False
+                                print("\n[madbench] Interrupted by user.")
+                                raise
+
+                            wall_time = time.monotonic() - cmd_start
+                            row = self._finalize_invocation(
+                                test, combo, mgv, invocation_id, rep_id,
+                                rep_dir, output_file,
+                                result_version_dir, csv_path, csv_header,
+                                write_header, invocation_ts, exit_code, wall_time,
                             )
                             write_header = False
+                            csv_rows.append(row)
                             results.append({
                                 "command": " ".join(cmd),
                                 "invocation_id": invocation_id,
-                                "mg_version": mgv,
-                                "exit_code": PROC_GEN_FAILED_EXIT_CODE,
-                                "wall_time": 0.0,
-                            })
-                            print(
-                                f"[madbench] SKIP ({global_i}/{len(commands)}): "
-                                f"[{invocation_id} mg_version={mgv}] — proc_card "
-                                "generation failed for this version"
-                            )
-                            continue
-
-                        env = os.environ.copy()
-                        env["MADBENCH_WORKDIR"] = str(invocation_dir)
-                        env["MADBENCH_INPUTS"] = str(inputs_dir)
-                        env["MADBENCH_PROCESSES"] = str(processes_dir)
-                        env["MADBENCH_OUTPUT_FILE"] = str(output_file)
-                        env["MG_VERSION"] = mgv
-                        env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
-
-                        header = (
-                            f"=== Running ({global_i}/{len(commands)}): {' '.join(cmd)} "
-                            f"[{invocation_id} mg_version={mgv}] ==="
-                        )
-                        print(header)
-
-                        invocation_ts = get_timestamp()
-                        cmd_start = time.monotonic()
-                        try:
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdout=tee.write_fd,
-                                stderr=subprocess.STDOUT,
-                                cwd=invocation_dir,
-                                env=env,
-                                close_fds=True,
-                            )
-                            exit_code = proc.wait()
-                        except KeyboardInterrupt:
-                            proc.terminate()
-                            proc.wait()
-                            exit_code = -2
-                            wall_time = time.monotonic() - cmd_start
-                            self._finalize_invocation(
-                                test, combo, mgv, invocation_id, invocation_dir, output_file,
-                                result_version_dir, csv_path, csv_header, write_header,
-                                invocation_ts, exit_code, wall_time,
-                            )
-                            results.append({
-                                "command": " ".join(cmd),
-                                "invocation_id": invocation_id,
+                                "repetition": rep_id,
                                 "mg_version": mgv,
                                 "exit_code": exit_code,
                                 "wall_time": round(wall_time, 2),
                             })
-                            write_header = False
-                            print("\n[madbench] Interrupted by user.")
-                            raise
-
-                        wall_time = time.monotonic() - cmd_start
-                        self._finalize_invocation(
-                            test, combo, mgv, invocation_id, invocation_dir, output_file,
-                            result_version_dir, csv_path, csv_header, write_header,
-                            invocation_ts, exit_code, wall_time,
-                        )
-                        write_header = False
-                        results.append({
-                            "command": " ".join(cmd),
-                            "invocation_id": invocation_id,
-                            "mg_version": mgv,
-                            "exit_code": exit_code,
-                            "wall_time": round(wall_time, 2),
-                        })
 
         except KeyboardInterrupt:
             print("[madbench] Interrupted — bundling partial logs...")
         finally:
+            summary_csv_path: Optional[Path] = None
+            if csv_rows:
+                summary_csv_path = self._write_summary(test, result_dir, csv_rows)
             metadata["results"] = results
             metadata["total_wall_time"] = round(time.monotonic() - wall_start, 2)
             metadata["csv_path"] = str(csv_path)
+            if summary_csv_path is not None:
+                metadata["summary_csv_path"] = str(summary_csv_path)
             bundle_logs(run_log_dir, main_log, metadata, archive_path)
 
         total_time = time.monotonic() - wall_start
@@ -365,12 +405,14 @@ class MadBench:
         for r in results:
             status = "OK" if r["exit_code"] == 0 else f"FAILED (exit {r['exit_code']})"
             print(
-                f"  [{status}] {r['invocation_id']}  mg_version={r['mg_version']}  "
-                f"{r['command']}  ({r['wall_time']}s)"
+                f"  [{status}] {r['invocation_id']} rep={r['repetition']} "
+                f"mg_version={r['mg_version']}  {r['command']}  ({r['wall_time']}s)"
             )
         for mgv, rd in run_dirs.items():
             print(f"[madbench] Workdir [mg_version={mgv}]: {rd}")
         print(f"[madbench] Results CSV: {csv_path}")
+        if summary_csv_path is not None:
+            print(f"[madbench] Summary CSV: {summary_csv_path}")
         print(f"[madbench] Log archive: {archive_path}")
 
     def plot(self, test_path: Path) -> None:
@@ -629,8 +671,19 @@ class MadBench:
             ["timestamp", "mg_version"]
             + list(test.args.keys())
             + list(test.outputs)
-            + ["exit_code", "wall_time", "invocation_id"]
+            + ["exit_code", "wall_time", "invocation_id", "repetition"]
         )
+
+    def _summary_header(self, test: TestDefinition) -> list[str]:
+        """Header for summary.csv: per-(mg_version, arg-combo) stats. Each
+        numeric column from ``outputs`` (plus ``wall_time``) becomes a
+        ``_mean``/``_std`` pair; ``n_successful`` records the count actually
+        averaged."""
+        cols = ["timestamp", "mg_version"] + list(test.args.keys())
+        for k in test.outputs + ["wall_time"]:
+            cols.extend([f"{k}_mean", f"{k}_std"])
+        cols.extend(["n_successful", "invocation_id"])
+        return cols
 
     def _finalize_invocation(
         self,
@@ -638,7 +691,8 @@ class MadBench:
         combo: dict[str, Any],
         mg_version: str,
         invocation_id: str,
-        invocation_dir: Path,
+        repetition: str,
+        rep_dir: Path,
         output_file: Path,
         result_version_dir: Path,
         csv_path: Path,
@@ -647,16 +701,18 @@ class MadBench:
         invocation_ts: str,
         exit_code: int,
         wall_time: float,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Post-script: read outputs JSON, copy output_files, append CSV row.
 
-        ``result_version_dir`` is the per-mg_version slice of the result dir
-        (``results/<group>`` or ``results/<group>/<mg_version>`` depending on
-        whether a version was set), so per-version output_files don't clobber
-        each other when invocation_ids are shared.
+        Returns the in-memory row dict so the caller can accumulate it for
+        the summary stage. ``result_version_dir`` is the per-mg_version slice
+        of the result dir; output_files land at ``<...>/invocation_id/repetition/``
+        so repetitions of the same arg-combo don't overwrite each other.
         """
         output_values = self._read_outputs_json(test, output_file)
-        self._copy_output_files(test, combo, invocation_dir, result_version_dir / invocation_id)
+        self._copy_output_files(
+            test, combo, rep_dir, result_version_dir / invocation_id / repetition,
+        )
 
         row: dict[str, Any] = {
             "timestamp": invocation_ts,
@@ -664,6 +720,7 @@ class MadBench:
             "exit_code": exit_code,
             "wall_time": round(wall_time, 2),
             "invocation_id": invocation_id,
+            "repetition": repetition,
         }
         for k in test.args:
             row[k] = combo[k]
@@ -671,6 +728,7 @@ class MadBench:
             row[k] = output_values.get(k, "")
 
         append_row(csv_path, csv_header, row, write_header)
+        return row
 
     def _record_skipped_invocation(
         self,
@@ -678,12 +736,13 @@ class MadBench:
         combo: dict[str, Any],
         mg_version: str,
         invocation_id: str,
+        repetition: str,
         csv_path: Path,
         csv_header: list[str],
         write_header: bool,
         invocation_ts: str,
-    ) -> None:
-        """Write a CSV row marking an invocation that was skipped because
+    ) -> dict[str, Any]:
+        """Write a CSV row marking a repetition that was skipped because
         proc_card generation failed for its mg_version. No script ran, so
         outputs are blank and ``exit_code`` is the proc-gen sentinel."""
         row: dict[str, Any] = {
@@ -692,6 +751,7 @@ class MadBench:
             "exit_code": PROC_GEN_FAILED_EXIT_CODE,
             "wall_time": 0.0,
             "invocation_id": invocation_id,
+            "repetition": repetition,
         }
         for k in test.args:
             row[k] = combo[k]
@@ -699,6 +759,76 @@ class MadBench:
             row[k] = ""
 
         append_row(csv_path, csv_header, row, write_header)
+        return row
+
+    def _write_summary(
+        self,
+        test: TestDefinition,
+        result_dir: Path,
+        csv_rows: list[dict[str, Any]],
+    ) -> Path:
+        """Aggregate per-rep rows into one summary row per (mg_version, args).
+
+        Each numeric output and ``wall_time`` is averaged over **successful**
+        reps only (exit_code == 0). Non-numeric output values yield empty
+        mean/std cells. ``n_successful`` records how many reps contributed.
+        """
+        import statistics
+        from collections import OrderedDict
+
+        summary_header = self._summary_header(test)
+        arg_keys = list(test.args.keys())
+
+        groups: "OrderedDict[tuple, list[dict[str, Any]]]" = OrderedDict()
+        for row in csv_rows:
+            key = (row["mg_version"],) + tuple(row[k] for k in arg_keys)
+            groups.setdefault(key, []).append(row)
+
+        summary_path, write_header = select_results_csv(
+            result_dir, summary_header, basename="summary",
+        )
+
+        for key, rows in groups.items():
+            successful = [r for r in rows if r.get("exit_code") == 0]
+            n_successful = len(successful)
+
+            summary_row: dict[str, Any] = {
+                "timestamp": rows[0]["timestamp"],
+                "mg_version": key[0],
+                "invocation_id": rows[0]["invocation_id"],
+                "n_successful": n_successful,
+            }
+            for i, k in enumerate(arg_keys):
+                summary_row[k] = key[i + 1]
+
+            for col in list(test.outputs) + ["wall_time"]:
+                mean_col = f"{col}_mean"
+                std_col = f"{col}_std"
+                values: list[float] = []
+                try:
+                    for r in successful:
+                        v = r.get(col, "")
+                        if v == "" or v is None:
+                            raise ValueError("blank value")
+                        values.append(float(v))
+                except (TypeError, ValueError):
+                    summary_row[mean_col] = ""
+                    summary_row[std_col] = ""
+                    continue
+
+                if not values:
+                    summary_row[mean_col] = ""
+                    summary_row[std_col] = ""
+                else:
+                    summary_row[mean_col] = statistics.mean(values)
+                    summary_row[std_col] = (
+                        statistics.stdev(values) if len(values) >= 2 else ""
+                    )
+
+            append_row(summary_path, summary_header, summary_row, write_header)
+            write_header = False
+
+        return summary_path
 
     def _read_outputs_json(
         self,
@@ -803,7 +933,10 @@ class MadBench:
             print(f"[madbench] Outputs (CSV columns): {test.outputs}")
         if test.output_files:
             print(f"[madbench] Output files (per invocation): {test.output_files}")
-        print(f"[madbench] Commands ({len(commands)}):")
+        print(
+            f"[madbench] Commands ({len(commands)}, each ×{test.repeat} rep"
+            f"{'s' if test.repeat != 1 else ''}):"
+        )
         for cmd in commands:
             print(f"  {' '.join(cmd)}")
         print("[madbench] Metadata:")
