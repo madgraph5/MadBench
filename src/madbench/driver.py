@@ -46,7 +46,12 @@ class TestDefinition:
     result_group: str
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
-    output_files: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+    # Glob/literal paths (resolved relative to the script's per-rep workdir)
+    # of files the script produces that should be preserved alongside the
+    # results CSV — gridpacks, reports, plots, log excerpts, etc. Each
+    # pattern may use ``{arg}`` placeholders that get substituted with the
+    # current invocation's arg values before matching.
     workdir: Optional[str] = None
     plot: Optional[str] = None
     raw: dict = field(default_factory=dict)
@@ -170,7 +175,7 @@ class MadBench:
             result_group=raw["result_group"],
             inputs=_as_str_list(raw.get("inputs"), "inputs"),
             outputs=_as_str_list(raw.get("outputs"), "outputs"),
-            output_files=_as_str_list(raw.get("output_files"), "output_files"),
+            artifacts=_as_str_list(raw.get("artifacts"), "artifacts"),
             workdir=raw.get("workdir"),
             plot=raw.get("plot"),
             raw=raw,
@@ -659,7 +664,7 @@ class MadBench:
         return True
 
     def _version_result_dir(self, result_dir: Path, mg_version: str) -> Path:
-        """Per-mg_version slice of the result dir for ``output_files`` copies.
+        """Per-mg_version slice of the result dir for ``artifacts`` copies.
         The version segment is dropped when ``mg_version`` is "none" so
         version-less tests keep the ``results/<group>/<invocation>/`` layout."""
         if mg_version == MG_VERSION_NONE:
@@ -702,15 +707,15 @@ class MadBench:
         exit_code: int,
         wall_time: float,
     ) -> dict[str, Any]:
-        """Post-script: read outputs JSON, copy output_files, append CSV row.
+        """Post-script: read outputs JSON, copy artifacts, append CSV row.
 
         Returns the in-memory row dict so the caller can accumulate it for
         the summary stage. ``result_version_dir`` is the per-mg_version slice
-        of the result dir; output_files land at ``<...>/invocation_id/repetition/``
+        of the result dir; artifacts land at ``<...>/invocation_id/repetition/``
         so repetitions of the same arg-combo don't overwrite each other.
         """
         output_values = self._read_outputs_json(test, output_file)
-        self._copy_output_files(
+        self._copy_artifacts(
             test, combo, rep_dir, result_version_dir / invocation_id / repetition,
         )
 
@@ -871,27 +876,27 @@ class MadBench:
             )
         return values
 
-    def _copy_output_files(
+    def _copy_artifacts(
         self,
         test: TestDefinition,
         combo: dict[str, Any],
         invocation_dir: Path,
         dest_dir: Path,
     ) -> None:
-        if not test.output_files:
+        if not test.artifacts:
             return
-        for pattern in test.output_files:
+        for pattern in test.artifacts:
             try:
                 resolved = pattern.format_map(combo)
             except KeyError as e:
                 print(
-                    f"[madbench] WARN: output_files entry {pattern!r} "
+                    f"[madbench] WARN: artifacts entry {pattern!r} "
                     f"references unknown arg {e}"
                 )
                 continue
             src = invocation_dir / resolved
             if not src.exists():
-                print(f"[madbench] WARN: declared output_file missing: {src}")
+                print(f"[madbench] WARN: declared artifact missing: {src}")
                 continue
             target = dest_dir / resolved
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -931,8 +936,8 @@ class MadBench:
                 print(f"  {card}")
         if test.outputs:
             print(f"[madbench] Outputs (CSV columns): {test.outputs}")
-        if test.output_files:
-            print(f"[madbench] Output files (per invocation): {test.output_files}")
+        if test.artifacts:
+            print(f"[madbench] Artifacts (per rep): {test.artifacts}")
         print(
             f"[madbench] Commands ({len(commands)}, each ×{test.repeat} rep"
             f"{'s' if test.repeat != 1 else ''}):"

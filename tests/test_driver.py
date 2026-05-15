@@ -67,7 +67,7 @@ def test_load_test_basic(tmp_path):
     assert td.args == {"ncores": 1, "nevents": 100}
     assert td.inputs == []
     assert td.outputs == []
-    assert td.output_files == []
+    assert td.artifacts == []
     assert td.workdir is None
 
 
@@ -83,7 +83,7 @@ def test_load_test_with_new_fields(tmp_path):
         "result_group": "g",
         "inputs": ["config/*", "data/x.txt"],
         "outputs": ["throughput", "note"],
-        "output_files": ["out.log", "gridpack_{seed}/timings.txt"],
+        "artifacts": ["out.log", "gridpack_{seed}/timings.txt"],
         "workdir": "/tmp/madbench-test",
     }
     test_file = make_test_yaml(ws_root, yaml_data)
@@ -91,7 +91,7 @@ def test_load_test_with_new_fields(tmp_path):
 
     assert td.inputs == ["config/*", "data/x.txt"]
     assert td.outputs == ["throughput", "note"]
-    assert td.output_files == ["out.log", "gridpack_{seed}/timings.txt"]
+    assert td.artifacts == ["out.log", "gridpack_{seed}/timings.txt"]
     assert td.workdir == "/tmp/madbench-test"
 
 
@@ -503,11 +503,11 @@ def test_run_missing_outputs_json_writes_blanks(tmp_path, capsys):
 
 
 # -----------------------------------------------------------------------
-# output_files copy
+# artifacts copy
 # -----------------------------------------------------------------------
 
 
-def test_run_copies_output_files_with_arg_substitution(tmp_path):
+def test_run_copies_artifacts_with_arg_substitution(tmp_path):
     ws_root = make_workspace(tmp_path)
     make_script(
         ws_root,
@@ -526,7 +526,7 @@ def test_run_copies_output_files_with_arg_substitution(tmp_path):
         "script": "hello.sh",
         "args": {"seed": [1, 2]},
         "result_group": "g",
-        "output_files": ["gridpack_{seed}/timings.txt"],
+        "artifacts": ["gridpack_{seed}/timings.txt"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
@@ -548,13 +548,13 @@ def test_run_missing_output_file_warns(tmp_path, capsys):
         "script": "hello.sh",
         "args": {"x": 1},
         "result_group": "g",
-        "output_files": ["does_not_exist.log"],
+        "artifacts": ["does_not_exist.log"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
     captured = capsys.readouterr()
-    assert "output_file missing" in captured.out
+    assert "artifact missing" in captured.out
 
 
 # -----------------------------------------------------------------------
@@ -909,7 +909,7 @@ def test_run_invocation_ids_align_across_versions(tmp_path):
         assert v2_marker == f"{expected_x} v2"
 
 
-def test_run_output_files_scoped_per_version(tmp_path):
+def test_run_artifacts_scoped_per_version(tmp_path):
     """Same invocation_id across versions writes to different result subdirs."""
     ws_root = make_workspace(tmp_path)
     make_script(
@@ -925,7 +925,7 @@ def test_run_output_files_scoped_per_version(tmp_path):
         {
             "name": "outv", "script": "hello.sh", "args": {"x": 1},
             "result_group": "g", "mg_version": ["v1", "v2"],
-            "output_files": ["out.log"],
+            "artifacts": ["out.log"],
         },
     )
     mb.run(test_file)
@@ -1313,7 +1313,7 @@ def test_run_csv_has_repetition_column_with_row_per_rep(tmp_path):
     assert by_inv["invocation_002"] == ["01", "02", "03"]
 
 
-def test_run_output_files_scoped_per_rep(tmp_path):
+def test_run_artifacts_scoped_per_rep(tmp_path):
     """Same invocation across reps writes to different result subdirs."""
     ws_root = make_workspace(tmp_path)
     make_script(
@@ -1328,7 +1328,7 @@ def test_run_output_files_scoped_per_rep(tmp_path):
         ws_root,
         {
             "name": "outr", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "output_files": ["out.log"], "repeat": 2,
+            "result_group": "g", "artifacts": ["out.log"], "repeat": 2,
         },
     )
     mb.run(test_file)
