@@ -1,7 +1,5 @@
-results/
 logs/
 scratch/
-gridpacks/
 MadGraph/
 __pycache__/
 *.pyc
