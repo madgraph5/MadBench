@@ -1655,3 +1655,228 @@ def test_run_inputs_staged_per_version(tmp_path):
     v2_dir = next((ws_root / "scratch" / "v2").glob("inputsmg_*"))
     assert (v1_dir / "inputs" / "config" / "card.dat").read_text() == "CARD"
     assert (v2_dir / "inputs" / "config" / "card.dat").read_text() == "CARD"
+
+
+# -----------------------------------------------------------------------
+# failed.yml + retry
+# -----------------------------------------------------------------------
+
+
+def _make_flaky_script(ws_root: Path, fail_when: str) -> Path:
+    """Make hello.sh fail (exit 1) iff $1 == ``fail_when``, else succeed."""
+    return make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            f"if [ \"$1\" = \"{fail_when}\" ]; then exit 1; fi\n"
+            "echo ok\n"
+        ),
+    )
+
+
+def test_run_writes_failed_yml_when_some_runs_fail(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "flaky", "script": "hello.sh", "args": {"x": [1, 2, 3]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+
+    rd = run_dir(ws_root, "g", "flaky")
+    failed_yml = rd / "failed.yml"
+    assert failed_yml.exists()
+    payload = yaml.safe_load(failed_yml.read_text())
+    assert payload["test_name"] == "flaky"
+    assert payload["n_total"] == 3
+    assert payload["n_failed"] == 1
+    assert len(payload["failures"]) == 1
+    fail = payload["failures"][0]
+    assert fail["invocation_id"] == "invocation_002"
+    assert fail["repetition"] == "01"
+    assert fail["exit_code"] == 1
+    assert fail["args"]["x"] == 2
+
+
+def test_run_no_failed_yml_when_all_pass(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)  # default body: echo "hello $@" (always succeeds)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "happy", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+
+    rd = run_dir(ws_root, "g", "happy")
+    assert not (rd / "failed.yml").exists()
+
+
+def test_retry_reruns_only_failed_combos_with_preserved_ids(tmp_path):
+    """retry() picks rows with exit_code != 0 and replays them, preserving
+    invocation_id / repetition / mg_version. The script is now patched so
+    the same args succeed — the retry's results.csv should hold one row,
+    matching the originally-failing invocation."""
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "retried", "script": "hello.sh", "args": {"x": [1, 2, 3]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+    original = run_dir(ws_root, "g", "retried")
+
+    # Patch the script so x=2 now succeeds, then retry.
+    make_script(ws_root)  # back to always-succeeding body
+    mb.retry(original)
+
+    rd_dirs = sorted((ws_root / "results" / "g").glob("retried_*"))
+    assert len(rd_dirs) == 2
+    retry_dir = [d for d in rd_dirs if d != original][0]
+
+    rows = (retry_dir / "results.csv").read_text().splitlines()
+    assert len(rows) == 2  # header + 1 retried row
+    header = rows[0].split(",")
+    cells = rows[1].split(",")
+    inv_idx = header.index("invocation_id")
+    rep_idx = header.index("repetition")
+    exit_idx = header.index("exit_code")
+    x_idx = header.index("x")
+    assert cells[inv_idx] == "invocation_002"
+    assert cells[rep_idx] == "01"
+    assert cells[exit_idx] == "0"
+    assert cells[x_idx] == "2"
+
+
+def test_retry_writes_retry_of_pointer_in_metadata(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "retrymeta", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+    original = run_dir(ws_root, "g", "retrymeta")
+
+    mb.retry(original)
+
+    retry_dir = [
+        d for d in (ws_root / "results" / "g").glob("retrymeta_*")
+        if d != original
+    ][0]
+    meta = yaml.safe_load((retry_dir / "metadata.yml").read_text())
+    assert meta["retry_of"] == str(original)
+
+
+def test_retry_noop_when_no_failures(tmp_path, capsys):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)  # always succeeds
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "happy_retry", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+    original = run_dir(ws_root, "g", "happy_retry")
+
+    mb.retry(original)
+
+    captured = capsys.readouterr()
+    assert "Nothing to retry" in captured.out
+    # No second results dir was created.
+    assert len(list((ws_root / "results" / "g").glob("happy_retry_*"))) == 1
+
+
+def test_retry_works_without_original_test_yaml(tmp_path):
+    """retry() rebuilds the TestDefinition from the test_definition embedded
+    in metadata.yml, so deleting/renaming the source test YAML between the
+    failing run and the retry is fine."""
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "noyml", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+    original = run_dir(ws_root, "g", "noyml")
+
+    # Delete the source YAML — retry should still work.
+    test_file.unlink()
+    make_script(ws_root)  # script now succeeds for x=2 too
+    mb.retry(original)
+
+    retry_dir = [
+        d for d in (ws_root / "results" / "g").glob("noyml_*")
+        if d != original
+    ][0]
+    rows = (retry_dir / "results.csv").read_text().splitlines()
+    assert len(rows) == 2  # header + 1 retried row
+
+
+def test_retry_replays_per_mg_version_failures(tmp_path):
+    """Sweep across two mg_versions where only v_bad's invocations fail.
+    The retry should run only v_bad's failed combos — v_good never enters
+    the retry's mg_versions list, so no scratch dir for v_good is created.
+    """
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "if [ \"$MG_VERSION\" = \"v_bad\" ]; then exit 1; fi\n"
+            "echo ok\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "mgretry", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g", "mg_version": ["v_good", "v_bad"],
+        },
+    )
+    mb.run(test_file)
+    original = run_dir(ws_root, "g", "mgretry")
+
+    # Flip the script: now v_bad succeeds. Retry should re-run only v_bad.
+    make_script(ws_root)
+    mb.retry(original)
+
+    retry_dir = [
+        d for d in (ws_root / "results" / "g").glob("mgretry_*")
+        if d != original
+    ][0]
+    rows = (retry_dir / "results.csv").read_text().splitlines()
+    assert len(rows) == 3  # header + 2 retried rows (x=1 and x=2 under v_bad)
+    header = rows[0].split(",")
+    mgv_idx = header.index("mg_version")
+    mg_versions = {row.split(",")[mgv_idx] for row in rows[1:]}
+    assert mg_versions == {"v_bad"}
+
+    # No v_good scratch dir for the retry run.
+    retry_ts = retry_dir.name[len("mgretry_"):]
+    assert not list(
+        (ws_root / "scratch" / "v_good").glob(f"mgretry_{retry_ts.rsplit('_', 1)[0]}*")
+    )

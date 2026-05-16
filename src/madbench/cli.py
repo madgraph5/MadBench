@@ -32,6 +32,20 @@ def main() -> None:
         help="Print commands without executing them",
     )
 
+    # madbench retry <run_dir>
+    retry_parser = subparsers.add_parser(
+        "retry",
+        help="Re-run only the failed rows of a previous run",
+    )
+    retry_parser.add_argument(
+        "run_dir",
+        type=Path,
+        help=(
+            "Path to the failing per-run results dir "
+            "(results/<group>/<test>_<ts>_<host>/)"
+        ),
+    )
+
     # madbench status
     subparsers.add_parser("status", help="List available tests and their status")
 
@@ -45,6 +59,8 @@ def main() -> None:
         _cmd_init(args)
     elif args.command == "run":
         _cmd_run(args)
+    elif args.command == "retry":
+        _cmd_retry(args)
     elif args.command == "status":
         _cmd_status(args)
     elif args.command == "plot":
@@ -70,6 +86,22 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
     try:
         mb.run(args.test, dry_run=args.dry_run)
+    except (FileNotFoundError, PermissionError, ValueError) as e:
+        print(f"[madbench] Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _cmd_retry(args: argparse.Namespace) -> None:
+    from .driver import MadBench
+
+    try:
+        mb = MadBench()
+    except FileNotFoundError as e:
+        print(f"[madbench] {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        mb.retry(args.run_dir)
     except (FileNotFoundError, PermissionError, ValueError) as e:
         print(f"[madbench] Error: {e}", file=sys.stderr)
         sys.exit(1)
