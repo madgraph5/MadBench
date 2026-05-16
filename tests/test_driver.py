@@ -1658,6 +1658,57 @@ def test_run_inputs_staged_per_version(tmp_path):
 
 
 # -----------------------------------------------------------------------
+# Sibling test.yml in per-run result dir
+# -----------------------------------------------------------------------
+
+
+def test_run_copies_test_yml_into_result_dir_verbatim(tmp_path):
+    """The per-run dir gets a byte-for-byte copy of the source test YAML
+    so the committed artifacts make it obvious what was run (including any
+    per-machine tweaks made before the run)."""
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    # Hand-write the YAML so we can assert on the byte content; include a
+    # comment to verify formatting is preserved (yaml.dump would strip it).
+    yml_body = (
+        "# per-machine tweak: dropped nevents=10000 for this run\n"
+        "name: tyml\n"
+        "script: hello.sh\n"
+        "args:\n"
+        "  ncores: [1, 2]\n"
+        "  nevents: 100\n"
+        "result_group: g\n"
+    )
+    test_file = ws_root / "tests" / "tyml.yml"
+    test_file.write_text(yml_body)
+    mb.run(test_file)
+
+    copied = run_dir(ws_root, "g", "tyml") / "test.yml"
+    assert copied.exists()
+    assert copied.read_text() == yml_body  # byte-for-byte, including comment
+
+
+def test_run_metadata_yml_points_at_sibling_test_yml(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "metayml", "script": "hello.sh", "args": {"x": 1},
+         "result_group": "g"},
+    )
+    mb.run(test_file)
+
+    meta = yaml.safe_load(
+        (run_dir(ws_root, "g", "metayml") / "metadata.yml").read_text()
+    )
+    # test_definition is no longer in metadata.yml; the sibling test.yml is.
+    assert "test_definition" not in meta
+    assert meta["test_yml"] == "test.yml"
+
+
+# -----------------------------------------------------------------------
 # failed.yml + retry
 # -----------------------------------------------------------------------
 
@@ -1805,10 +1856,11 @@ def test_retry_noop_when_no_failures(tmp_path, capsys):
     assert len(list((ws_root / "results" / "g").glob("happy_retry_*"))) == 1
 
 
-def test_retry_works_without_original_test_yaml(tmp_path):
-    """retry() rebuilds the TestDefinition from the test_definition embedded
-    in metadata.yml, so deleting/renaming the source test YAML between the
-    failing run and the retry is fine."""
+def test_retry_works_without_original_workspace_test_yaml(tmp_path):
+    """retry() rebuilds the TestDefinition from the sibling ``test.yml``
+    that lives inside the per-run results dir, so deleting/renaming the
+    canonical ``tests/<name>.yml`` between the failing run and the retry
+    is fine."""
     ws_root = make_workspace(tmp_path)
     _make_flaky_script(ws_root, fail_when="2")
     mb = MadBench(find_workspace(ws_root))
@@ -1822,7 +1874,8 @@ def test_retry_works_without_original_test_yaml(tmp_path):
     mb.run(test_file)
     original = run_dir(ws_root, "g", "noyml")
 
-    # Delete the source YAML — retry should still work.
+    # Delete the canonical YAML — retry should still work because the
+    # sibling test.yml inside the original run dir is authoritative.
     test_file.unlink()
     make_script(ws_root)  # script now succeeds for x=2 too
     mb.retry(original)
@@ -1833,6 +1886,31 @@ def test_retry_works_without_original_test_yaml(tmp_path):
     ][0]
     rows = (retry_dir / "results.csv").read_text().splitlines()
     assert len(rows) == 2  # header + 1 retried row
+    # And the retry run also dropped a copy of test.yml.
+    assert (retry_dir / "test.yml").exists()
+
+
+def test_retry_errors_when_sibling_test_yml_missing(tmp_path):
+    """If the per-run ``test.yml`` was manually deleted (or the run
+    pre-dates the sibling-test.yml feature), retry surfaces a clear
+    error rather than silently doing the wrong thing."""
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "deletedyml", "script": "hello.sh", "args": {"x": [1, 2]},
+            "result_group": "g",
+        },
+    )
+    mb.run(test_file)
+    original = run_dir(ws_root, "g", "deletedyml")
+
+    (original / "test.yml").unlink()
+
+    with pytest.raises(FileNotFoundError, match="test.yml missing"):
+        mb.retry(original)
 
 
 def test_retry_replays_per_mg_version_failures(tmp_path):

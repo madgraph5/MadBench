@@ -183,10 +183,9 @@ class MadBench:
     def _test_from_dict(raw: dict, *, source: str) -> TestDefinition:
         """Build a TestDefinition from an already-parsed YAML dict.
 
-        Used both by ``load_test`` (file source) and ``retry`` (the
-        ``test_definition`` blob embedded in a prior run's metadata.yml,
-        which makes retries self-contained — the original ``tests/...``
-        YAML can have been renamed or deleted since the run).
+        Factored out of ``load_test`` so the same validation + dataclass
+        construction can run against any source — e.g. a dict synthesized
+        in tests, without needing a real file on disk.
         """
         missing = _REQUIRED_FIELDS - raw.keys()
         if missing:
@@ -231,6 +230,11 @@ class MadBench:
         """Main entry point. Loads the test, builds commands, runs them."""
         test = self.load_test(test_path)
         script_path = resolve_script(self.workspace, test.script)
+        # Resolve to an absolute path so the verbatim copy into the
+        # result dir is unambiguous even if cwd changes later.
+        test_yml_abs = (
+            test_path if test_path.is_absolute() else Path.cwd() / test_path
+        ).resolve()
 
         sweep_points = self._build_sweep_points(test)
         commands = [
@@ -303,6 +307,7 @@ class MadBench:
             run_dirs=run_dirs,
             result_dir=result_dir,
             run_log_dir=run_log_dir,
+            test_yml_source=test_yml_abs,
             metadata=metadata,
             retry_of=None,
         )
@@ -330,28 +335,25 @@ class MadBench:
                 f"Original run dir not found: {original_run_dir}"
             )
 
-        orig_meta_path = original_run_dir / "metadata.yml"
         orig_csv_path = original_run_dir / "results.csv"
-        if not orig_meta_path.exists():
-            raise FileNotFoundError(
-                f"metadata.yml missing in {original_run_dir} — not a "
-                "valid madbench run dir."
-            )
+        orig_test_yml = original_run_dir / "test.yml"
         if not orig_csv_path.exists():
             raise FileNotFoundError(
                 f"results.csv missing in {original_run_dir} — nothing to "
                 "retry from."
             )
-
-        import yaml as _yaml
-        orig_meta = _yaml.safe_load(orig_meta_path.read_text()) or {}
-        raw_def = orig_meta.get("test_definition")
-        if not raw_def:
-            raise ValueError(
-                f"{orig_meta_path} has no embedded 'test_definition' — this "
-                "run pre-dates retry support and cannot be retried."
+        if not orig_test_yml.exists():
+            raise FileNotFoundError(
+                f"test.yml missing in {original_run_dir} — cannot rebuild "
+                "the test definition to retry against. (Runs from before "
+                "the sibling test.yml landed cannot be retried.)"
             )
-        test = self._test_from_dict(raw_def, source=str(orig_meta_path))
+
+        # Use ``load_test`` so the source path is recorded in error
+        # messages — the retry's TestDefinition is built from this exact
+        # file, not from any embedded metadata, so per-machine tweaks
+        # made in the original run carry through.
+        test = self.load_test(orig_test_yml)
 
         failed_rows = self._read_failed_rows(orig_csv_path, test)
         if not failed_rows:
@@ -430,6 +432,7 @@ class MadBench:
             run_dirs=run_dirs,
             result_dir=result_dir,
             run_log_dir=run_log_dir,
+            test_yml_source=orig_test_yml,
             metadata=metadata,
             retry_of=original_run_dir,
         )
@@ -852,10 +855,11 @@ class MadBench:
             "repeat": test.repeat,
             "hardware": hardware,
             "run_dirs": {mgv: str(p) for mgv, p in run_dirs.items()},
-            # Embedded so ``madbench retry`` against this run can rebuild
-            # the exact TestDefinition that was executed, even if the
-            # original tests/<name>.yml has since been renamed or edited.
-            "test_definition": test.raw,
+            # The executed test definition is the sibling ``test.yml`` —
+            # see ``_execute_units`` for the copy. Kept out of this file
+            # to keep ``metadata.yml`` focused on the environment + run
+            # bookkeeping, separate from "what was run".
+            "test_yml": "test.yml",
         }
         if retry_of is not None:
             run_meta["retry_of"] = str(retry_of)
@@ -964,6 +968,7 @@ class MadBench:
         run_dirs: dict[str, Path],
         result_dir: Path,
         run_log_dir: Path,
+        test_yml_source: Path,
         metadata: dict[str, Any],
         retry_of: Optional[Path],
     ) -> None:
@@ -979,6 +984,12 @@ class MadBench:
         # version actually exercised by this set of units).
         result_dir.mkdir(parents=True, exist_ok=True)
         run_log_dir.mkdir(parents=True, exist_ok=True)
+        # Drop a verbatim copy of the test YAML into the result dir so
+        # the committed artifacts make it obvious what was actually run
+        # (incl. any per-machine tweaks the user made before this run) —
+        # diff against the canonical tests/<name>.yml to see the delta.
+        # It is also what ``retry()`` reads to rebuild the TestDefinition.
+        shutil.copyfile(test_yml_source, result_dir / "test.yml")
         for mgv, rd in run_dirs.items():
             rd.mkdir(parents=True, exist_ok=True)
             inputs_dir = rd / "inputs"
