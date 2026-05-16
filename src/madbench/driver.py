@@ -19,7 +19,7 @@ from .workspace import (
     resolve_script,
     stage_inputs,
 )
-from ._logging import TeeLogger, bundle_logs
+from ._logging import MainLog, bundle_logs
 from .results import append_row, select_results_csv
 
 
@@ -229,7 +229,13 @@ class MadBench:
         # is the job of post-processing scripts.
         result_group_dir = self.workspace.results_dir / test.result_group
         result_dir = result_group_dir / f"{test.name}_{timestamp}_{hostname}"
-        run_log_dir = self.workspace.logs_dir / f"{test.name}_{timestamp}"
+        # Per-run log dir mirrors the per-run result dir shape but groups
+        # under <test.name>/ inside logs_dir, so a single test's runs stay
+        # adjacent on disk regardless of which result_group they belong to.
+        run_log_dir = (
+            self.workspace.logs_dir / test.name
+            / f"{test.name}_{timestamp}_{hostname}"
+        )
 
         metadata: dict[str, Any] = {
             "test_name": test.name,
@@ -267,7 +273,10 @@ class MadBench:
         csv_path, write_header = select_results_csv(result_dir, csv_header)
 
         main_log = run_log_dir / "main.log"
-        archive_path = self.workspace.logs_dir / f"{test.name}_{timestamp}.tar.gz"
+        archive_path = (
+            self.workspace.logs_dir / test.name
+            / f"{test.name}_{timestamp}_{hostname}.tar.gz"
+        )
 
         results: list[dict] = []
         wall_start = time.monotonic()
@@ -278,19 +287,21 @@ class MadBench:
         script_idx = 0
         csv_rows: list[dict[str, Any]] = []
 
+        summary_csv_path: Optional[Path] = None
         try:
-            with TeeLogger(main_log) as tee:
-                print(f"[madbench] Host: {format_hardware_summary(hardware)}")
+            with MainLog(main_log) as tee:
+                tee.log(f"[madbench] Host: {format_hardware_summary(hardware)}")
                 for mgv in test.mg_version:
                     run_dir = run_dirs[mgv]
                     inputs_dir = run_dir / "inputs"
                     processes_dir = run_dir / "processes"
                     result_version_dir = self._version_result_dir(result_dir, mgv)
+                    log_version_dir = self._version_log_dir(run_log_dir, mgv)
 
                     proc_gen_ok = True
                     if test.proc_cards:
                         proc_gen_ok = self._generate_processes(
-                            test, mgv, run_dir, tee.write_fd,
+                            test, mgv, run_dir, tee, log_version_dir / "proc_gen",
                         )
 
                     for version_i in range(1, n_per_version + 1):
@@ -327,7 +338,7 @@ class MadBench:
                                     "exit_code": PROC_GEN_FAILED_EXIT_CODE,
                                     "wall_time": 0.0,
                                 })
-                                print(
+                                tee.log(
                                     f"[madbench] SKIP ({script_idx}/{total_runs}): "
                                     f"[{invocation_id} rep={rep_id} mg_version={mgv}] — "
                                     "proc_card generation failed for this version"
@@ -343,25 +354,33 @@ class MadBench:
                             env["MG_VERSION"] = mgv
                             env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
 
-                            header = (
+                            rep_log_dir = log_version_dir / invocation_id / rep_id
+                            rep_log_dir.mkdir(parents=True, exist_ok=True)
+                            stdout_log = rep_log_dir / "stdout.log"
+                            stderr_log = rep_log_dir / "stderr.log"
+
+                            tee.log(
                                 f"=== Running ({script_idx}/{total_runs}): "
                                 f"{' '.join(cmd)} "
                                 f"[{invocation_id} rep={rep_id} mg_version={mgv}] ==="
                             )
-                            print(header)
+                            tee.log(f"  stdout: {stdout_log}")
+                            tee.log(f"  stderr: {stderr_log}")
 
                             invocation_ts = get_timestamp()
                             cmd_start = time.monotonic()
                             try:
-                                proc = subprocess.Popen(
-                                    cmd,
-                                    stdout=tee.write_fd,
-                                    stderr=subprocess.STDOUT,
-                                    cwd=rep_dir,
-                                    env=env,
-                                    close_fds=True,
-                                )
-                                exit_code = proc.wait()
+                                with open(stdout_log, "w") as so, \
+                                        open(stderr_log, "w") as se:
+                                    proc = subprocess.Popen(
+                                        cmd,
+                                        stdout=so,
+                                        stderr=se,
+                                        cwd=rep_dir,
+                                        env=env,
+                                        close_fds=True,
+                                    )
+                                    exit_code = proc.wait()
                             except KeyboardInterrupt:
                                 proc.terminate()
                                 proc.wait()
@@ -383,7 +402,7 @@ class MadBench:
                                     "wall_time": round(wall_time, 2),
                                 })
                                 write_header = False
-                                print("\n[madbench] Interrupted by user.")
+                                tee.log("\n[madbench] Interrupted by user.")
                                 raise
 
                             wall_time = time.monotonic() - cmd_start
@@ -404,11 +423,39 @@ class MadBench:
                                 "wall_time": round(wall_time, 2),
                             })
 
+                # Summary lives inside the tee context so it lands in main.log
+                # — the user greps main.log to see which invocation/rep failed
+                # and then opens the per-rep stdout.log/stderr.log for detail.
+                if csv_rows:
+                    summary_csv_path = self._write_summary(
+                        test, result_dir, csv_rows,
+                    )
+
+                total_time = time.monotonic() - wall_start
+                tee.log(f"\n[madbench] Run complete in {total_time:.1f}s")
+                for r in results:
+                    status = (
+                        "OK" if r["exit_code"] == 0
+                        else f"FAILED (exit {r['exit_code']})"
+                    )
+                    tee.log(
+                        f"  [{status}] {r['invocation_id']} rep={r['repetition']} "
+                        f"mg_version={r['mg_version']}  {r['command']}  "
+                        f"({r['wall_time']}s)"
+                    )
+                for mgv, rd in run_dirs.items():
+                    tee.log(f"[madbench] Workdir [mg_version={mgv}]: {rd}")
+                tee.log(f"[madbench] Results CSV: {csv_path}")
+                if summary_csv_path is not None:
+                    tee.log(f"[madbench] Summary CSV: {summary_csv_path}")
+                tee.log(f"[madbench] Log archive: {archive_path}")
         except KeyboardInterrupt:
             print("[madbench] Interrupted — bundling partial logs...")
         finally:
-            summary_csv_path: Optional[Path] = None
-            if csv_rows:
+            # Defensive: on partial interruption the summary inside the tee
+            # block didn't run, but we still want a summary CSV for whatever
+            # reps completed before the interrupt.
+            if csv_rows and summary_csv_path is None:
                 summary_csv_path = self._write_summary(test, result_dir, csv_rows)
             metadata["results"] = results
             metadata["total_wall_time"] = round(time.monotonic() - wall_start, 2)
@@ -420,22 +467,7 @@ class MadBench:
                 run_dirs, result_dir,
             )
             metadata["metadata_yml_path"] = str(metadata_yml_path)
-            bundle_logs(run_log_dir, main_log, metadata, archive_path)
-
-        total_time = time.monotonic() - wall_start
-        print(f"\n[madbench] Run complete in {total_time:.1f}s")
-        for r in results:
-            status = "OK" if r["exit_code"] == 0 else f"FAILED (exit {r['exit_code']})"
-            print(
-                f"  [{status}] {r['invocation_id']} rep={r['repetition']} "
-                f"mg_version={r['mg_version']}  {r['command']}  ({r['wall_time']}s)"
-            )
-        for mgv, rd in run_dirs.items():
-            print(f"[madbench] Workdir [mg_version={mgv}]: {rd}")
-        print(f"[madbench] Results CSV: {csv_path}")
-        if summary_csv_path is not None:
-            print(f"[madbench] Summary CSV: {summary_csv_path}")
-        print(f"[madbench] Log archive: {archive_path}")
+            bundle_logs(run_log_dir, metadata, archive_path)
 
     def plot(self, test_path: Path) -> None:
         """Plotting is deprecated for now.
@@ -601,24 +633,27 @@ class MadBench:
         test: TestDefinition,
         mg_version: str,
         run_dir: Path,
-        tee_fd: int,
+        tee: MainLog,
+        proc_gen_log_dir: Path,
     ) -> bool:
         """Run MadGraph once per proc_card with cwd=<run_dir>/processes/.
 
-        Returns True on success, False on any failure (missing binary, missing
-        card, non-zero MG exit). Diagnostic messages are printed to stdout so
-        they end up in main.log via ``tee_fd``.
+        Each card's stdout/stderr lands in
+        ``<proc_gen_log_dir>/<card_stem>.{stdout,stderr}.log`` so a failing
+        card is easy to pinpoint without scrolling through main.log.
+        Returns True on success, False on any failure (missing binary,
+        missing card, non-zero MG exit).
         """
         mg_bin = self._resolve_mg_bin(mg_version)
         if mg_bin is None:
-            print(
+            tee.log(
                 "[madbench] ERROR: 'proc_cards' is set but mg_version is "
                 f"'{MG_VERSION_NONE}'. Set mg_version to a MadGraph install "
                 "folder to enable process generation."
             )
             return False
         if not mg_bin.exists():
-            print(
+            tee.log(
                 f"[madbench] ERROR: MadGraph binary not found at {mg_bin} "
                 f"(required by mg_version='{mg_version}')."
             )
@@ -626,30 +661,37 @@ class MadBench:
 
         processes_dir = run_dir / "processes"
         processes_dir.mkdir(parents=True, exist_ok=True)
+        proc_gen_log_dir.mkdir(parents=True, exist_ok=True)
 
         for card in test.proc_cards:
             card_path = (self.workspace.root / card).resolve()
             if not card_path.exists():
-                print(f"[madbench] ERROR: proc_card not found: {card}")
+                tee.log(f"[madbench] ERROR: proc_card not found: {card}")
                 return False
-            print(
+            card_stem = Path(card).stem
+            stdout_log = proc_gen_log_dir / f"{card_stem}.stdout.log"
+            stderr_log = proc_gen_log_dir / f"{card_stem}.stderr.log"
+            tee.log(
                 f"[madbench] Generating processes from {card} "
                 f"(mg_version={mg_version})..."
             )
+            tee.log(f"  stdout: {stdout_log}")
+            tee.log(f"  stderr: {stderr_log}")
             try:
-                proc = subprocess.Popen(
-                    [str(mg_bin), str(card_path)],
-                    stdout=tee_fd,
-                    stderr=subprocess.STDOUT,
-                    cwd=processes_dir,
-                    close_fds=True,
-                )
-                exit_code = proc.wait()
+                with open(stdout_log, "w") as so, open(stderr_log, "w") as se:
+                    proc = subprocess.Popen(
+                        [str(mg_bin), str(card_path)],
+                        stdout=so,
+                        stderr=se,
+                        cwd=processes_dir,
+                        close_fds=True,
+                    )
+                    exit_code = proc.wait()
             except OSError as e:
-                print(f"[madbench] ERROR: failed to invoke MadGraph: {e}")
+                tee.log(f"[madbench] ERROR: failed to invoke MadGraph: {e}")
                 return False
             if exit_code != 0:
-                print(
+                tee.log(
                     f"[madbench] ERROR: MadGraph exited {exit_code} for "
                     f"proc_card {card} (mg_version={mg_version})."
                 )
@@ -663,6 +705,15 @@ class MadBench:
         if mg_version == MG_VERSION_NONE:
             return result_dir
         return result_dir / mg_version
+
+    def _version_log_dir(self, run_log_dir: Path, mg_version: str) -> Path:
+        """Per-mg_version slice of the run log dir, paralleling the result
+        dir layout — per-rep ``stdout.log``/``stderr.log`` live under
+        ``<run_log_dir>/<mg_version>/<invocation>/<rep>/``, except the
+        ``<mg_version>`` segment is dropped for the "none" sentinel."""
+        if mg_version == MG_VERSION_NONE:
+            return run_log_dir
+        return run_log_dir / mg_version
 
     def _csv_header(self, test: TestDefinition) -> list[str]:
         return (

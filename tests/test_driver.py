@@ -369,20 +369,35 @@ def test_run_end_to_end(tmp_path):
 
     mb.run(test_file)
 
-    archives = list((ws_root / "logs").glob("e2e_test_*.tar.gz"))
+    archives = list((ws_root / "logs" / "e2e_test").glob("e2e_test_*.tar.gz"))
     assert len(archives) == 1
 
     with tarfile.open(archives[0]) as tar:
         names = tar.getnames()
-        assert "main.log" in names
-        assert "metadata.yml" in names
+        run_dir_name = archives[0].name[: -len(".tar.gz")]
+        assert f"{run_dir_name}/main.log" in names
+        assert f"{run_dir_name}/metadata.yml" in names
+        # Per-rep stdout/stderr split: subprocess output no longer lands in
+        # main.log; it goes to <run>/<invocation>/<rep>/stdout.log etc.
+        assert f"{run_dir_name}/invocation_001/01/stdout.log" in names
+        assert f"{run_dir_name}/invocation_002/01/stdout.log" in names
 
-        meta = yaml.safe_load(tar.extractfile("metadata.yml").read())
+        meta = yaml.safe_load(
+            tar.extractfile(f"{run_dir_name}/metadata.yml").read(),
+        )
         assert meta["test_name"] == "e2e_test"
         assert len(meta["commands"]) == 2
 
-        log_content = tar.extractfile("main.log").read().decode()
-        assert "hello" in log_content
+        main_log = tar.extractfile(f"{run_dir_name}/main.log").read().decode()
+        # main.log now carries the orchestration narrative + summary lines.
+        assert "[madbench] Host:" in main_log
+        assert "=== Running" in main_log
+        assert "[OK]" in main_log
+
+        stdout_1 = tar.extractfile(
+            f"{run_dir_name}/invocation_001/01/stdout.log"
+        ).read().decode()
+        assert "hello" in stdout_1
 
     # CSV exists with both invocations, inside the per-run subdir.
     csv_path = run_dir(ws_root, "e2e", "e2e_test") / "results.csv"
@@ -408,7 +423,7 @@ def test_dry_run_no_side_effects(tmp_path, capsys):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file, dry_run=True)
 
-    assert not any((ws_root / "logs").glob("*.tar.gz"))
+    assert not list((ws_root / "logs").rglob("*.tar.gz"))
     assert not (ws_root / "results" / "dry").exists()
     assert not (ws_root / "scratch" / "dry_test").exists()
 
@@ -603,9 +618,12 @@ def test_run_sets_env_vars(tmp_path):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    archives = list((ws_root / "logs").glob("envcheck_*.tar.gz"))
+    archives = list((ws_root / "logs" / "envcheck").glob("envcheck_*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
-        log = tar.extractfile("main.log").read().decode()
+        run_dir_name = archives[0].name[: -len(".tar.gz")]
+        log = tar.extractfile(
+            f"{run_dir_name}/invocation_001/01/stdout.log"
+        ).read().decode()
 
     assert "WORKDIR=" in log and "/invocation_001" in log
     assert "INPUTS=" in log and "/inputs" in log
@@ -829,9 +847,12 @@ def test_run_exposes_mg_env_vars(tmp_path):
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs").glob("envmg_*.tar.gz"))
+    archives = list((ws_root / "logs" / "envmg").glob("envmg_*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
-        log = tar.extractfile("main.log").read().decode()
+        run_dir_name = archives[0].name[: -len(".tar.gz")]
+        log = tar.extractfile(
+            f"{run_dir_name}/v3.5.4/invocation_001/01/stdout.log"
+        ).read().decode()
     assert "MG_VERSION=v3.5.4" in log
     assert "MG_BIN=" in log
     assert "MadGraph/v3.5.4/bin/mg5_aMC" in log
@@ -854,9 +875,12 @@ def test_run_mg_bin_empty_when_version_is_none(tmp_path):
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs").glob("envnone_*.tar.gz"))
+    archives = list((ws_root / "logs" / "envnone").glob("envnone_*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
-        log = tar.extractfile("main.log").read().decode()
+        run_dir_name = archives[0].name[: -len(".tar.gz")]
+        log = tar.extractfile(
+            f"{run_dir_name}/invocation_001/01/stdout.log"
+        ).read().decode()
     assert "MG_VERSION=none" in log
     assert "MG_BIN=[]" in log
 
@@ -1289,9 +1313,12 @@ def test_run_processes_env_var_set_even_without_proc_cards(tmp_path):
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs").glob("penv_*.tar.gz"))
+    archives = list((ws_root / "logs" / "penv").glob("penv_*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
-        log = tar.extractfile("main.log").read().decode()
+        run_dir_name = archives[0].name[: -len(".tar.gz")]
+        log = tar.extractfile(
+            f"{run_dir_name}/invocation_001/01/stdout.log"
+        ).read().decode()
     assert "PROCESSES=" in log and "/processes" in log
     assert "DIR_EXISTS" in log
 
