@@ -42,17 +42,17 @@ def make_test_yaml(ws_root: Path, data: dict, name: str = "test.yml") -> Path:
     return test_file
 
 
-def run_dir(ws_root: Path, result_group: str, test_name: str) -> Path:
+def run_dir(ws_root: Path, test_name: str) -> Path:
     """Return the single per-run subfolder created by a madbench run.
 
     Each ``madbench run`` writes its outputs into
-    ``results/<result_group>/<test_name>_<timestamp>_<hostname>/``. Tests
-    almost always invoke exactly one run per ``test_name`` per result_group,
-    so we glob and assert uniqueness.
+    ``results/<test_name>/<hostname>_<timestamp>/``. Tests almost always
+    invoke exactly one run per ``test_name``, so we list and assert
+    uniqueness.
     """
-    matches = list((ws_root / "results" / result_group).glob(f"{test_name}_*"))
+    matches = list((ws_root / "results" / test_name).iterdir())
     assert len(matches) == 1, (
-        f"Expected exactly one per-run subdir for {test_name!r} in {result_group!r}, "
+        f"Expected exactly one per-run subdir for {test_name!r}, "
         f"found {[str(m) for m in matches]}"
     )
     return matches[0]
@@ -73,7 +73,6 @@ def test_load_test_basic(tmp_path):
         "description": "A test",
         "script": "hello.sh",
         "args": {"ncores": 1, "nevents": 100},
-        "result_group": "mygroup",
     }
     test_file = make_test_yaml(ws_root, yaml_data)
 
@@ -96,7 +95,6 @@ def test_load_test_with_new_fields(tmp_path):
         "name": "t",
         "script": "hello.sh",
         "args": {"seed": 42},
-        "result_group": "g",
         "inputs": ["config/*", "data/x.txt"],
         "outputs": ["throughput", "note"],
         "artifacts": ["out.log", "gridpack_{seed}/timings.txt"],
@@ -135,7 +133,6 @@ def test_build_commands_scalar_only(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"ncores": 4, "nevents": 100, "seed": 42},
-        result_group="grp",
     )
     cmds = mb.build_commands(td)
     assert len(cmds) == 1
@@ -151,7 +148,6 @@ def test_build_commands_one_list(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"ncores": [1, 2, 4], "nevents": 100},
-        result_group="grp",
     )
     cmds = mb.build_commands(td)
     assert len(cmds) == 3
@@ -169,7 +165,6 @@ def test_build_commands_cartesian(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"ncores": [1, 2], "nevents": [100, 200], "seed": 42},
-        result_group="grp",
     )
     cmds = mb.build_commands(td)
     assert [c[1:] for c in cmds] == [
@@ -189,7 +184,6 @@ def test_build_commands_single_zip_group(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"nevents": [1000, 2000], "timeout": [10, 20], "seed": 42},
-        result_group="grp",
         zip_groups=[["nevents", "timeout"]],
     )
     cmds = mb.build_commands(td)
@@ -213,7 +207,6 @@ def test_build_commands_zip_and_cartesian(tmp_path):
             "timeout": [10, 600],
             "seed": 42,
         },
-        result_group="grp",
         zip_groups=[["nevents", "timeout"]],
     )
     cmds = mb.build_commands(td)
@@ -238,7 +231,6 @@ def test_build_commands_multiple_zip_groups(tmp_path):
             "c": ["x", "y", "z"],
             "d": ["X", "Y", "Z"],
         },
-        result_group="grp",
         zip_groups=[["a", "b"], ["c", "d"]],
     )
     cmds = mb.build_commands(td)
@@ -258,7 +250,6 @@ def test_build_commands_zip_mismatched_length_raises(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"a": [1, 2], "b": [10, 20, 30]},
-        result_group="grp",
         zip_groups=[["a", "b"]],
     )
     with pytest.raises(ValueError, match="mismatched lengths"):
@@ -274,7 +265,6 @@ def test_build_commands_zip_unknown_arg_raises(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"a": [1, 2]},
-        result_group="grp",
         zip_groups=[["a", "missing"]],
     )
     with pytest.raises(ValueError, match="unknown arg"):
@@ -290,7 +280,6 @@ def test_build_commands_zip_scalar_member_raises(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"a": [1, 2], "b": 5},
-        result_group="grp",
         zip_groups=[["a", "b"]],
     )
     with pytest.raises(ValueError, match="must be a list"):
@@ -306,7 +295,6 @@ def test_build_commands_zip_overlap_raises(tmp_path):
     td = TestDefinition(
         name="t", description="", script="hello.sh",
         args={"a": [1, 2], "b": [3, 4], "c": [5, 6]},
-        result_group="grp",
         zip_groups=[["a", "b"], ["b", "c"]],
     )
     with pytest.raises(ValueError, match="more than one zip group"):
@@ -322,7 +310,6 @@ def test_load_test_zip_field_single_group(tmp_path):
         "name": "z",
         "script": "hello.sh",
         "args": {"a": [1, 2], "b": [10, 20]},
-        "result_group": "g",
         "zip": ["a", "b"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
@@ -339,7 +326,6 @@ def test_load_test_zip_field_multi_group(tmp_path):
         "name": "z",
         "script": "hello.sh",
         "args": {"a": [1, 2], "b": [10, 20], "c": [3], "d": [30]},
-        "result_group": "g",
         "zip": [["a", "b"], ["c", "d"]],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
@@ -363,13 +349,12 @@ def test_run_end_to_end(tmp_path):
         "description": "End-to-end smoke test",
         "script": "hello.sh",
         "args": {"ncores": [1, 2], "nevents": 100},
-        "result_group": "e2e",
     }
     test_file = make_test_yaml(ws_root, yaml_data)
 
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "e2e_test").glob("e2e_test_*.tar.gz"))
+    archives = list((ws_root / "logs" / "e2e_test").glob("*.tar.gz"))
     assert len(archives) == 1
 
     with tarfile.open(archives[0]) as tar:
@@ -400,7 +385,7 @@ def test_run_end_to_end(tmp_path):
         assert "hello" in stdout_1
 
     # CSV exists with both invocations, inside the per-run subdir.
-    csv_path = run_dir(ws_root, "e2e", "e2e_test") / "results.csv"
+    csv_path = run_dir(ws_root, "e2e_test") / "results.csv"
     assert csv_path.exists()
     lines = csv_path.read_text().splitlines()
     assert len(lines) == 3  # header + 2 rows
@@ -418,7 +403,6 @@ def test_dry_run_no_side_effects(tmp_path, capsys):
         "name": "dry_test",
         "script": "hello.sh",
         "args": {"ncores": [1, 2], "nevents": 100},
-        "result_group": "dry",
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file, dry_run=True)
@@ -449,7 +433,6 @@ def test_run_stages_inputs(tmp_path):
         "name": "staged",
         "script": "hello.sh",
         "args": {"x": 1},
-        "result_group": "g",
         "inputs": ["config/Cards/*"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
@@ -485,13 +468,12 @@ def test_run_reads_outputs_json_and_writes_csv(tmp_path):
         "name": "without",
         "script": "hello.sh",
         "args": {"throughput": [10, 20]},
-        "result_group": "g",
         "outputs": ["throughput", "note"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    csv_path = run_dir(ws_root, "g", "without") / "results.csv"
+    csv_path = run_dir(ws_root, "without") / "results.csv"
     rows = csv_path.read_text().splitlines()
     header = rows[0].split(",")
     # arg `throughput` and output `throughput` collide on column name; this
@@ -514,13 +496,12 @@ def test_run_missing_outputs_json_writes_blanks(tmp_path, capsys):
         "name": "missing",
         "script": "hello.sh",
         "args": {"x": 1},
-        "result_group": "g",
         "outputs": ["throughput"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    csv_path = run_dir(ws_root, "g", "missing") / "results.csv"
+    csv_path = run_dir(ws_root, "missing") / "results.csv"
     rows = csv_path.read_text().splitlines()
     assert len(rows) == 2  # header + 1 row
     # 'throughput' column exists, value is empty
@@ -556,13 +537,12 @@ def test_run_copies_artifacts_with_arg_substitution(tmp_path):
         "name": "copy_outputs",
         "script": "hello.sh",
         "args": {"seed": [1, 2]},
-        "result_group": "g",
         "artifacts": ["gridpack_{seed}/timings.txt"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "g", "copy_outputs")
+    rd = run_dir(ws_root, "copy_outputs")
     inv1 = rd / "invocation_001" / "01" / "gridpack_1" / "timings.txt"
     inv2 = rd / "invocation_002" / "01" / "gridpack_2" / "timings.txt"
     assert inv1.exists() and inv1.read_text().strip() == "timings for 1"
@@ -579,7 +559,6 @@ def test_run_missing_output_file_warns(tmp_path, capsys):
         "name": "missing_file",
         "script": "hello.sh",
         "args": {"x": 1},
-        "result_group": "g",
         "artifacts": ["does_not_exist.log"],
     }
     test_file = make_test_yaml(ws_root, yaml_data)
@@ -613,12 +592,11 @@ def test_run_sets_env_vars(tmp_path):
         "name": "envcheck",
         "script": "hello.sh",
         "args": {"x": 1},
-        "result_group": "g",
     }
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "envcheck").glob("envcheck_*.tar.gz"))
+    archives = list((ws_root / "logs" / "envcheck").glob("*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
         run_dir_name = archives[0].name[: -len(".tar.gz")]
         log = tar.extractfile(
@@ -640,10 +618,10 @@ def test_run_sets_env_vars(tmp_path):
 
 
 def test_two_runs_produce_isolated_subdirs(tmp_path):
-    """Per-run isolation: re-running a test in the same result_group with
-    different schemas produces two distinct subdirs, each with its own
+    """Per-run isolation: re-running a test with different schemas produces
+    two distinct subdirs under ``results/<test_name>/``, each with its own
     results.csv. The old rollover mechanism (results.2.csv at the
-    result_group root) is therefore not exercised in the normal flow."""
+    per-test root) is therefore not exercised in the normal flow."""
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)
     ws = find_workspace(ws_root)
@@ -653,7 +631,7 @@ def test_two_runs_produce_isolated_subdirs(tmp_path):
         ws_root,
         {
             "name": "schema", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "outputs": ["a"],
+            "outputs": ["a"],
         },
         name="schema1.yml",
     )
@@ -665,19 +643,19 @@ def test_two_runs_produce_isolated_subdirs(tmp_path):
         ws_root,
         {
             "name": "schema", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "outputs": ["a", "b"],
+            "outputs": ["a", "b"],
         },
         name="schema2.yml",
     )
     mb.run(ws_root / "tests" / "schema2.yml")
 
-    subdirs = sorted((ws_root / "results" / "g").glob("schema_*"))
+    subdirs = sorted((ws_root / "results" / "schema").iterdir())
     assert len(subdirs) == 2
     h1 = (subdirs[0] / "results.csv").read_text().splitlines()[0]
     h2 = (subdirs[1] / "results.csv").read_text().splitlines()[0]
     assert h1 != h2  # different schemas, in different subdirs
-    # The old result_group-level results.csv must not exist any more.
-    assert not (ws_root / "results" / "g" / "results.csv").exists()
+    # No per-test rollup CSV must exist — each subdir is self-contained.
+    assert not (ws_root / "results" / "schema" / "results.csv").exists()
 
 
 # -----------------------------------------------------------------------
@@ -695,7 +673,6 @@ def test_list_tests(tmp_path):
         "name": "mytest",
         "script": "hello.sh",
         "args": {"n": 1},
-        "result_group": "grp",
     }
     make_test_yaml(ws_root, yaml_data, "mytest.yml")
 
@@ -716,7 +693,7 @@ def test_load_test_mg_version_defaults_to_none(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "t", "script": "hello.sh", "args": {"x": 1}},
     )
     td = mb.load_test(test_file)
     assert td.mg_version == ["none"]
@@ -729,7 +706,7 @@ def test_load_test_mg_version_accepts_string(tmp_path):
         ws_root,
         {
             "name": "t", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": "v3.5.4",
+            "mg_version": "v3.5.4",
         },
     )
     td = mb.load_test(test_file)
@@ -743,7 +720,7 @@ def test_load_test_mg_version_accepts_list(tmp_path):
         ws_root,
         {
             "name": "t", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v3.5.4", "dev_abc"],
+            "mg_version": ["v3.5.4", "dev_abc"],
         },
     )
     td = mb.load_test(test_file)
@@ -757,7 +734,7 @@ def test_load_test_mg_version_invalid_raises(tmp_path):
         ws_root,
         {
             "name": "t", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": 123,
+            "mg_version": 123,
         },
     )
     with pytest.raises(ValueError, match="mg_version"):
@@ -773,7 +750,6 @@ def test_build_commands_multiplied_by_mg_version(tmp_path):
         {
             "name": "t", "script": "hello.sh",
             "args": {"x": [1, 2]},
-            "result_group": "g",
             "mg_version": ["a", "b"],
         },
     )
@@ -795,7 +771,7 @@ def test_run_per_version_workdir_layout(tmp_path):
         ws_root,
         {
             "name": "wd", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v1", "v2"],
+            "mg_version": ["v1", "v2"],
         },
     )
     mb.run(test_file)
@@ -817,7 +793,7 @@ def test_run_no_version_segment_when_none(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "noversion", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "noversion", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
@@ -842,12 +818,12 @@ def test_run_exposes_mg_env_vars(tmp_path):
         ws_root,
         {
             "name": "envmg", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v3.5.4"],
+            "mg_version": ["v3.5.4"],
         },
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "envmg").glob("envmg_*.tar.gz"))
+    archives = list((ws_root / "logs" / "envmg").glob("*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
         run_dir_name = archives[0].name[: -len(".tar.gz")]
         log = tar.extractfile(
@@ -871,11 +847,11 @@ def test_run_mg_bin_empty_when_version_is_none(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "envnone", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "envnone", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "envnone").glob("envnone_*.tar.gz"))
+    archives = list((ws_root / "logs" / "envnone").glob("*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
         run_dir_name = archives[0].name[: -len(".tar.gz")]
         log = tar.extractfile(
@@ -893,12 +869,12 @@ def test_run_csv_includes_mg_version_column(tmp_path):
         ws_root,
         {
             "name": "csvmg", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g", "mg_version": ["a", "b"],
+            "mg_version": ["a", "b"],
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "csvmg") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "csvmg") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "mg_version" in header
     mgv_idx = header.index("mg_version")
@@ -913,11 +889,11 @@ def test_run_csv_mg_version_column_when_unset(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "csvnone", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "csvnone", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "csvnone") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "csvnone") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "mg_version" in header
     mgv_idx = header.index("mg_version")
@@ -936,7 +912,7 @@ def test_run_invocation_ids_align_across_versions(tmp_path):
         ws_root,
         {
             "name": "align", "script": "hello.sh", "args": {"x": [10, 20, 30]},
-            "result_group": "g", "mg_version": ["v1", "v2"],
+            "mg_version": ["v1", "v2"],
         },
     )
     mb.run(test_file)
@@ -965,13 +941,13 @@ def test_run_artifacts_scoped_per_version(tmp_path):
         ws_root,
         {
             "name": "outv", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v1", "v2"],
+            "mg_version": ["v1", "v2"],
             "artifacts": ["out.log"],
         },
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "g", "outv")
+    rd = run_dir(ws_root, "outv")
     v1_out = (rd / "v1" / "invocation_001" / "01" / "out.log").read_text().strip()
     v2_out = (rd / "v2" / "invocation_001" / "01" / "out.log").read_text().strip()
     assert v1_out == "v1"
@@ -984,22 +960,21 @@ def test_run_artifacts_scoped_per_version(tmp_path):
 
 
 def test_run_dir_naming(tmp_path):
-    """The per-run subfolder under results/<group>/ encodes test, timestamp,
-    and hostname — enough to identify the run by path alone."""
+    """The per-run subfolder under results/<test_name>/ encodes hostname
+    and timestamp — enough to identify the run by path alone."""
     import socket
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "named", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "named", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "g", "named")
-    name = rd.name
-    assert name.startswith("named_")
-    assert name.endswith(f"_{socket.gethostname()}")
+    rd = run_dir(ws_root, "named")
+    assert rd.parent.name == "named"
+    assert rd.name.startswith(f"{socket.gethostname()}_")
 
 
 def test_run_writes_metadata_yml(tmp_path):
@@ -1011,11 +986,11 @@ def test_run_writes_metadata_yml(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "runmeta", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "runmeta", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "g", "runmeta")
+    rd = run_dir(ws_root, "runmeta")
     meta = yaml.safe_load((rd / "metadata.yml").read_text())
     assert meta["test_name"] == "runmeta"
     assert meta["hostname"] == socket.gethostname()
@@ -1026,14 +1001,15 @@ def test_run_writes_metadata_yml(tmp_path):
 
 
 def test_two_runs_create_separate_subdirs(tmp_path):
-    """Successive runs in the same result_group create separate
-    self-contained subdirs — no shared file is read/written by either."""
+    """Successive runs of the same test create separate self-contained
+    subdirs under ``results/<test_name>/`` — no shared file is read/written
+    by either."""
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)
     mb = MadBench(find_workspace(ws_root))
     make_test_yaml(
         ws_root,
-        {"name": "twice", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "twice", "script": "hello.sh", "args": {"x": 1}},
         name="twice.yml",
     )
     test_file = ws_root / "tests" / "twice.yml"
@@ -1043,7 +1019,7 @@ def test_two_runs_create_separate_subdirs(tmp_path):
     _t.sleep(1.1)  # ensure a distinct timestamp on the second run
     mb.run(test_file)
 
-    subdirs = sorted((ws_root / "results" / "g").glob("twice_*"))
+    subdirs = sorted((ws_root / "results" / "twice").iterdir())
     assert len(subdirs) == 2
     for sd in subdirs:
         assert (sd / "results.csv").exists()
@@ -1086,7 +1062,7 @@ def test_load_test_proc_cards_default_empty(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "t", "script": "hello.sh", "args": {"x": 1}},
     )
     td = mb.load_test(test_file)
     assert td.proc_cards == []
@@ -1098,8 +1074,7 @@ def test_load_test_proc_cards_parsed(tmp_path):
     test_file = make_test_yaml(
         ws_root,
         {
-            "name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g",
-            "proc_cards": ["inputs/proc_a.dat", "inputs/proc_b.dat"],
+            "name": "t", "script": "hello.sh", "args": {"x": 1}, "proc_cards": ["inputs/proc_a.dat", "inputs/proc_b.dat"],
         },
     )
     td = mb.load_test(test_file)
@@ -1125,7 +1100,7 @@ def test_run_generates_process_dirs(tmp_path):
         ws_root,
         {
             "name": "gen", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v1"],
+            "mg_version": ["v1"],
             "proc_cards": ["inputs/card1.dat", "inputs/card2.dat"],
         },
     )
@@ -1170,7 +1145,7 @@ def test_run_generates_once_per_version_not_per_invocation(tmp_path):
         {
             "name": "once", "script": "hello.sh",
             "args": {"x": [1, 2, 3]},  # 3 invocations
-            "result_group": "g", "mg_version": ["v1"],
+            "mg_version": ["v1"],
             "proc_cards": ["inputs/card.dat"],
         },
     )
@@ -1193,14 +1168,13 @@ def test_run_proc_cards_requires_mg_version(tmp_path):
         ws_root,
         {
             "name": "needsmg", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g",
             "proc_cards": ["inputs/card.dat"],
             # mg_version intentionally omitted → "none"
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "needsmg") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "needsmg") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1220,13 +1194,13 @@ def test_run_proc_cards_missing_mg_binary(tmp_path):
         ws_root,
         {
             "name": "noghost", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["ghost"],
+            "mg_version": ["ghost"],
             "proc_cards": ["inputs/card.dat"],
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "noghost") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "noghost") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1253,14 +1227,14 @@ def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
         ws_root,
         {
             "name": "mgfail", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v1"],
+            "mg_version": ["v1"],
             "proc_cards": ["inputs/card.dat"],
         },
     )
     mb.run(test_file)
 
     assert not marker.exists()  # script never ran
-    rows = (run_dir(ws_root, "g", "mgfail") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "mgfail") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1280,13 +1254,13 @@ def test_run_proc_cards_one_version_fails_others_continue(tmp_path):
         ws_root,
         {
             "name": "mixed", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v_good", "v_bad"],
+            "mg_version": ["v_good", "v_bad"],
             "proc_cards": ["inputs/card.dat"],
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "mixed") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "mixed") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     mgv_idx = header.index("mg_version")
@@ -1309,11 +1283,11 @@ def test_run_processes_env_var_set_even_without_proc_cards(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "penv", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "penv", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "penv").glob("penv_*.tar.gz"))
+    archives = list((ws_root / "logs" / "penv").glob("*.tar.gz"))
     with tarfile.open(archives[0]) as tar:
         run_dir_name = archives[0].name[: -len(".tar.gz")]
         log = tar.extractfile(
@@ -1333,7 +1307,7 @@ def test_load_test_repeat_defaults_to_1(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "t", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "t", "script": "hello.sh", "args": {"x": 1}},
     )
     td = mb.load_test(test_file)
     assert td.repeat == 1
@@ -1347,7 +1321,7 @@ def test_load_test_repeat_invalid_raises(tmp_path):
             ws_root,
             {
                 "name": "t", "script": "hello.sh", "args": {"x": 1},
-                "result_group": "g", "repeat": bad,
+                "repeat": bad,
             },
             name=f"bad_{type(bad).__name__}_{bad}.yml".replace(" ", "_"),
         )
@@ -1370,7 +1344,7 @@ def test_run_creates_rep_subdirs(tmp_path):
         ws_root,
         {
             "name": "rep", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "repeat": 3,
+            "repeat": 3,
         },
     )
     mb.run(test_file)
@@ -1390,7 +1364,7 @@ def test_run_rep_subdir_for_repeat_1(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "single", "script": "hello.sh", "args": {"x": 1}, "result_group": "g"},
+        {"name": "single", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
@@ -1414,12 +1388,12 @@ def test_run_csv_has_repetition_column_with_row_per_rep(tmp_path):
         ws_root,
         {
             "name": "csvr", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g", "outputs": ["v"], "repeat": 3,
+            "outputs": ["v"], "repeat": 3,
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "csvr") / "results.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "csvr") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "repetition" in header
     rep_idx = header.index("repetition")
@@ -1449,12 +1423,12 @@ def test_run_artifacts_scoped_per_rep(tmp_path):
         ws_root,
         {
             "name": "outr", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "artifacts": ["out.log"], "repeat": 2,
+            "artifacts": ["out.log"], "repeat": 2,
         },
     )
     mb.run(test_file)
 
-    inv = run_dir(ws_root, "g", "outr") / "invocation_001"
+    inv = run_dir(ws_root, "outr") / "invocation_001"
     assert (inv / "01" / "out.log").read_text().strip() == "01"
     assert (inv / "02" / "out.log").read_text().strip() == "02"
 
@@ -1476,12 +1450,12 @@ def test_run_summary_csv_mean_std_n_successful(tmp_path):
         ws_root,
         {
             "name": "sum", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "outputs": ["throughput"], "repeat": 3,
+            "outputs": ["throughput"], "repeat": 3,
         },
     )
     mb.run(test_file)
 
-    summary = run_dir(ws_root, "g", "sum") / "summary.csv"
+    summary = run_dir(ws_root, "sum") / "summary.csv"
     assert summary.exists()
     rows = summary.read_text().splitlines()
     header = rows[0].split(",")
@@ -1514,12 +1488,12 @@ def test_run_summary_excludes_failed_reps_from_average(tmp_path):
         ws_root,
         {
             "name": "mix", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "outputs": ["throughput"], "repeat": 3,
+            "outputs": ["throughput"], "repeat": 3,
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "mix") / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "mix") / "summary.csv").read_text().splitlines()
     header = rows[0].split(",")
     cells = dict(zip(header, rows[1].split(",")))
     assert cells["n_successful"] == "2"
@@ -1537,12 +1511,12 @@ def test_run_summary_handles_all_failures(tmp_path):
         ws_root,
         {
             "name": "allbad", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "outputs": ["throughput"], "repeat": 2,
+            "outputs": ["throughput"], "repeat": 2,
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "allbad") / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "allbad") / "summary.csv").read_text().splitlines()
     header = rows[0].split(",")
     cells = dict(zip(header, rows[1].split(",")))
     assert cells["n_successful"] == "0"
@@ -1565,12 +1539,12 @@ def test_run_summary_skips_non_numeric_outputs(tmp_path):
         ws_root,
         {
             "name": "mixed_outs", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "outputs": ["throughput", "note"], "repeat": 2,
+            "outputs": ["throughput", "note"], "repeat": 2,
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "mixed_outs") / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "mixed_outs") / "summary.csv").read_text().splitlines()
     header = rows[0].split(",")
     cells = dict(zip(header, rows[1].split(",")))
     assert float(cells["throughput_mean"]) == 50.0
@@ -1593,12 +1567,12 @@ def test_run_summary_one_row_per_arg_combo(tmp_path):
         ws_root,
         {
             "name": "multi", "script": "hello.sh", "args": {"x": [10, 20]},
-            "result_group": "g", "outputs": ["v"], "repeat": 2,
+            "outputs": ["v"], "repeat": 2,
         },
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "g", "multi") / "summary.csv").read_text().splitlines()
+    rows = (run_dir(ws_root, "multi") / "summary.csv").read_text().splitlines()
     # Header + 2 arg-combos = 3 lines
     assert len(rows) == 3
     header = rows[0].split(",")
@@ -1624,7 +1598,7 @@ def test_run_other_reps_continue_when_one_fails(tmp_path):
         ws_root,
         {
             "name": "isol", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "repeat": 3,
+            "repeat": 3,
         },
     )
     mb.run(test_file)
@@ -1645,7 +1619,7 @@ def test_run_inputs_staged_per_version(tmp_path):
         ws_root,
         {
             "name": "inputsmg", "script": "hello.sh", "args": {"x": 1},
-            "result_group": "g", "mg_version": ["v1", "v2"],
+            "mg_version": ["v1", "v2"],
             "inputs": ["config/card.dat"],
         },
     )
@@ -1678,13 +1652,12 @@ def test_run_copies_test_yml_into_result_dir_verbatim(tmp_path):
         "args:\n"
         "  ncores: [1, 2]\n"
         "  nevents: 100\n"
-        "result_group: g\n"
-    )
+        )
     test_file = ws_root / "tests" / "tyml.yml"
     test_file.write_text(yml_body)
     mb.run(test_file)
 
-    copied = run_dir(ws_root, "g", "tyml") / "test.yml"
+    copied = run_dir(ws_root, "tyml") / "test.yml"
     assert copied.exists()
     assert copied.read_text() == yml_body  # byte-for-byte, including comment
 
@@ -1695,13 +1668,12 @@ def test_run_metadata_yml_points_at_sibling_test_yml(tmp_path):
     mb = MadBench(find_workspace(ws_root))
     test_file = make_test_yaml(
         ws_root,
-        {"name": "metayml", "script": "hello.sh", "args": {"x": 1},
-         "result_group": "g"},
+        {"name": "metayml", "script": "hello.sh", "args": {"x": 1}},
     )
     mb.run(test_file)
 
     meta = yaml.safe_load(
-        (run_dir(ws_root, "g", "metayml") / "metadata.yml").read_text()
+        (run_dir(ws_root, "metayml") / "metadata.yml").read_text()
     )
     # test_definition is no longer in metadata.yml; the sibling test.yml is.
     assert "test_definition" not in meta
@@ -1733,12 +1705,11 @@ def test_run_writes_failed_yml_when_some_runs_fail(tmp_path):
         ws_root,
         {
             "name": "flaky", "script": "hello.sh", "args": {"x": [1, 2, 3]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "g", "flaky")
+    rd = run_dir(ws_root, "flaky")
     failed_yml = rd / "failed.yml"
     assert failed_yml.exists()
     payload = yaml.safe_load(failed_yml.read_text())
@@ -1761,12 +1732,11 @@ def test_run_no_failed_yml_when_all_pass(tmp_path):
         ws_root,
         {
             "name": "happy", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "g", "happy")
+    rd = run_dir(ws_root, "happy")
     assert not (rd / "failed.yml").exists()
 
 
@@ -1782,17 +1752,16 @@ def test_retry_reruns_only_failed_combos_with_preserved_ids(tmp_path):
         ws_root,
         {
             "name": "retried", "script": "hello.sh", "args": {"x": [1, 2, 3]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "g", "retried")
+    original = run_dir(ws_root, "retried")
 
     # Patch the script so x=2 now succeeds, then retry.
     make_script(ws_root)  # back to always-succeeding body
     mb.retry(original)
 
-    rd_dirs = sorted((ws_root / "results" / "g").glob("retried_*"))
+    rd_dirs = sorted((ws_root / "results" / "retried").iterdir())
     assert len(rd_dirs) == 2
     retry_dir = [d for d in rd_dirs if d != original][0]
 
@@ -1818,16 +1787,15 @@ def test_retry_writes_retry_of_pointer_in_metadata(tmp_path):
         ws_root,
         {
             "name": "retrymeta", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "g", "retrymeta")
+    original = run_dir(ws_root, "retrymeta")
 
     mb.retry(original)
 
     retry_dir = [
-        d for d in (ws_root / "results" / "g").glob("retrymeta_*")
+        d for d in (ws_root / "results" / "retrymeta").iterdir()
         if d != original
     ][0]
     meta = yaml.safe_load((retry_dir / "metadata.yml").read_text())
@@ -1842,18 +1810,17 @@ def test_retry_noop_when_no_failures(tmp_path, capsys):
         ws_root,
         {
             "name": "happy_retry", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "g", "happy_retry")
+    original = run_dir(ws_root, "happy_retry")
 
     mb.retry(original)
 
     captured = capsys.readouterr()
     assert "Nothing to retry" in captured.out
     # No second results dir was created.
-    assert len(list((ws_root / "results" / "g").glob("happy_retry_*"))) == 1
+    assert len(list((ws_root / "results" / "happy_retry").iterdir())) == 1
 
 
 def test_retry_works_without_original_workspace_test_yaml(tmp_path):
@@ -1868,11 +1835,10 @@ def test_retry_works_without_original_workspace_test_yaml(tmp_path):
         ws_root,
         {
             "name": "noyml", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "g", "noyml")
+    original = run_dir(ws_root, "noyml")
 
     # Delete the canonical YAML — retry should still work because the
     # sibling test.yml inside the original run dir is authoritative.
@@ -1881,7 +1847,7 @@ def test_retry_works_without_original_workspace_test_yaml(tmp_path):
     mb.retry(original)
 
     retry_dir = [
-        d for d in (ws_root / "results" / "g").glob("noyml_*")
+        d for d in (ws_root / "results" / "noyml").iterdir()
         if d != original
     ][0]
     rows = (retry_dir / "results.csv").read_text().splitlines()
@@ -1901,11 +1867,10 @@ def test_retry_errors_when_sibling_test_yml_missing(tmp_path):
         ws_root,
         {
             "name": "deletedyml", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g",
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "g", "deletedyml")
+    original = run_dir(ws_root, "deletedyml")
 
     (original / "test.yml").unlink()
 
@@ -1932,18 +1897,18 @@ def test_retry_replays_per_mg_version_failures(tmp_path):
         ws_root,
         {
             "name": "mgretry", "script": "hello.sh", "args": {"x": [1, 2]},
-            "result_group": "g", "mg_version": ["v_good", "v_bad"],
+            "mg_version": ["v_good", "v_bad"],
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "g", "mgretry")
+    original = run_dir(ws_root, "mgretry")
 
     # Flip the script: now v_bad succeeds. Retry should re-run only v_bad.
     make_script(ws_root)
     mb.retry(original)
 
     retry_dir = [
-        d for d in (ws_root / "results" / "g").glob("mgretry_*")
+        d for d in (ws_root / "results" / "mgretry").iterdir()
         if d != original
     ][0]
     rows = (retry_dir / "results.csv").read_text().splitlines()

@@ -23,7 +23,7 @@ from ._logging import MainLog, bundle_logs
 from .results import append_row, select_results_csv
 
 
-_REQUIRED_FIELDS = {"name", "script", "args", "result_group"}
+_REQUIRED_FIELDS = {"name", "script", "args"}
 
 OUTPUT_FILE_NAME = ".madbench_output.json"
 
@@ -61,7 +61,6 @@ class TestDefinition:
     description: str
     script: str
     args: dict[str, Any]              # values can be scalars or lists
-    result_group: str
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
@@ -200,7 +199,6 @@ class MadBench:
             description=raw.get("description", ""),
             script=raw["script"],
             args=raw["args"] or {},
-            result_group=raw["result_group"],
             inputs=_as_str_list(raw.get("inputs"), "inputs"),
             outputs=_as_str_list(raw.get("outputs"), "outputs"),
             artifacts=_as_str_list(raw.get("artifacts"), "artifacts"),
@@ -271,11 +269,11 @@ class MadBench:
         hardware = detect_hardware()
         hostname = hardware["hostname"]
 
-        result_group_dir = self.workspace.results_dir / test.result_group
-        result_dir = result_group_dir / f"{test.name}_{timestamp}_{hostname}"
+        result_dir = (
+            self.workspace.results_dir / test.name / f"{hostname}_{timestamp}"
+        )
         run_log_dir = (
-            self.workspace.logs_dir / test.name
-            / f"{test.name}_{timestamp}_{hostname}"
+            self.workspace.logs_dir / test.name / f"{hostname}_{timestamp}"
         )
 
         metadata: dict[str, Any] = {
@@ -320,7 +318,7 @@ class MadBench:
         original ``invocation_id`` / ``repetition`` / ``mg_version`` so the
         retry's tree mirrors the failing slice of the original on disk.
         The retry lands in a fresh sibling under
-        ``results/<group>/<test>_<retry_ts>_<host>/`` with
+        ``results/<test>/<host>_<retry_ts>/`` with
         ``retry_of: <original_run_dir>`` in its ``metadata.yml`` — the
         original is never mutated, and cross-host retries cohabit cleanly
         because each retry's directory name carries its own host.
@@ -398,11 +396,11 @@ class MadBench:
             for mgv in retry_mg_versions
         }
 
-        result_group_dir = self.workspace.results_dir / test.result_group
-        result_dir = result_group_dir / f"{test.name}_{timestamp}_{hostname}"
+        result_dir = (
+            self.workspace.results_dir / test.name / f"{hostname}_{timestamp}"
+        )
         run_log_dir = (
-            self.workspace.logs_dir / test.name
-            / f"{test.name}_{timestamp}_{hostname}"
+            self.workspace.logs_dir / test.name / f"{hostname}_{timestamp}"
         )
 
         metadata: dict[str, Any] = {
@@ -441,17 +439,17 @@ class MadBench:
         """Plotting is deprecated for now.
 
         With the per-run result layout each ``madbench run`` produces its own
-        ``<test>_<timestamp>_<hostname>/results.csv`` rather than a single
-        accumulating CSV per ``result_group``. Plotting therefore needs a
+        ``results/<test>/<hostname>_<timestamp>/results.csv`` rather than a
+        single accumulating CSV per test. Plotting therefore needs a
         cross-run aggregation step that hasn't been designed yet, so the
         command short-circuits with a notice instead of guessing a layout.
         """
         print(
             "[madbench] 'plot' is deprecated and not currently supported. "
             "Each madbench run now writes its own results CSV under "
-            "results/<group>/<test>_<timestamp>_<hostname>/; a future "
-            "release will reintroduce plotting once the cross-run "
-            "aggregation story is settled."
+            "results/<test>/<hostname>_<timestamp>/; a future release "
+            "will reintroduce plotting once the cross-run aggregation "
+            "story is settled."
         )
 
     def list_tests(self) -> list[dict]:
@@ -477,7 +475,7 @@ class MadBench:
                 })
                 continue
 
-            result_dir = self.workspace.results_dir / test.result_group
+            result_dir = self.workspace.results_dir / test.name
             has_results = result_dir.exists() and any(result_dir.iterdir())
 
             plot_path = resolve_plot_module(self.workspace, test.plot or "")
@@ -669,7 +667,7 @@ class MadBench:
     def _version_result_dir(self, result_dir: Path, mg_version: str) -> Path:
         """Per-mg_version slice of the result dir for ``artifacts`` copies.
         The version segment is dropped when ``mg_version`` is "none" so
-        version-less tests keep the ``results/<group>/<invocation>/`` layout."""
+        version-less tests keep the ``results/<test>/<run>/<invocation>/`` layout."""
         if mg_version == MG_VERSION_NONE:
             return result_dir
         return result_dir / mg_version
@@ -687,25 +685,20 @@ class MadBench:
         a textual marker so retries stand out in directory listings.
         """
         base_ts = get_timestamp()
-        result_group = self.workspace.results_dir  # group joined per-test
+        result_test_dir = self.workspace.results_dir / test_name
         log_test_dir = self.workspace.logs_dir / test_name
 
         def _candidate(suffix: str) -> tuple[str, list[Path]]:
             ts = f"{base_ts}_retry{suffix}"
-            run_basename = f"{test_name}_{ts}_{hostname}"
-            paths: list[Path] = [log_test_dir / run_basename]
+            run_basename = f"{hostname}_{ts}"
+            paths: list[Path] = [
+                log_test_dir / run_basename,
+                result_test_dir / run_basename,
+            ]
             for mgv in mg_versions:
                 paths.append(
                     self._version_run_dir(workdir_base, test_name, ts, mgv),
                 )
-            # results dir: same basename, but we don't know the group
-            # without test.result_group — caller already resolved
-            # ``result_group_dir`` via test.result_group, so we walk every
-            # group subdir to be safe (cheap; results/<group>/ is shallow).
-            if result_group.exists():
-                for group_dir in result_group.iterdir():
-                    if group_dir.is_dir():
-                        paths.append(group_dir / run_basename)
             return ts, paths
 
         ts, paths = _candidate("")
@@ -838,9 +831,9 @@ class MadBench:
 
         One file per ``madbench run`` invocation, sibling of the run's own
         ``results.csv`` and ``summary.csv``. The per-run dir name encodes
-        ``<test>_<timestamp>_<hostname>``, so the file is path-independent —
+        ``<test>/<hostname>_<timestamp>``, so the file is path-independent —
         no other run writes here, no merging needed. Cross-run aggregation
-        is a post-processing concern (walk ``<result_group>/*/metadata.yml``).
+        is a post-processing concern (walk ``results/<test>/*/metadata.yml``).
 
         ``retry_of`` (when set) records the original run dir this is a
         retry of, so aggregators can follow the chain back."""
@@ -1005,7 +998,7 @@ class MadBench:
         main_log = run_log_dir / "main.log"
         archive_path = (
             self.workspace.logs_dir / test.name
-            / f"{test.name}_{timestamp}_{hostname}.tar.gz"
+            / f"{hostname}_{timestamp}.tar.gz"
         )
 
         # mg_version groupings as they appear in units (preserves order).

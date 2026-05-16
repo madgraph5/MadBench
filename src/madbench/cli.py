@@ -42,7 +42,7 @@ def main() -> None:
         type=Path,
         help=(
             "Path to the failing per-run results dir "
-            "(results/<group>/<test>_<ts>_<host>/)"
+            "(results/<test>/<host>_<ts>/)"
         ),
     )
 
