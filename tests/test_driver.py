@@ -440,7 +440,7 @@ def test_run_stages_inputs(tmp_path):
 
     run_dirs = list((ws_root / "scratch").glob("staged_*"))
     assert len(run_dirs) == 1
-    staged = run_dirs[0] / "inputs" / "config" / "Cards" / "card.dat"
+    staged = run_dirs[0] / "staged" / "config" / "Cards" / "card.dat"
     assert staged.exists()
     assert staged.read_text() == "CARD"
 
@@ -604,7 +604,7 @@ def test_run_sets_env_vars(tmp_path):
         ).read().decode()
 
     assert "WORKDIR=" in log and "/invocation_001" in log
-    assert "INPUTS=" in log and "/inputs" in log
+    assert "INPUTS=" in log and "/staged" in log
     assert "OUTPUT_FILE=" in log and ".madbench_output.json" in log
     # cwd should equal the invocation workdir
     workdir_line = [ln for ln in log.splitlines() if ln.startswith("WORKDIR=")][0]
@@ -1804,8 +1804,8 @@ def test_run_inputs_staged_per_version(tmp_path):
 
     v1_dir = next((ws_root / "scratch" / "v1").glob("inputsmg_*"))
     v2_dir = next((ws_root / "scratch" / "v2").glob("inputsmg_*"))
-    assert (v1_dir / "inputs" / "config" / "card.dat").read_text() == "CARD"
-    assert (v2_dir / "inputs" / "config" / "card.dat").read_text() == "CARD"
+    assert (v1_dir / "staged" / "config" / "card.dat").read_text() == "CARD"
+    assert (v2_dir / "staged" / "config" / "card.dat").read_text() == "CARD"
 
 
 # -----------------------------------------------------------------------

@@ -27,6 +27,15 @@ _REQUIRED_FIELDS = {"name", "script", "args"}
 
 OUTPUT_FILE_NAME = ".madbench_output.json"
 
+# Name of the per-rep staging directory inside each run dir. Distinct from
+# the workspace-level ``inputs/`` folder so the staged tree (which
+# preserves workspace-relative paths) doesn't produce a confusing
+# ``inputs/inputs/Cards/...`` hierarchy when patterns reference files
+# under the workspace ``inputs/`` folder. Exposed to scripts via
+# ``$MADBENCH_INPUTS``; that env-var name is preserved for backward
+# compatibility — only the on-disk folder name changed.
+STAGED_DIR_NAME = "staged"
+
 # Distinct exit code recorded in the CSV when a version's proc_card
 # generation step failed and the script was therefore not run.
 PROC_GEN_FAILED_EXIT_CODE = -3
@@ -1018,7 +1027,7 @@ class MadBench:
         shutil.copyfile(test_yml_source, result_dir / "test.yml")
         for mgv, rd in run_dirs.items():
             rd.mkdir(parents=True, exist_ok=True)
-            inputs_dir = rd / "inputs"
+            inputs_dir = rd / STAGED_DIR_NAME
             if test.inputs:
                 stage_inputs(self.workspace.root, test.inputs, inputs_dir)
             else:
@@ -1062,7 +1071,7 @@ class MadBench:
                     )
                 for mgv in mg_versions_in_units:
                     run_dir = run_dirs[mgv]
-                    inputs_dir = run_dir / "inputs"
+                    inputs_dir = run_dir / STAGED_DIR_NAME
                     processes_dir = run_dir / "processes"
                     result_version_dir = self._version_result_dir(result_dir, mgv)
                     log_version_dir = self._version_log_dir(run_log_dir, mgv)
@@ -1426,7 +1435,10 @@ class MadBench:
             print(f"[madbench] Run dir [mg_version={mgv}]: {rd}")
         print(f"[madbench] Result dir: {result_dir}")
         if test.inputs:
-            print("[madbench] Inputs (staged per mg_version into <run_dir>/inputs):")
+            print(
+                f"[madbench] Inputs (staged per mg_version into "
+                f"<run_dir>/{STAGED_DIR_NAME}):"
+            )
             for pat in test.inputs:
                 print(f"  {pat}")
         if test.proc_cards:
