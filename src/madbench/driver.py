@@ -89,6 +89,19 @@ class TestDefinition:
     # Number of statistical repetitions per arg-combo. Each rep gets its own
     # <invocation>/RR/ subdir (zero-padded), its own row in the main CSV, and
     # contributes to the per-(mg_version, arg-combo) summary CSV.
+    stats: Optional[list[str]] = None
+    # Subset of ``outputs`` to aggregate (mean/std) in summary.csv. ``None``
+    # means the user did not declare it — the run-time default is "all
+    # outputs", with a warning logged when ``repeat > 1`` so they know to
+    # set it explicitly. An empty list is a valid explicit opt-out: no
+    # output is aggregated (only ``wall_time`` still is). Every entry must
+    # be present in ``outputs``.
+
+    def resolved_stats(self) -> list[str]:
+        """Effective stats list — falls back to all outputs when unset."""
+        if self.stats is None:
+            return list(self.outputs)
+        return list(self.stats)
 
 
 def _normalize_zip_groups(raw_zip: Any) -> list[list[str]]:
@@ -127,6 +140,23 @@ def _normalize_repeat(raw: Any) -> int:
     if raw < 1:
         raise ValueError(f"'repeat' must be >= 1, got {raw}")
     return raw
+
+
+def _normalize_stats(raw: Any, outputs: list[str]) -> Optional[list[str]]:
+    """Accept missing/None (→ defer to ``outputs`` at run time), or a list
+    of strings whose entries are all declared in ``outputs``."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError("'stats' must be a list of strings")
+    declared = set(outputs)
+    unknown = [x for x in raw if x not in declared]
+    if unknown:
+        raise ValueError(
+            f"'stats' entries not declared in 'outputs': {unknown}. "
+            f"Declared outputs: {outputs}"
+        )
+    return list(raw)
 
 
 def _normalize_mg_version(raw: Any) -> list[str]:
@@ -194,13 +224,14 @@ class MadBench:
                 f"Source: {source}"
             )
 
+        outputs = _as_str_list(raw.get("outputs"), "outputs")
         return TestDefinition(
             name=raw["name"],
             description=raw.get("description", ""),
             script=raw["script"],
             args=raw["args"] or {},
             inputs=_as_str_list(raw.get("inputs"), "inputs"),
-            outputs=_as_str_list(raw.get("outputs"), "outputs"),
+            outputs=outputs,
             artifacts=_as_str_list(raw.get("artifacts"), "artifacts"),
             workdir=raw.get("workdir"),
             plot=raw.get("plot"),
@@ -209,6 +240,7 @@ class MadBench:
             mg_version=_normalize_mg_version(raw.get("mg_version")),
             proc_cards=_as_str_list(raw.get("proc_cards"), "proc_cards"),
             repeat=_normalize_repeat(raw.get("repeat")),
+            stats=_normalize_stats(raw.get("stats"), outputs),
         )
 
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
@@ -730,12 +762,13 @@ class MadBench:
 
     def _summary_header(self, test: TestDefinition) -> list[str]:
         """Header for summary.csv: per-(mg_version, arg-combo) stats. Each
-        numeric column from ``outputs`` (plus ``wall_time``) becomes a
-        ``_mean``/``_std`` pair; ``n_successful`` records the count actually
-        averaged. Hostname is not in this CSV — it lives once in the
-        sibling metadata.yml since every row belongs to the same run."""
+        column listed in ``stats`` (plus ``wall_time``, which MadBench
+        measures itself and is always numeric) becomes a ``_mean``/``_std``
+        pair; ``n_successful`` records the count actually averaged.
+        Hostname is not in this CSV — it lives once in the sibling
+        metadata.yml since every row belongs to the same run."""
         cols = ["timestamp", "mg_version"] + list(test.args.keys())
-        for k in test.outputs + ["wall_time"]:
+        for k in test.resolved_stats() + ["wall_time"]:
             cols.extend([f"{k}_mean", f"{k}_std"])
         cols.extend(["n_successful", "invocation_id"])
         return cols
@@ -1020,6 +1053,13 @@ class MadBench:
                 if retry_of is not None:
                     tee.log(f"[madbench] Retry of: {retry_of}")
                     tee.log(f"[madbench] Retrying {total_runs} failed unit(s)")
+                if test.stats is None and test.repeat > 1 and test.outputs:
+                    tee.log(
+                        f"[madbench] WARN: 'stats' not declared; defaulting "
+                        f"to all outputs {test.outputs} for summary.csv "
+                        f"aggregation. Set 'stats:' in the test YAML to "
+                        f"silence this and to exclude non-numeric outputs."
+                    )
                 for mgv in mg_versions_in_units:
                     run_dir = run_dirs[mgv]
                     inputs_dir = run_dir / "inputs"
@@ -1214,15 +1254,20 @@ class MadBench:
     ) -> Path:
         """Aggregate per-rep rows into one summary row per (mg_version, args).
 
-        Each numeric output and ``wall_time`` is averaged over **successful**
-        reps only (exit_code == 0). Non-numeric output values yield empty
-        mean/std cells. ``n_successful`` records how many reps contributed.
+        Each column listed in ``test.resolved_stats()`` (plus ``wall_time``)
+        is averaged over **successful** reps only (exit_code == 0). If a
+        listed column carries a non-numeric value in any successful rep,
+        the mean/std cells for that (column, arg-combo) are left blank and
+        a warning is emitted — ``stats`` declared the column as a
+        measurement, so a string there is almost certainly a bug worth
+        surfacing. ``n_successful`` records how many reps contributed.
         """
         import statistics
         from collections import OrderedDict
 
         summary_header = self._summary_header(test)
         arg_keys = list(test.args.keys())
+        stats_cols = test.resolved_stats()
 
         groups: "OrderedDict[tuple, list[dict[str, Any]]]" = OrderedDict()
         for row in csv_rows:
@@ -1246,17 +1291,33 @@ class MadBench:
             for i, k in enumerate(arg_keys):
                 summary_row[k] = key[i + 1]
 
-            for col in list(test.outputs) + ["wall_time"]:
+            for col in stats_cols + ["wall_time"]:
                 mean_col = f"{col}_mean"
                 std_col = f"{col}_std"
                 values: list[float] = []
-                try:
-                    for r in successful:
-                        v = r.get(col, "")
-                        if v == "" or v is None:
-                            raise ValueError("blank value")
+                bad_value: Any = None
+                bad = False
+                for r in successful:
+                    v = r.get(col, "")
+                    if v == "" or v is None:
+                        bad_value = v
+                        bad = True
+                        break
+                    try:
                         values.append(float(v))
-                except (TypeError, ValueError):
+                    except (TypeError, ValueError):
+                        bad_value = v
+                        bad = True
+                        break
+
+                if bad:
+                    print(
+                        f"[madbench] WARN: cannot aggregate stats column "
+                        f"{col!r} for {dict(zip(arg_keys, key[1:]))} "
+                        f"(mg_version={key[0]}): non-numeric value "
+                        f"{bad_value!r} in a successful rep. Leaving "
+                        f"mean/std blank."
+                    )
                     summary_row[mean_col] = ""
                     summary_row[std_col] = ""
                     continue
@@ -1377,6 +1438,15 @@ class MadBench:
                 print(f"  {card}")
         if test.outputs:
             print(f"[madbench] Outputs (CSV columns): {test.outputs}")
+        if test.repeat > 1:
+            if test.stats is None and test.outputs:
+                print(
+                    f"[madbench] WARN: 'stats' not declared; defaulting to "
+                    f"all outputs {test.outputs} for summary.csv. Set "
+                    f"'stats:' to exclude non-numeric outputs."
+                )
+            else:
+                print(f"[madbench] Stats (summary.csv): {test.resolved_stats()}")
         if test.artifacts:
             print(f"[madbench] Artifacts (per rep): {test.artifacts}")
         print(

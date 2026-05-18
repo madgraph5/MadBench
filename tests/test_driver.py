@@ -1524,8 +1524,10 @@ def test_run_summary_handles_all_failures(tmp_path):
     assert cells["throughput_std"] == ""
 
 
-def test_run_summary_skips_non_numeric_outputs(tmp_path):
-    """Non-numeric outputs produce empty mean/std cells (no crash)."""
+def test_run_summary_skips_non_numeric_outputs(tmp_path, capsys):
+    """With no explicit ``stats``, non-numeric outputs produce empty
+    mean/std cells (no crash) **and** a warning is emitted so the user
+    notices the bad column without their CSV silently rotting."""
     ws_root = make_workspace(tmp_path)
     make_script(
         ws_root,
@@ -1550,6 +1552,181 @@ def test_run_summary_skips_non_numeric_outputs(tmp_path):
     assert float(cells["throughput_mean"]) == 50.0
     assert cells["note_mean"] == ""
     assert cells["note_std"] == ""
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "cannot aggregate stats column 'note'" in combined
+    assert "'stats' not declared" in combined
+
+
+def test_load_test_stats_defaults_to_none(tmp_path):
+    """Unspecified ``stats`` keeps the sentinel ``None``; resolved_stats()
+    falls back to all outputs."""
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["a", "b"],
+        },
+    )
+    td = mb.load_test(test_file)
+    assert td.stats is None
+    assert td.resolved_stats() == ["a", "b"]
+
+
+def test_load_test_stats_subset_of_outputs(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["a", "b", "label"],
+            "stats": ["a", "b"],
+        },
+    )
+    td = mb.load_test(test_file)
+    assert td.stats == ["a", "b"]
+    assert td.resolved_stats() == ["a", "b"]
+
+
+def test_load_test_stats_unknown_key_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["a"],
+            "stats": ["a", "ghost"],
+        },
+    )
+    with pytest.raises(ValueError, match="not declared in 'outputs'"):
+        mb.load_test(test_file)
+
+
+def test_load_test_stats_wrong_type_raises(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["a"],
+            "stats": "a",
+        },
+    )
+    with pytest.raises(ValueError, match="'stats' must be a list of strings"):
+        mb.load_test(test_file)
+
+
+def test_load_test_stats_empty_list_is_explicit_optout(tmp_path):
+    """Empty ``stats: []`` is a valid explicit opt-out (no output columns
+    are aggregated; ``wall_time`` still is)."""
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "t", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["a"],
+            "stats": [],
+        },
+    )
+    td = mb.load_test(test_file)
+    assert td.stats == []
+    assert td.resolved_stats() == []
+
+
+def test_run_summary_stats_narrows_columns(tmp_path):
+    """An explicit ``stats: [throughput]`` drops ``note_mean``/``note_std``
+    from summary.csv entirely — the user said only ``throughput`` is a
+    measurement, so the non-numeric ``note`` column doesn't pollute the
+    header."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo '{\"throughput\": 50, \"note\": \"ok\"}' > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "narrow", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["throughput", "note"],
+            "stats": ["throughput"],
+            "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (run_dir(ws_root, "narrow") / "summary.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    assert "throughput_mean" in header
+    assert "throughput_std" in header
+    assert "note_mean" not in header
+    assert "note_std" not in header
+    cells = dict(zip(header, rows[1].split(",")))
+    assert float(cells["throughput_mean"]) == 50.0
+
+
+def test_run_summary_stats_warns_when_declared_column_is_non_numeric(tmp_path, capsys):
+    """If ``stats`` declares a column that turns out to be non-numeric, the
+    user said it should be a number — warn, don't crash, blank the cells."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo '{\"v\": \"oops\"}' > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "badnum", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["v"], "stats": ["v"], "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+
+    rows = (run_dir(ws_root, "badnum") / "summary.csv").read_text().splitlines()
+    cells = dict(zip(rows[0].split(","), rows[1].split(",")))
+    assert cells["v_mean"] == ""
+    assert cells["v_std"] == ""
+
+    captured = capsys.readouterr()
+    assert "cannot aggregate stats column 'v'" in (captured.out + captured.err)
+
+
+def test_run_summary_no_default_warning_when_stats_set(tmp_path, capsys):
+    """With ``stats`` explicitly declared the default-stats warning must
+    NOT fire."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo '{\"v\": 1}' > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "quiet", "script": "hello.sh", "args": {"x": 1},
+            "outputs": ["v"], "stats": ["v"], "repeat": 2,
+        },
+    )
+    mb.run(test_file)
+    captured = capsys.readouterr()
+    assert "'stats' not declared" not in (captured.out + captured.err)
 
 
 def test_run_summary_one_row_per_arg_combo(tmp_path):
