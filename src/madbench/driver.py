@@ -265,7 +265,12 @@ class MadBench:
             for combo, _ in self._build_sweep_points(test)
         ]
 
-    def run(self, test_path: Path, dry_run: bool = False) -> None:
+    def run(
+        self,
+        test_path: Path,
+        dry_run: bool = False,
+        note: Optional[str] = None,
+    ) -> None:
         """Main entry point. Loads the test, builds commands, runs them."""
         test = self.load_test(test_path)
         script_path = resolve_script(self.workspace, test.script)
@@ -337,6 +342,8 @@ class MadBench:
             "result_dir": str(result_dir),
             "dry_run": dry_run,
         }
+        if note is not None:
+            metadata["note"] = note
 
         if dry_run:
             self._print_dry_run(test, script_path, run_dirs, result_dir, commands, metadata)
@@ -466,6 +473,14 @@ class MadBench:
             "retry_of": str(original_run_dir),
             "retry_n_units": len(units),
         }
+        # Carry forward the original run's note so a retry's metadata.yml
+        # is self-describing without having to chase ``retry_of`` back to
+        # the source. ``retry`` does not expose its own --note: the retried
+        # jobs are the same jobs, so a fresh note would not mean anything
+        # new.
+        inherited_note = self._read_original_note(original_run_dir)
+        if inherited_note is not None:
+            metadata["note"] = inherited_note
 
         self._execute_units(
             test=test,
@@ -864,6 +879,23 @@ class MadBench:
         append_row(csv_path, csv_header, row, write_header)
         return row
 
+    @staticmethod
+    def _read_original_note(original_run_dir: Path) -> Optional[str]:
+        """Return the ``note`` field from a previous run's ``metadata.yml``,
+        or ``None`` if absent / unreadable. Used by ``retry`` so the carried
+        note never blocks a retry when the original predates this field."""
+        import yaml as _yaml
+
+        meta_path = original_run_dir / "metadata.yml"
+        if not meta_path.exists():
+            return None
+        try:
+            data = _yaml.safe_load(meta_path.read_text()) or {}
+        except _yaml.YAMLError:
+            return None
+        note = data.get("note") if isinstance(data, dict) else None
+        return note if isinstance(note, str) else None
+
     def _write_run_metadata(
         self,
         test: TestDefinition,
@@ -874,6 +906,7 @@ class MadBench:
         run_dirs: dict[str, Path],
         result_dir: Path,
         retry_of: Optional[Path] = None,
+        note: Optional[str] = None,
     ) -> Path:
         """Write ``metadata.yml`` inside the per-run result dir.
 
@@ -904,6 +937,8 @@ class MadBench:
         }
         if retry_of is not None:
             run_meta["retry_of"] = str(retry_of)
+        if note is not None:
+            run_meta["note"] = note
         result_dir.mkdir(parents=True, exist_ok=True)
         path = result_dir / "metadata.yml"
         path.write_text(
@@ -1065,6 +1100,9 @@ class MadBench:
         try:
             with MainLog(main_log) as tee:
                 tee.log(f"[madbench] Host: {format_hardware_summary(hardware)}")
+                note = metadata.get("note")
+                if note:
+                    tee.log(f"[madbench] Note: {note}")
                 if retry_of is not None:
                     tee.log(f"[madbench] Retry of: {retry_of}")
                     tee.log(f"[madbench] Retrying {total_runs} failed unit(s)")
@@ -1275,6 +1313,7 @@ class MadBench:
             metadata_yml_path = self._write_run_metadata(
                 test, timestamp, hostname, git_sha, hardware,
                 run_dirs, result_dir, retry_of=retry_of,
+                note=metadata.get("note"),
             )
             metadata["metadata_yml_path"] = str(metadata_yml_path)
             bundle_logs(run_log_dir, metadata, archive_path)
@@ -1456,6 +1495,8 @@ class MadBench:
 
         print("[madbench] DRY RUN — no files will be created or scripts executed")
         print(f"[madbench] Host: {format_hardware_summary(metadata['hardware'])}")
+        if metadata.get("note"):
+            print(f"[madbench] Note: {metadata['note']}")
         print(f"[madbench] Test: {test.name}")
         print(f"[madbench] Script: {script_path}")
         print(f"[madbench] mg_versions: {list(run_dirs.keys())}")

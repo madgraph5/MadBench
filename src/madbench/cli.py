@@ -31,6 +31,12 @@ def main() -> None:
         action="store_true",
         help="Print commands without executing them",
     )
+    run_parser.add_argument(
+        "--note",
+        type=str,
+        default=None,
+        help="Free-form note recorded in metadata.yml for this run",
+    )
 
     # madbench retry <run_dir>
     retry_parser = subparsers.add_parser(
@@ -85,7 +91,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        mb.run(args.test, dry_run=args.dry_run)
+        mb.run(args.test, dry_run=args.dry_run, note=args.note)
     except (FileNotFoundError, PermissionError, ValueError) as e:
         print(f"[madbench] Error: {e}", file=sys.stderr)
         sys.exit(1)
