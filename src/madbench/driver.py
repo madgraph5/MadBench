@@ -281,19 +281,25 @@ class MadBench:
             for combo, _ in sweep_points
         ]
 
-        # Build the execution unit list. Each sweep point expands into
-        # ``test.repeat`` units sharing the same invocation_id; mg_version
-        # is the outer loop (matches the order in ``sweep_points``).
+        # Build the execution unit list. ``repeat`` is the outermost loop:
+        # rep N of every sweep point runs before any rep N+1, so partial
+        # results across the whole sweep accumulate evenly and intermediate
+        # plots become meaningful before the final rep lands. Within each
+        # rep, units follow ``sweep_points`` order (mg_version outer,
+        # arg-combo inner). The invocation_id is tied to the combo's
+        # position in the per-mg_version slice so the same combo lands at
+        # the same ``invocation_NNN/`` path across reps and versions.
         units: list[_ExecUnit] = []
         n_per_version = len(sweep_points) // len(test.mg_version)
-        for vi_global, (combo, mgv) in enumerate(sweep_points):
-            version_i = (vi_global % n_per_version) + 1
-            invocation_id = f"invocation_{version_i:03d}"
-            cmd = [str(script_path)] + [str(combo[k]) for k in test.args]
-            for rep_i in range(1, test.repeat + 1):
+        for rep_i in range(1, test.repeat + 1):
+            rep_id = f"{rep_i:02d}"
+            for vi_global, (combo, mgv) in enumerate(sweep_points):
+                version_i = (vi_global % n_per_version) + 1
+                invocation_id = f"invocation_{version_i:03d}"
+                cmd = [str(script_path)] + [str(combo[k]) for k in test.args]
                 units.append(_ExecUnit(
                     invocation_id=invocation_id,
-                    rep_id=f"{rep_i:02d}",
+                    rep_id=rep_id,
                     mg_version=mgv,
                     combo=combo,
                     cmd=cmd,
@@ -1069,116 +1075,107 @@ class MadBench:
                         f"aggregation. Set 'stats:' in the test YAML to "
                         f"silence this and to exclude non-numeric outputs."
                     )
+                # Pre-flight: proc_gen once per mg_version before any reps
+                # start. With ``repeat`` as the outermost loop, units from
+                # different mg_versions interleave, so proc_gen can't live
+                # inside the per-unit loop without redoing the same work
+                # every rep.
+                proc_gen_status: dict[str, bool] = {}
                 for mgv in mg_versions_in_units:
+                    if test.proc_cards:
+                        log_version_dir = self._version_log_dir(run_log_dir, mgv)
+                        proc_gen_status[mgv] = self._generate_processes(
+                            test, mgv, run_dirs[mgv], tee,
+                            log_version_dir / "proc_gen",
+                        )
+                    else:
+                        proc_gen_status[mgv] = True
+
+                for unit in units:
+                    script_idx += 1
+                    mgv = unit.mg_version
+                    invocation_id = unit.invocation_id
+                    rep_id = unit.rep_id
+                    combo = unit.combo
+                    cmd = unit.cmd
+
                     run_dir = run_dirs[mgv]
                     inputs_dir = run_dir / STAGED_DIR_NAME
                     processes_dir = run_dir / "processes"
                     result_version_dir = self._version_result_dir(result_dir, mgv)
                     log_version_dir = self._version_log_dir(run_log_dir, mgv)
 
-                    proc_gen_ok = True
-                    if test.proc_cards:
-                        proc_gen_ok = self._generate_processes(
-                            test, mgv, run_dir, tee, log_version_dir / "proc_gen",
-                        )
+                    rep_dir = run_dir / invocation_id / rep_id
+                    rep_dir.mkdir(parents=True, exist_ok=True)
+                    output_file = rep_dir / OUTPUT_FILE_NAME
 
-                    for unit in units:
-                        if unit.mg_version != mgv:
-                            continue
-                        script_idx += 1
-                        invocation_id = unit.invocation_id
-                        rep_id = unit.rep_id
-                        combo = unit.combo
-                        cmd = unit.cmd
-
-                        rep_dir = run_dir / invocation_id / rep_id
-                        rep_dir.mkdir(parents=True, exist_ok=True)
-                        output_file = rep_dir / OUTPUT_FILE_NAME
-
-                        if not proc_gen_ok:
-                            invocation_ts = get_timestamp()
-                            row = self._record_skipped_invocation(
-                                test, combo, mgv, invocation_id, rep_id,
-                                csv_path, csv_header, write_header,
-                                invocation_ts,
-                            )
-                            write_header = False
-                            csv_rows.append(row)
-                            results.append({
-                                "command": " ".join(cmd),
-                                "invocation_id": invocation_id,
-                                "repetition": rep_id,
-                                "mg_version": mgv,
-                                "exit_code": PROC_GEN_FAILED_EXIT_CODE,
-                                "wall_time": 0.0,
-                            })
-                            tee.log(
-                                f"[madbench] SKIP ({script_idx}/{total_runs}): "
-                                f"[{invocation_id} rep={rep_id} mg_version={mgv}] — "
-                                "proc_card generation failed for this version"
-                            )
-                            continue
-
-                        env = os.environ.copy()
-                        env["MADBENCH_WORKDIR"] = str(rep_dir)
-                        env["MADBENCH_INPUTS"] = str(inputs_dir)
-                        env["MADBENCH_PROCESSES"] = str(processes_dir)
-                        env["MADBENCH_OUTPUT_FILE"] = str(output_file)
-                        env["MADBENCH_REPETITION"] = rep_id
-                        env["MG_VERSION"] = mgv
-                        env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
-
-                        rep_log_dir = log_version_dir / invocation_id / rep_id
-                        rep_log_dir.mkdir(parents=True, exist_ok=True)
-                        stdout_log = rep_log_dir / "stdout.log"
-                        stderr_log = rep_log_dir / "stderr.log"
-
-                        tee.log(
-                            f"=== Running ({script_idx}/{total_runs}): "
-                            f"{' '.join(cmd)} "
-                            f"[{invocation_id} rep={rep_id} mg_version={mgv}] ==="
-                        )
-                        tee.log(f"  stdout: {stdout_log}")
-                        tee.log(f"  stderr: {stderr_log}")
-
+                    if not proc_gen_status[mgv]:
                         invocation_ts = get_timestamp()
-                        cmd_start = time.monotonic()
-                        try:
-                            with open(stdout_log, "w") as so, \
-                                    open(stderr_log, "w") as se:
-                                proc = subprocess.Popen(
-                                    cmd,
-                                    stdout=so,
-                                    stderr=se,
-                                    cwd=rep_dir,
-                                    env=env,
-                                    close_fds=True,
-                                )
-                                exit_code = proc.wait()
-                        except KeyboardInterrupt:
-                            proc.terminate()
-                            proc.wait()
-                            exit_code = -2
-                            wall_time = time.monotonic() - cmd_start
-                            row = self._finalize_invocation(
-                                test, combo, mgv, invocation_id, rep_id,
-                                rep_dir, output_file,
-                                result_version_dir, csv_path, csv_header,
-                                write_header, invocation_ts, exit_code, wall_time,
-                            )
-                            csv_rows.append(row)
-                            results.append({
-                                "command": " ".join(cmd),
-                                "invocation_id": invocation_id,
-                                "repetition": rep_id,
-                                "mg_version": mgv,
-                                "exit_code": exit_code,
-                                "wall_time": round(wall_time, 2),
-                            })
-                            write_header = False
-                            tee.log("\n[madbench] Interrupted by user.")
-                            raise
+                        row = self._record_skipped_invocation(
+                            test, combo, mgv, invocation_id, rep_id,
+                            csv_path, csv_header, write_header,
+                            invocation_ts,
+                        )
+                        write_header = False
+                        csv_rows.append(row)
+                        results.append({
+                            "command": " ".join(cmd),
+                            "invocation_id": invocation_id,
+                            "repetition": rep_id,
+                            "mg_version": mgv,
+                            "exit_code": PROC_GEN_FAILED_EXIT_CODE,
+                            "wall_time": 0.0,
+                        })
+                        tee.log(
+                            f"[madbench] SKIP ({script_idx}/{total_runs}): "
+                            f"[{invocation_id} rep={rep_id} mg_version={mgv}] — "
+                            "proc_card generation failed for this version"
+                        )
+                        summary_csv_path = self._write_summary(
+                            test, result_dir, csv_rows,
+                        )
+                        continue
 
+                    env = os.environ.copy()
+                    env["MADBENCH_WORKDIR"] = str(rep_dir)
+                    env["MADBENCH_INPUTS"] = str(inputs_dir)
+                    env["MADBENCH_PROCESSES"] = str(processes_dir)
+                    env["MADBENCH_OUTPUT_FILE"] = str(output_file)
+                    env["MADBENCH_REPETITION"] = rep_id
+                    env["MG_VERSION"] = mgv
+                    env["MG_BIN"] = str(self._resolve_mg_bin(mgv) or "")
+
+                    rep_log_dir = log_version_dir / invocation_id / rep_id
+                    rep_log_dir.mkdir(parents=True, exist_ok=True)
+                    stdout_log = rep_log_dir / "stdout.log"
+                    stderr_log = rep_log_dir / "stderr.log"
+
+                    tee.log(
+                        f"=== Running ({script_idx}/{total_runs}): "
+                        f"{' '.join(cmd)} "
+                        f"[{invocation_id} rep={rep_id} mg_version={mgv}] ==="
+                    )
+                    tee.log(f"  stdout: {stdout_log}")
+                    tee.log(f"  stderr: {stderr_log}")
+
+                    invocation_ts = get_timestamp()
+                    cmd_start = time.monotonic()
+                    try:
+                        with open(stdout_log, "w") as so, \
+                                open(stderr_log, "w") as se:
+                            proc = subprocess.Popen(
+                                cmd,
+                                stdout=so,
+                                stderr=se,
+                                cwd=rep_dir,
+                                env=env,
+                                close_fds=True,
+                            )
+                            exit_code = proc.wait()
+                    except KeyboardInterrupt:
+                        proc.terminate()
+                        proc.wait()
+                        exit_code = -2
                         wall_time = time.monotonic() - cmd_start
                         row = self._finalize_invocation(
                             test, combo, mgv, invocation_id, rep_id,
@@ -1186,7 +1183,6 @@ class MadBench:
                             result_version_dir, csv_path, csv_header,
                             write_header, invocation_ts, exit_code, wall_time,
                         )
-                        write_header = False
                         csv_rows.append(row)
                         results.append({
                             "command": " ".join(cmd),
@@ -1196,13 +1192,41 @@ class MadBench:
                             "exit_code": exit_code,
                             "wall_time": round(wall_time, 2),
                         })
+                        write_header = False
+                        summary_csv_path = self._write_summary(
+                            test, result_dir, csv_rows,
+                        )
+                        tee.log("\n[madbench] Interrupted by user.")
+                        raise
 
-                # Summary + failed.yml inside the tee context so their paths
-                # land in main.log alongside the OK/FAILED roll-up.
-                if csv_rows:
+                    wall_time = time.monotonic() - cmd_start
+                    row = self._finalize_invocation(
+                        test, combo, mgv, invocation_id, rep_id,
+                        rep_dir, output_file,
+                        result_version_dir, csv_path, csv_header,
+                        write_header, invocation_ts, exit_code, wall_time,
+                    )
+                    write_header = False
+                    csv_rows.append(row)
+                    results.append({
+                        "command": " ".join(cmd),
+                        "invocation_id": invocation_id,
+                        "repetition": rep_id,
+                        "mg_version": mgv,
+                        "exit_code": exit_code,
+                        "wall_time": round(wall_time, 2),
+                    })
+                    # Live-update summary.csv after each rep so partial
+                    # results are plottable mid-run. Cheap — summary is
+                    # one row per (mg_version, arg-combo).
                     summary_csv_path = self._write_summary(
                         test, result_dir, csv_rows,
                     )
+
+                # ``summary.csv`` is already up-to-date from the live
+                # updates above; only ``failed.yml`` still needs writing
+                # here so its path lands in main.log alongside the
+                # OK/FAILED roll-up.
                 failed_yml_path = self._write_failed_summary(
                     test, result_dir, results, csv_rows, timestamp, hostname,
                 )
@@ -1283,9 +1307,13 @@ class MadBench:
             key = (row["mg_version"],) + tuple(row[k] for k in arg_keys)
             groups.setdefault(key, []).append(row)
 
-        summary_path, write_header = select_results_csv(
+        summary_path, _ = select_results_csv(
             result_dir, summary_header, basename="summary",
         )
+        # Called repeatedly during a run for live partial-results updates,
+        # so each call rewrites the file from scratch — the summary is a
+        # recomputed snapshot of ``csv_rows``, not an append-only log.
+        write_header = True
 
         for key, rows in groups.items():
             successful = [r for r in rows if r.get("exit_code") == 0]
