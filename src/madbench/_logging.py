@@ -56,13 +56,15 @@ def bundle_logs(
     run_log_dir: Path,
     metadata: dict,
     output_archive: Path,
+    arcname: Optional[str] = None,
 ) -> Path:
     """Tar the per-run log directory recursively.
 
-    Writes ``metadata.yml`` into ``run_log_dir`` first, then tars the whole
-    tree with ``run_log_dir.name`` as the top-level entry — so extracting
-    the archive reproduces the on-disk layout exactly. Returns the archive
-    path.
+    Writes ``metadata.yml`` into ``run_log_dir`` first, then tars the
+    tree with ``arcname`` as the top-level entry (defaults to
+    ``run_log_dir.name``) — so extracting the archive yields a single
+    self-identifying directory rather than a generic ``try_0/`` slice.
+    Returns the archive path.
     """
     output_archive.parent.mkdir(parents=True, exist_ok=True)
 
@@ -71,6 +73,6 @@ def bundle_logs(
         yaml.dump(metadata, f, default_flow_style=False, allow_unicode=True)
 
     with tarfile.open(output_archive, "w:gz") as tar:
-        tar.add(run_log_dir, arcname=run_log_dir.name)
+        tar.add(run_log_dir, arcname=arcname or run_log_dir.name)
 
     return output_archive

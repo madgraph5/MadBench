@@ -47,8 +47,16 @@ def main() -> None:
         "run_dir",
         type=Path,
         help=(
-            "Path to the failing per-run results dir "
+            "Path to the per-run results dir to retry "
             "(results/<test>/<host>_<ts>/)"
+        ),
+    )
+    retry_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Bypass the hardware-mismatch check; allows retrying a run on "
+            "a different host than the one that produced try_0."
         ),
     )
 
@@ -107,7 +115,7 @@ def _cmd_retry(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        mb.retry(args.run_dir)
+        mb.retry(args.run_dir, force=args.force)
     except (FileNotFoundError, PermissionError, ValueError) as e:
         print(f"[madbench] Error: {e}", file=sys.stderr)
         sys.exit(1)

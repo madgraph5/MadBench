@@ -49,8 +49,8 @@ class _ExecUnit:
     """One concrete (script + args + mg_version + repetition) to execute.
 
     ``run()`` builds these from the cartesian sweep; ``retry()`` builds them
-    from the failed rows of a prior run's ``results.csv``. The IDs are
-    preserved across retries so a retried row lands at the same
+    from the failures listed in the latest ``try_N/failed.yml``. The IDs
+    are preserved across retries so a retried row lands at the same
     ``invocation_id/rep_id`` path as the original — diffs against the
     failing run stay trivial.
     """
@@ -352,6 +352,7 @@ class MadBench:
         self._execute_units(
             test=test,
             units=units,
+            try_n=0,
             timestamp=timestamp,
             hostname=hostname,
             git_sha=git_sha,
@@ -364,98 +365,110 @@ class MadBench:
             retry_of=None,
         )
 
-    def retry(self, original_run_dir: Path) -> None:
+    def retry(self, result_dir: Path, force: bool = False) -> None:
         """Re-run only the failed rows of a previous ``madbench run``.
 
-        Reads ``<original_run_dir>/results.csv``, picks rows with
-        ``exit_code != 0``, and replays each as a unit preserving the
-        original ``invocation_id`` / ``repetition`` / ``mg_version`` so the
-        retry's tree mirrors the failing slice of the original on disk.
-        The retry lands in a fresh sibling under
-        ``results/<test>/<host>_<retry_ts>/`` with
-        ``retry_of: <original_run_dir>`` in its ``metadata.yml`` — the
-        original is never mutated, and cross-host retries cohabit cleanly
-        because each retry's directory name carries its own host.
+        Picks the highest existing ``try_N/`` inside ``result_dir``, reads
+        its ``failed.yml``, and replays each failure as a unit preserving
+        ``invocation_id`` / ``repetition`` / ``mg_version`` — so the retried
+        rep lands at the same on-disk slot under
+        ``result_dir/invocation_NNN/RR/`` (artifacts overwritten in place).
+        The new try is written to ``result_dir/try_{N+1}/`` and the
+        top-level ``summary.csv`` is recomputed across every try so it
+        reflects the latest state of every rep.
 
-        The current ``tests/<test_name>.yml`` is used (script, inputs,
-        outputs, artifacts pick up any fixes you made since the failing
-        run); the failing args themselves come from the CSV.
+        Hardware is compared against ``try_0/metadata.yml``; ``force=True``
+        bypasses the check for cross-host retries.
+
+        The sibling ``result_dir/test.yml`` is the source of truth for the
+        test definition — fixes to ``scripts/<name>`` ARE picked up since
+        the script is invoked by path each time.
         """
-        original_run_dir = original_run_dir.resolve()
-        if not original_run_dir.is_dir():
+        result_dir = result_dir.resolve()
+        if not result_dir.is_dir():
             raise FileNotFoundError(
-                f"Original run dir not found: {original_run_dir}"
+                f"Result dir not found: {result_dir}"
             )
 
-        orig_csv_path = original_run_dir / "results.csv"
-        orig_test_yml = original_run_dir / "test.yml"
-        if not orig_csv_path.exists():
+        top_test_yml = result_dir / "test.yml"
+        if not top_test_yml.exists():
             raise FileNotFoundError(
-                f"results.csv missing in {original_run_dir} — nothing to "
+                f"test.yml missing in {result_dir} — cannot rebuild the "
+                "test definition to retry against."
+            )
+
+        latest_try_n = self._find_latest_try_n(result_dir)
+        if latest_try_n < 0:
+            raise FileNotFoundError(
+                f"No try_*/ directories found in {result_dir} — nothing to "
                 "retry from."
             )
-        if not orig_test_yml.exists():
-            raise FileNotFoundError(
-                f"test.yml missing in {original_run_dir} — cannot rebuild "
-                "the test definition to retry against. (Runs from before "
-                "the sibling test.yml landed cannot be retried.)"
-            )
-
-        # Use ``load_test`` so the source path is recorded in error
-        # messages — the retry's TestDefinition is built from this exact
-        # file, not from any embedded metadata, so per-machine tweaks
-        # made in the original run carry through.
-        test = self.load_test(orig_test_yml)
-
-        failed_rows = self._read_failed_rows(orig_csv_path, test)
-        if not failed_rows:
+        prev_try_rel = f"try_{latest_try_n}"
+        prev_failed_yml = result_dir / prev_try_rel / "failed.yml"
+        if not prev_failed_yml.exists():
             print(
-                f"[madbench] No failed runs in {orig_csv_path}. "
+                f"[madbench] No failures recorded in {prev_failed_yml}. "
+                "Nothing to retry."
+            )
+            return
+
+        test = self.load_test(top_test_yml)
+
+        failures = self._read_failed_yml(prev_failed_yml, test)
+        if not failures:
+            print(
+                f"[madbench] {prev_failed_yml} has no entries. "
                 "Nothing to retry."
             )
             return
 
         script_path = resolve_script(self.workspace, test.script)
         units: list[_ExecUnit] = []
-        for row in failed_rows:
-            combo = {k: row[k] for k in test.args}
+        for f in failures:
+            combo = {k: f["args"][k] for k in test.args}
             cmd = [str(script_path)] + [str(combo[k]) for k in test.args]
             units.append(_ExecUnit(
-                invocation_id=row["invocation_id"],
-                rep_id=row["repetition"],
-                mg_version=row["mg_version"],
+                invocation_id=f["invocation_id"],
+                rep_id=f["repetition"],
+                mg_version=f["mg_version"],
                 combo=combo,
                 cmd=cmd,
             ))
 
         # Filter run_dirs to mg_versions actually present in the retry
         # so we don't spin up scratch dirs / proc_gen for versions whose
-        # original runs all passed.
+        # earlier-try runs all passed.
         retry_mg_versions = list(dict.fromkeys(u.mg_version for u in units))
 
-        workdir_base = self._resolve_workdir(test)
-        git_sha = get_git_sha(self.workspace.root)
         hardware = detect_hardware()
+        if not force:
+            self._check_hardware_compatible(result_dir, hardware)
+
+        git_sha = get_git_sha(self.workspace.root)
         hostname = hardware["hostname"]
 
-        # ``<ts>_retry`` (with a numeric counter on collision) keeps the
-        # retry's result/log/scratch dirs textually distinct from the
-        # source run and prevents ``results.csv`` corruption when the
-        # original and retry land in the same wall-clock second.
-        timestamp = self._unique_retry_timestamp(
-            test.name, hostname, retry_mg_versions, workdir_base,
-        )
+        # The scratch dir is keyed off the *original* host/ts (from the
+        # result dir name) so reps land back at the same workdir as the
+        # original — even if the scratch tree was wiped, it gets rebuilt
+        # under the same path so artifacts/inputs/processes are
+        # self-contained.
+        _, scratch_ts = self._parse_host_ts(result_dir)
+        workdir_base = self._resolve_workdir(test)
         run_dirs = {
-            mgv: self._version_run_dir(workdir_base, test.name, timestamp, mgv)
+            mgv: self._version_run_dir(workdir_base, test.name, scratch_ts, mgv)
             for mgv in retry_mg_versions
         }
 
-        result_dir = (
-            self.workspace.results_dir / test.name / f"{hostname}_{timestamp}"
-        )
-        run_log_dir = (
-            self.workspace.logs_dir / test.name / f"{hostname}_{timestamp}"
-        )
+        timestamp = get_timestamp()
+        run_log_dir = self.workspace.logs_dir / test.name / result_dir.name
+        new_try_n = latest_try_n + 1
+        retry_of_rel = f"{prev_try_rel}/failed.yml"
+
+        prev_csv_rows: list[dict[str, Any]] = []
+        for n in range(new_try_n):
+            prev_csv_rows.extend(
+                self._load_csv_rows(result_dir / f"try_{n}" / "results.csv")
+            )
 
         metadata: dict[str, Any] = {
             "test_name": test.name,
@@ -470,21 +483,21 @@ class MadBench:
             "run_dirs": {mgv: str(p) for mgv, p in run_dirs.items()},
             "result_dir": str(result_dir),
             "dry_run": False,
-            "retry_of": str(original_run_dir),
+            "retry_of": retry_of_rel,
             "retry_n_units": len(units),
         }
-        # Carry forward the original run's note so a retry's metadata.yml
-        # is self-describing without having to chase ``retry_of`` back to
-        # the source. ``retry`` does not expose its own --note: the retried
-        # jobs are the same jobs, so a fresh note would not mean anything
-        # new.
-        inherited_note = self._read_original_note(original_run_dir)
+        # Carry forward try_0's note so a retry's metadata is
+        # self-describing without having to chase the chain back. ``retry``
+        # does not expose its own --note: the retried jobs are the same
+        # jobs, so a fresh note would not mean anything new.
+        inherited_note = self._read_original_note(result_dir)
         if inherited_note is not None:
             metadata["note"] = inherited_note
 
         self._execute_units(
             test=test,
             units=units,
+            try_n=new_try_n,
             timestamp=timestamp,
             hostname=hostname,
             git_sha=git_sha,
@@ -492,9 +505,10 @@ class MadBench:
             run_dirs=run_dirs,
             result_dir=result_dir,
             run_log_dir=run_log_dir,
-            test_yml_source=orig_test_yml,
+            test_yml_source=top_test_yml,
             metadata=metadata,
-            retry_of=original_run_dir,
+            retry_of=retry_of_rel,
+            prev_csv_rows=prev_csv_rows,
         )
 
     def plot(self, test_path: Path) -> None:
@@ -734,45 +748,6 @@ class MadBench:
             return result_dir
         return result_dir / mg_version
 
-    def _unique_retry_timestamp(
-        self,
-        test_name: str,
-        hostname: str,
-        mg_versions: list[str],
-        workdir_base: Path,
-    ) -> str:
-        """Pick a ``<wall_ts>_retry[N]`` timestamp that doesn't collide on
-        disk anywhere a normal run would write — result dir, log dir, and
-        every per-mg_version scratch dir. The ``_retry`` infix doubles as
-        a textual marker so retries stand out in directory listings.
-        """
-        base_ts = get_timestamp()
-        result_test_dir = self.workspace.results_dir / test_name
-        log_test_dir = self.workspace.logs_dir / test_name
-
-        def _candidate(suffix: str) -> tuple[str, list[Path]]:
-            ts = f"{base_ts}_retry{suffix}"
-            run_basename = f"{hostname}_{ts}"
-            paths: list[Path] = [
-                log_test_dir / run_basename,
-                result_test_dir / run_basename,
-            ]
-            for mgv in mg_versions:
-                paths.append(
-                    self._version_run_dir(workdir_base, test_name, ts, mgv),
-                )
-            return ts, paths
-
-        ts, paths = _candidate("")
-        if not any(p.exists() for p in paths):
-            return ts
-        n = 2
-        while True:
-            ts, paths = _candidate(str(n))
-            if not any(p.exists() for p in paths):
-                return ts
-            n += 1
-
     def _version_log_dir(self, run_log_dir: Path, mg_version: str) -> Path:
         """Per-mg_version slice of the run log dir, paralleling the result
         dir layout — per-rep ``stdout.log``/``stderr.log`` live under
@@ -880,13 +855,15 @@ class MadBench:
         return row
 
     @staticmethod
-    def _read_original_note(original_run_dir: Path) -> Optional[str]:
-        """Return the ``note`` field from a previous run's ``metadata.yml``,
-        or ``None`` if absent / unreadable. Used by ``retry`` so the carried
-        note never blocks a retry when the original predates this field."""
+    def _read_original_note(result_dir: Path) -> Optional[str]:
+        """Return the ``note`` field from ``try_0/metadata.yml`` if any.
+
+        Used by ``retry`` so the carried note never blocks a retry when the
+        original predates this field.
+        """
         import yaml as _yaml
 
-        meta_path = original_run_dir / "metadata.yml"
+        meta_path = result_dir / "try_0" / "metadata.yml"
         if not meta_path.exists():
             return None
         try:
@@ -896,107 +873,216 @@ class MadBench:
         note = data.get("note") if isinstance(data, dict) else None
         return note if isinstance(note, str) else None
 
+    @staticmethod
+    def _find_latest_try_n(result_dir: Path) -> int:
+        """Return the highest N such that ``result_dir/try_N`` exists.
+
+        Returns -1 when no ``try_*`` directory exists yet (e.g. a result dir
+        from before the try_N/ layout). Callers can rely on
+        ``_find_latest_try_n + 1`` to pick the next try slot.
+        """
+        latest = -1
+        if not result_dir.is_dir():
+            return latest
+        for child in result_dir.iterdir():
+            if not child.is_dir() or not child.name.startswith("try_"):
+                continue
+            try:
+                n = int(child.name[len("try_"):])
+            except ValueError:
+                continue
+            if n > latest:
+                latest = n
+        return latest
+
+    @staticmethod
+    def _parse_host_ts(result_dir: Path) -> tuple[str, str]:
+        """Split ``result_dir.name`` (``<host>_<ts>``) into ``(host, ts)``.
+
+        The timestamp segment is the trailing ``YYYYMMDDTHHMMSS`` block;
+        anything before the matching underscore is taken as the hostname
+        (which itself may contain underscores).
+        """
+        import re
+
+        m = re.search(r"_(\d{8}T\d{6})$", result_dir.name)
+        if m is None:
+            raise ValueError(
+                f"Result dir name {result_dir.name!r} does not match the "
+                "expected <hostname>_<YYYYMMDDTHHMMSS> layout."
+            )
+        return result_dir.name[: m.start()], m.group(1)
+
+    @staticmethod
+    def _hardware_fingerprint(hw: dict) -> tuple:
+        """Compact identity tuple used to detect cross-host retries.
+
+        Compares the fields that meaningfully change with the machine —
+        host/cpu identity, core count, GPU set — and ignores transient
+        ones like ``cuda_visible_devices`` that can change between
+        invocations on the same host.
+        """
+        gpus = tuple(
+            (g.get("vendor"), g.get("name"), g.get("memory_mb"))
+            for g in (hw.get("gpus") or [])
+        )
+        return (
+            hw.get("hostname"),
+            hw.get("fqdn"),
+            hw.get("cpu_model"),
+            hw.get("cpu_arch"),
+            hw.get("cpu_count_physical") or hw.get("cpu_count_logical"),
+            gpus,
+        )
+
+    def _check_hardware_compatible(
+        self,
+        result_dir: Path,
+        current_hw: dict,
+    ) -> None:
+        """Raise if the current host doesn't match ``try_0``'s hardware.
+
+        ``try_0`` is the run that established this result dir's identity;
+        all retries are expected to land on the same machine. The caller
+        bypasses this check with ``--force``.
+        """
+        import yaml as _yaml
+
+        try_0_meta = result_dir / "try_0" / "metadata.yml"
+        if not try_0_meta.exists():
+            return  # no try_0 to compare against — let the caller proceed
+        try:
+            data = _yaml.safe_load(try_0_meta.read_text()) or {}
+        except _yaml.YAMLError:
+            return
+        orig_hw = data.get("hardware") if isinstance(data, dict) else None
+        if not isinstance(orig_hw, dict):
+            return
+        if self._hardware_fingerprint(orig_hw) == self._hardware_fingerprint(current_hw):
+            return
+        raise ValueError(
+            "Hardware mismatch: this host's hardware does not match "
+            f"try_0/metadata.yml in {result_dir}.\n"
+            f"  try_0 hostname: {orig_hw.get('hostname')!r}, "
+            f"cpu_model: {orig_hw.get('cpu_model')!r}\n"
+            f"  current hostname: {current_hw.get('hostname')!r}, "
+            f"cpu_model: {current_hw.get('cpu_model')!r}\n"
+            "Pass --force to override (cross-host retry)."
+        )
+
+    @staticmethod
+    def _load_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
+        """Load a previous try's ``results.csv`` as in-memory row dicts.
+
+        Coerces ``exit_code`` to ``int`` so downstream ``successful`` checks
+        keyed on ``== 0`` work uniformly across rows from disk and rows
+        produced in-memory by the current run.
+        """
+        import csv as _csv
+
+        if not csv_path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    row["exit_code"] = int(row.get("exit_code", "0"))
+                except (TypeError, ValueError):
+                    row["exit_code"] = 0
+                rows.append(row)
+        return rows
+
+    @staticmethod
+    def _merge_rows(prev: list[dict[str, Any]], current: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge per-(invocation, rep, mg_version) so the latest row wins.
+
+        Preserves prev-only rows (successful reps from earlier tries that
+        the current retry didn't touch) and overrides matching keys with
+        the current try's row (the retried reps).
+        """
+        by_key: dict[tuple, dict[str, Any]] = {}
+        for r in prev:
+            by_key[(r["invocation_id"], r["repetition"], r["mg_version"])] = r
+        for r in current:
+            by_key[(r["invocation_id"], r["repetition"], r["mg_version"])] = r
+        return list(by_key.values())
+
     def _write_run_metadata(
         self,
         test: TestDefinition,
         timestamp: str,
-        hostname: str,
         git_sha: Optional[str],
         hardware: dict,
         run_dirs: dict[str, Path],
-        result_dir: Path,
-        retry_of: Optional[Path] = None,
+        try_dir: Path,
+        retry_of: Optional[str] = None,
         note: Optional[str] = None,
     ) -> Path:
-        """Write ``metadata.yml`` inside the per-run result dir.
+        """Write ``metadata.yml`` into ``try_dir`` (``result_dir/try_N/``).
 
-        One file per ``madbench run`` invocation, sibling of the run's own
-        ``results.csv`` and ``summary.csv``. The per-run dir name encodes
-        ``<test>/<hostname>_<timestamp>``, so the file is path-independent —
-        no other run writes here, no merging needed. Cross-run aggregation
-        is a post-processing concern (walk ``results/<test>/*/metadata.yml``).
+        Each ``try_N/`` snapshot records the environment that produced
+        *that try's* CSV. The hostname lives once inside ``hardware`` (we
+        don't duplicate it at the top), and ``repeat`` lives inside the
+        verbatim ``test.yml`` at ``result_dir/test.yml`` so we don't
+        duplicate it here either.
 
-        ``retry_of`` (when set) records the original run dir this is a
-        retry of, so aggregators can follow the chain back."""
+        ``retry_of`` (when set) records the *relative* path of the
+        previous try's ``failed.yml`` this retry was replaying — e.g.
+        ``"try_0/failed.yml"``. Aggregators can follow the chain back
+        through the local result dir without resolving absolute paths.
+        """
         import yaml as _yaml
 
         run_meta: dict[str, Any] = {
             "test_name": test.name,
             "timestamp": timestamp,
-            "hostname": hostname,
             "git_sha": git_sha,
             "mg_versions": list(run_dirs.keys()),
-            "repeat": test.repeat,
             "hardware": hardware,
             "run_dirs": {mgv: str(p) for mgv, p in run_dirs.items()},
-            # The executed test definition is the sibling ``test.yml`` —
-            # see ``_execute_units`` for the copy. Kept out of this file
-            # to keep ``metadata.yml`` focused on the environment + run
-            # bookkeeping, separate from "what was run".
-            "test_yml": "test.yml",
+            # ``test.yml`` lives at the top of the result dir (one copy
+            # shared across all tries — the test definition is the same
+            # for every retry of the same run). This pointer is relative
+            # to this metadata file's own location.
+            "test_yml": "../test.yml",
         }
         if retry_of is not None:
-            run_meta["retry_of"] = str(retry_of)
+            run_meta["retry_of"] = retry_of
         if note is not None:
             run_meta["note"] = note
-        result_dir.mkdir(parents=True, exist_ok=True)
-        path = result_dir / "metadata.yml"
+        try_dir.mkdir(parents=True, exist_ok=True)
+        path = try_dir / "metadata.yml"
         path.write_text(
             _yaml.safe_dump(run_meta, sort_keys=False, allow_unicode=True),
         )
         return path
 
-    def _read_failed_rows(
-        self, csv_path: Path, test: TestDefinition,
-    ) -> list[dict[str, str]]:
-        """Read rows with ``exit_code != 0`` from a previous run's CSV.
-
-        Validates that every column in ``test.args`` is present so a schema
-        drift between the failing run and the current test YAML surfaces
-        immediately rather than producing garbled retries.
-        """
-        import csv as _csv
-
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
-            header = reader.fieldnames or []
-            missing = [k for k in test.args if k not in header]
-            if missing:
-                raise ValueError(
-                    f"Cannot retry from {csv_path}: arg columns missing "
-                    f"from CSV header: {missing}. The test YAML's args "
-                    "must match the args of the original run."
-                )
-            failed: list[dict[str, str]] = []
-            for row in reader:
-                try:
-                    code = int(row.get("exit_code", "0"))
-                except ValueError:
-                    code = 0
-                if code != 0:
-                    failed.append(row)
-        return failed
-
     def _write_failed_summary(
         self,
         test: TestDefinition,
-        result_dir: Path,
+        try_dir: Path,
         results: list[dict[str, Any]],
         csv_rows: list[dict[str, Any]],
         timestamp: str,
         hostname: str,
+        retry_of: Optional[str] = None,
     ) -> Optional[Path]:
-        """Write ``failed.yml`` listing every non-zero-exit row.
+        """Write ``failed.yml`` listing every non-zero-exit row of this try.
 
-        Pure human convenience — the source of truth for ``madbench retry``
-        is still ``results.csv``. Returns the file path, or ``None`` when
-        every row succeeded (no file is written in that case).
+        Lives inside ``try_dir`` (``result_dir/try_N/``) and is the source
+        of truth for ``madbench retry`` — it picks the latest
+        ``try_N/failed.yml`` and replays each ``failures:`` entry. Returns
+        the file path, or ``None`` when every row in this try succeeded.
+
+        ``retry_of`` (when set) is the relative path of the *prior* try's
+        ``failed.yml`` that this try was replaying, so the chain of failed
+        files is self-describing.
         """
         import yaml as _yaml
 
         # Pair results (which carry exit_code + command) with the CSV rows
         # (which carry the per-arg values), keyed by (invocation_id, rep_id,
-        # mg_version) — unique within a run.
+        # mg_version) — unique within a try.
         row_index = {
             (r["invocation_id"], r["repetition"], r["mg_version"]): r
             for r in csv_rows
@@ -1017,26 +1103,69 @@ class MadBench:
         if not failures:
             return None
 
-        payload = {
+        payload: dict[str, Any] = {
             "test_name": test.name,
             "timestamp": timestamp,
             "hostname": hostname,
             "n_total": len(results),
             "n_failed": len(failures),
-            "failures": failures,
         }
-        result_dir.mkdir(parents=True, exist_ok=True)
-        path = result_dir / "failed.yml"
+        if retry_of is not None:
+            payload["retry_of"] = retry_of
+        payload["failures"] = failures
+        try_dir.mkdir(parents=True, exist_ok=True)
+        path = try_dir / "failed.yml"
         path.write_text(
             _yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
         )
         return path
+
+    def _read_failed_yml(
+        self, failed_yml_path: Path, test: TestDefinition,
+    ) -> list[dict[str, Any]]:
+        """Parse a ``failed.yml`` into a list of failure dicts.
+
+        Returns the ``failures:`` list verbatim (each entry has
+        ``invocation_id``, ``repetition``, ``mg_version``, ``exit_code``,
+        ``args``). Validates that every entry's args cover the current
+        test's declared args so a schema drift between the failing run and
+        the current test YAML surfaces immediately.
+        """
+        import yaml as _yaml
+
+        if not failed_yml_path.exists():
+            return []
+        try:
+            data = _yaml.safe_load(failed_yml_path.read_text()) or {}
+        except _yaml.YAMLError as e:
+            raise ValueError(
+                f"Could not parse {failed_yml_path}: {e}"
+            ) from e
+        failures = data.get("failures") if isinstance(data, dict) else None
+        if not isinstance(failures, list):
+            return []
+        expected = set(test.args)
+        for f in failures:
+            args = f.get("args") if isinstance(f, dict) else None
+            if not isinstance(args, dict):
+                raise ValueError(
+                    f"Failure entry in {failed_yml_path} missing 'args' dict: {f!r}"
+                )
+            missing = expected - set(args.keys())
+            if missing:
+                raise ValueError(
+                    f"Failure entry in {failed_yml_path} missing args "
+                    f"{sorted(missing)}; the test YAML's args must match the "
+                    "args of the original run."
+                )
+        return failures
 
     def _execute_units(
         self,
         *,
         test: TestDefinition,
         units: list[_ExecUnit],
+        try_n: int,
         timestamp: str,
         hostname: str,
         git_sha: Optional[str],
@@ -1046,26 +1175,40 @@ class MadBench:
         run_log_dir: Path,
         test_yml_source: Path,
         metadata: dict[str, Any],
-        retry_of: Optional[Path],
+        retry_of: Optional[str],
+        prev_csv_rows: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         """Shared executor for ``run()`` and ``retry()``.
 
         Drives a list of ``_ExecUnit``s through the same per-rep machinery
         (proc_gen per mg_version, subprocess into per-rep ``stdout.log`` /
-        ``stderr.log``, CSV append, artifacts copy), then writes
-        ``summary.csv`` / ``failed.yml`` / ``metadata.yml`` and bundles
-        ``main.log`` + the whole log tree into a tar.gz.
+        ``stderr.log``, CSV append, artifacts copy), then writes the
+        try-scoped ``results.csv`` / ``failed.yml`` / ``metadata.yml``
+        inside ``result_dir/try_{try_n}/``, refreshes the top-level
+        ``summary.csv`` so it reflects every try, and tars the try's log
+        tree into ``logs/<test>/<host>_<ts>_try{N}.tar.gz``.
+
+        ``prev_csv_rows`` are rows loaded from earlier tries; together
+        with the current try's rows they form the input to ``summary.csv``
+        (latest row per (invocation, rep, mg_version) wins).
         """
+        prev_csv_rows = prev_csv_rows or []
+        try_dir = result_dir / f"try_{try_n}"
+        try_log_dir = run_log_dir / f"try_{try_n}"
+
         # Prepare per-version run dirs + inputs + processes (once per
         # version actually exercised by this set of units).
         result_dir.mkdir(parents=True, exist_ok=True)
+        try_dir.mkdir(parents=True, exist_ok=True)
         run_log_dir.mkdir(parents=True, exist_ok=True)
-        # Drop a verbatim copy of the test YAML into the result dir so
-        # the committed artifacts make it obvious what was actually run
-        # (incl. any per-machine tweaks the user made before this run) —
-        # diff against the canonical tests/<name>.yml to see the delta.
-        # It is also what ``retry()`` reads to rebuild the TestDefinition.
-        shutil.copyfile(test_yml_source, result_dir / "test.yml")
+        try_log_dir.mkdir(parents=True, exist_ok=True)
+        # Drop a verbatim copy of the test YAML at the *top* of the result
+        # dir so all tries share one canonical reference. ``retry()`` reads
+        # it back to rebuild the TestDefinition. Only copy on the first try
+        # — subsequent retries inherit the original snapshot.
+        top_test_yml = result_dir / "test.yml"
+        if not top_test_yml.exists():
+            shutil.copyfile(test_yml_source, top_test_yml)
         for mgv, rd in run_dirs.items():
             rd.mkdir(parents=True, exist_ok=True)
             inputs_dir = rd / STAGED_DIR_NAME
@@ -1076,12 +1219,12 @@ class MadBench:
             (rd / "processes").mkdir(parents=True, exist_ok=True)
 
         csv_header = self._csv_header(test)
-        csv_path, write_header = select_results_csv(result_dir, csv_header)
+        csv_path, write_header = select_results_csv(try_dir, csv_header)
 
-        main_log = run_log_dir / "main.log"
+        main_log = try_log_dir / "main.log"
         archive_path = (
             self.workspace.logs_dir / test.name
-            / f"{hostname}_{timestamp}.tar.gz"
+            / f"{result_dir.name}_try{try_n}.tar.gz"
         )
 
         # mg_version groupings as they appear in units (preserves order).
@@ -1121,7 +1264,7 @@ class MadBench:
                 proc_gen_status: dict[str, bool] = {}
                 for mgv in mg_versions_in_units:
                     if test.proc_cards:
-                        log_version_dir = self._version_log_dir(run_log_dir, mgv)
+                        log_version_dir = self._version_log_dir(try_log_dir, mgv)
                         proc_gen_status[mgv] = self._generate_processes(
                             test, mgv, run_dirs[mgv], tee,
                             log_version_dir / "proc_gen",
@@ -1141,7 +1284,7 @@ class MadBench:
                     inputs_dir = run_dir / STAGED_DIR_NAME
                     processes_dir = run_dir / "processes"
                     result_version_dir = self._version_result_dir(result_dir, mgv)
-                    log_version_dir = self._version_log_dir(run_log_dir, mgv)
+                    log_version_dir = self._version_log_dir(try_log_dir, mgv)
 
                     rep_dir = run_dir / invocation_id / rep_id
                     rep_dir.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1313,8 @@ class MadBench:
                             "proc_card generation failed for this version"
                         )
                         summary_csv_path = self._write_summary(
-                            test, result_dir, csv_rows,
+                            test, result_dir,
+                            self._merge_rows(prev_csv_rows, csv_rows),
                         )
                         continue
 
@@ -1232,7 +1376,8 @@ class MadBench:
                         })
                         write_header = False
                         summary_csv_path = self._write_summary(
-                            test, result_dir, csv_rows,
+                            test, result_dir,
+                            self._merge_rows(prev_csv_rows, csv_rows),
                         )
                         tee.log("\n[madbench] Interrupted by user.")
                         raise
@@ -1258,7 +1403,8 @@ class MadBench:
                     # results are plottable mid-run. Cheap — summary is
                     # one row per (mg_version, arg-combo).
                     summary_csv_path = self._write_summary(
-                        test, result_dir, csv_rows,
+                        test, result_dir,
+                        self._merge_rows(prev_csv_rows, csv_rows),
                     )
 
                 # ``summary.csv`` is already up-to-date from the live
@@ -1266,7 +1412,8 @@ class MadBench:
                 # here so its path lands in main.log alongside the
                 # OK/FAILED roll-up.
                 failed_yml_path = self._write_failed_summary(
-                    test, result_dir, results, csv_rows, timestamp, hostname,
+                    test, try_dir, results, csv_rows, timestamp, hostname,
+                    retry_of=retry_of,
                 )
 
                 total_time = time.monotonic() - wall_start
@@ -1297,11 +1444,13 @@ class MadBench:
             # disk for whatever reps completed before the interrupt.
             if csv_rows and summary_csv_path is None:
                 summary_csv_path = self._write_summary(
-                    test, result_dir, csv_rows,
+                    test, result_dir,
+                    self._merge_rows(prev_csv_rows, csv_rows),
                 )
             if failed_yml_path is None:
                 failed_yml_path = self._write_failed_summary(
-                    test, result_dir, results, csv_rows, timestamp, hostname,
+                    test, try_dir, results, csv_rows, timestamp, hostname,
+                    retry_of=retry_of,
                 )
             metadata["results"] = results
             metadata["total_wall_time"] = round(time.monotonic() - wall_start, 2)
@@ -1311,12 +1460,15 @@ class MadBench:
             if failed_yml_path is not None:
                 metadata["failed_yml_path"] = str(failed_yml_path)
             metadata_yml_path = self._write_run_metadata(
-                test, timestamp, hostname, git_sha, hardware,
-                run_dirs, result_dir, retry_of=retry_of,
+                test, timestamp, git_sha, hardware,
+                run_dirs, try_dir, retry_of=retry_of,
                 note=metadata.get("note"),
             )
             metadata["metadata_yml_path"] = str(metadata_yml_path)
-            bundle_logs(run_log_dir, metadata, archive_path)
+            archive_basename = archive_path.name[: -len(".tar.gz")]
+            bundle_logs(
+                try_log_dir, metadata, archive_path, arcname=archive_basename,
+            )
 
     def _write_summary(
         self,
@@ -1341,9 +1493,14 @@ class MadBench:
         arg_keys = list(test.args.keys())
         stats_cols = test.resolved_stats()
 
+        # Coerce per-arg values to strings when keying so rows produced
+        # in-memory (typed values) group together with rows loaded from a
+        # previous try's results.csv (always strings).
         groups: "OrderedDict[tuple, list[dict[str, Any]]]" = OrderedDict()
         for row in csv_rows:
-            key = (row["mg_version"],) + tuple(row[k] for k in arg_keys)
+            key = (row["mg_version"],) + tuple(
+                str(row[k]) for k in arg_keys
+            )
             groups.setdefault(key, []).append(row)
 
         summary_path, _ = select_results_csv(

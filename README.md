@@ -181,24 +181,31 @@ scratch/my_test_20260515T140000/
 
 results/my_test/
     myLaptop_20260515T140000/            # one folder per madbench run
-        results.csv                       # this run only — one row per (invocation, rep)
-        summary.csv                       # this run only — one row per arg-combo
-        metadata.yml                      # this run's environment (host, hardware, git_sha, …)
+        test.yml                          # verbatim test definition (shared across tries)
+        summary.csv                       # aggregate across every try — latest row wins
         invocation_001/
             01/                           # artifacts for invocation_001, rep 01
-                timings.txt
+                timings.txt               # overwritten in place if a retry re-runs this rep
             02/
             03/
         invocation_002/
             01/ 02/ 03/
+        try_0/                            # the original `madbench run`
+            results.csv                   # one row per (invocation, rep) — this try only
+            failed.yml                    # the failures of this try (omitted if all passed)
+            metadata.yml                  # this try's environment (host, hardware, git_sha, …)
+        try_1/                            # only present after `madbench retry`
+            results.csv                   # rows for the reps this retry re-ran
+            failed.yml                    # what still failed; `retry_of: try_0/failed.yml`
+            metadata.yml                  # this retry's environment; `retry_of: try_0/failed.yml`
 ```
 
-Each `madbench run` writes only inside its own `<hostname>_<timestamp>/`
-subfolder under `results/<test_name>/` — never into anything shared. Two
+Each `madbench run` creates the result folder above with `try_0/` filled
+in; subsequent `madbench retry` invocations add `try_1/`, `try_2/`, … to
+the *same* folder, refresh the top-level `summary.csv`, and overwrite
+the affected reps' artifacts under `invocation_*/` in place. Two
 machines (or two consecutive runs on one machine) can push the same
-`results/` into a central git repo with zero conflicts, and re-running a
-test never overwrites a previous run's artifacts. Cross-run aggregation
-(merging CSVs across runs) is a post-processing concern.
+`results/` into a central git repo with zero conflicts.
 
 When `mg_version:` is set, an extra version segment is inserted under
 `scratch/` and inside the per-run results folder:
@@ -214,14 +221,17 @@ scratch/v3.5.5/my_test_20260515T140000/
 
 results/my_test/
     myLaptop_20260515T140000/
-        results.csv
+        test.yml
         summary.csv
-        metadata.yml
         v3.5.4/
             invocation_001/
                 01/ 02/ ...
         v3.5.5/
             ...
+        try_0/
+            results.csv
+            failed.yml
+            metadata.yml
 ```
 
 Invocation IDs **restart per version** — `invocation_002` under `v3.5.4`
@@ -231,10 +241,13 @@ place after the run (you manage cleanup); the per-run results folder
 holds the curated subset declared via `artifacts:` plus the CSVs and
 `metadata.yml`.
 
-## `results.csv` (per run)
+## `results.csv` (per try)
 
-Inside each `results/<test_name>/<hostname>_<timestamp>/` folder, one row per
-`(invocation, rep)`. Columns, in order:
+Inside each `results/<test_name>/<hostname>_<timestamp>/try_N/` folder,
+one row per `(invocation, rep)` that **this try** executed. The original
+run writes `try_0/results.csv`; each subsequent `madbench retry` writes
+its own `try_N/results.csv` covering only the reps it re-ran. Columns,
+in order:
 
 - `timestamp`
 - `mg_version` — `"none"` when unset
@@ -248,14 +261,17 @@ Inside each `results/<test_name>/<hostname>_<timestamp>/` folder, one row per
 - `repetition` — zero-padded (`"01"`, `"02"`, ...)
 
 `hostname` is **not** a column: every row in this file belongs to the
-same run, and the host is recorded once in the sibling `metadata.yml`
+same run, and the host is recorded once in the try's `metadata.yml`
 (and also encoded in the folder name).
 
 ## `summary.csv` (per run)
 
-Written automatically alongside `results.csv`. One row per
-`(mg_version, arg-combo)` for **this run**, aggregating across all reps
-of that combo. Columns:
+Written at the **top** of the result folder, refreshed after every try
+so it always reflects the latest state of every rep. One row per
+`(mg_version, arg-combo)`, aggregating across all reps of that combo.
+When a `madbench retry` re-runs a failing rep, the retry's row replaces
+the original rep's row in the aggregation (latest-wins by
+`(invocation_id, repetition, mg_version)`). Columns:
 
 - `timestamp`, `mg_version`, every `args:` key
 - For each label in `stats:` **and** `wall_time`: `<name>_mean` and `<name>_std`
@@ -293,20 +309,19 @@ likely bug — the run does **not** crash, but it warns loudly per
 (column, arg-combo) so you can chase it down. `wall_time` is always
 aggregated since MadBench measures it itself.
 
-## `metadata.yml` (per run)
+## `metadata.yml` (per try)
 
-Sibling of `results.csv` / `summary.csv`. Records the environment that
-produced this run's CSVs — host, hardware, git SHA, sweep parameters,
-scratch run dirs. Each `madbench run` writes exactly one of these into
-its own folder; no file is ever shared between runs.
+Sibling of `try_N/results.csv` / `try_N/failed.yml`. Records the
+environment that produced *this try's* CSV — host, hardware, git SHA,
+sweep parameters, scratch run dirs. Each `madbench run` writes
+`try_0/metadata.yml`; each `madbench retry` writes
+`try_{N+1}/metadata.yml` with a `retry_of:` pointer.
 
 ```yaml
 test_name: my_test
 timestamp: 20260515T140000
-hostname: myLaptop
 git_sha: fc041ae
 mg_versions: [v3.5.4]
-repeat: 5
 hardware:
   hostname: myLaptop
   fqdn: user.work
@@ -325,24 +340,27 @@ hardware:
   cuda_visible_devices: "0"          # only when set
 run_dirs:
   v3.5.4: scratch/v3.5.4/my_test_20260515T140000
-test_yml: test.yml                  # the executed test definition is the
-                                    # sibling file in this dir — see below.
-retry_of: /abs/path/to/original_run_dir/   # only on retry runs
+test_yml: ../test.yml               # the executed test definition lives
+                                    # one level up — shared across tries.
+retry_of: try_0/failed.yml          # only on retry runs (try_N>0); relative
+                                    # to the result_dir root.
 ```
 
-When aggregating across runs into a database, the per-run subfolder is
-the unit: walk `results/<test_name>/*/metadata.yml` to enumerate runs, and
-the `(hostname, timestamp)` pair (encoded in the folder name as
-`<hostname>_<timestamp>`) is the stable key linking a row in
-`results.csv` to the hardware it came from. A `retry_of:` pointer (when
-present) threads a retry run back to the run it was patching up — see
-the "Retrying failed runs" section below.
+`hostname` is **not** a top-level key — it lives inside `hardware` so
+there's a single source of truth. `repeat` isn't here either; it's part
+of the verbatim `test.yml` one level up. Aggregating across runs is
+straightforward: walk `results/<test_name>/*/try_*/metadata.yml`, and
+the `(hostname, timestamp)` pair encoded in the result-folder name is
+the stable key linking back to the hardware that produced the rows.
+`retry_of:` (when present) threads a retry try back to the previous
+try's `failed.yml` — see the "Retrying failed runs" section.
 
 ## `test.yml` (per run)
 
 A verbatim, byte-for-byte copy of the test YAML used for this run,
-dropped alongside `results.csv` / `metadata.yml`. It exists for two
-reasons:
+dropped at the *top* of the result folder. One shared copy across every
+try — the test definition is the same for every retry of the same run.
+It exists for two reasons:
 
 - **Auditability.** When the same test is run on multiple machines and
   some args are tweaked per machine (e.g. fewer `ncores` values on a
@@ -437,45 +455,61 @@ mean.
 Some runs fail (script crashed, env was off, MadGraph hiccup). Rather
 than re-running the whole sweep — which would re-do every successful
 combo too and waste time — `madbench retry` replays only the failed
-rows of a prior run:
+rows of the latest try:
 
 ```bash
 madbench retry results/my_test/myLaptop_20260516T120000/
+madbench retry results/my_test/myLaptop_20260516T120000/ --force  # cross-host
 ```
 
 What happens:
 
-- The original `results.csv` is read; every row with `exit_code != 0`
-  becomes a retry unit (proc-gen failures, `exit_code = -3`, are
-  included — they're eligible if you've fixed the MadGraph install
-  since).
-- The retry uses the **sibling `test.yml`** inside the original run's
-  result dir as the source of truth — you can delete or rename the
+- `retry` finds the highest existing `try_N/` inside the result dir,
+  reads its `failed.yml`, and replays each `failures:` entry as a
+  retry unit. Proc-gen failures (`exit_code = -3`) are eligible too —
+  retry them after fixing the MadGraph install.
+- The **top-level `test.yml`** inside the result dir is the source of
+  truth for the test definition — you can delete or rename the
   canonical `tests/<name>.yml` between the failing run and the retry
   and it still works. Fixes to the *script* (`scripts/<name>`) ARE
   picked up, since the script is invoked by path each time.
 - The retry preserves the original `invocation_id` / `repetition` /
-  `mg_version` of each replayed row, so a retried row lands at the same
-  on-disk position as the original (`invocation_002/01/`, etc.). Diffing
-  the retry's `stdout.log` against the original's is trivial.
-- mg_versions whose original runs all passed are skipped entirely — no
-  scratch dir, no proc-gen, no work.
-- The retry writes to a fresh sibling under
-  `results/<test_name>/<host>_<ts>_retry/` (or `_retry2`, ... if the
-  basename collides). The original run dir is never mutated, so the
-  failure record is preserved as evidence.
-- The retry's `metadata.yml` carries
-  `retry_of: /abs/path/to/original_run_dir/`, so cross-run aggregators
-  can follow the chain back to the source run.
+  `mg_version` of each replayed row, so a retried rep lands at the same
+  on-disk position as the original (`invocation_002/01/`, etc.) and
+  overwrites its artifacts in place under the result dir's top-level
+  invocation tree.
+- The new try is written into `try_{N+1}/` inside the same result dir
+  (no new sibling directory). The top-level `summary.csv` is
+  recomputed across **every** try, with the latest row per
+  `(invocation_id, repetition, mg_version)` winning, so a successful
+  retry promotes a failing combo to passing in the summary
+  automatically.
+- mg_versions whose earlier tries' reps all passed are skipped entirely
+  — no scratch dir, no proc-gen, no work.
+- `try_{N+1}/metadata.yml` and `try_{N+1}/failed.yml` both carry
+  `retry_of: try_N/failed.yml` (a path **relative** to the result_dir
+  root), so the chain of tries is self-describing inside the folder.
+- The scratch workdir is keyed off the **original** timestamp, so reps
+  re-execute in the same `scratch/<test>_<ts>/` tree as the first run
+  (recreating it if it was deleted).
 
-Each per-run dir gets a `failed.yml` whenever at least one row failed —
+**Hardware check.** Before running the retry, the current host's
+hardware is compared against `try_0/metadata.yml`'s `hardware` block.
+If it doesn't match (different hostname, CPU model, core count, or GPU
+set), the retry aborts with a clear error — performance tests aren't
+meaningful when re-run on a different machine. Pass `--force` to
+override (for the deliberate "I want to compare across machines" case);
+each try's `metadata.yml` still records its own hardware snapshot, so
+a forced cross-host retry is auditable.
+
+Each `try_N/` gets a `failed.yml` whenever at least one row failed —
 human-readable summary of which `(invocation_id, repetition,
-mg_version, args)` combos went wrong with what `exit_code`. It's a
-convenience for grepping; `madbench retry` itself reads `results.csv`,
-which is authoritative.
+mg_version, args)` combos went wrong with what `exit_code`. It's both
+the source of truth for `madbench retry` and a convenience for
+grepping.
 
 ```yaml
-# results/my_test/myLaptop_20260516T120000/failed.yml
+# results/my_test/myLaptop_20260516T120000/try_0/failed.yml
 test_name: my_test
 timestamp: 20260516T120000
 hostname: myLaptop
@@ -494,9 +528,9 @@ failures:
     args: {ncores: 16, nevents: 100000}
 ```
 
-Cross-host retry works the same way: kick off the retry on a different
-machine, the new dir naturally carries its own hostname, and the
-`retry_of:` pointer still threads back to the source.
+A `try_1/failed.yml` (and beyond) gets an additional `retry_of:
+try_0/failed.yml` header pointing back at the previous try's failures,
+so the chain is walkable from inside any try.
 
 ## Plotting (deprecated for now)
 
@@ -510,25 +544,32 @@ future release will reintroduce plotting once aggregation is settled.
 
 ## Log bundles
 
-Each run writes its logs into
-`logs/<test_name>/<hostname>_<timestamp>/` and bundles the whole
-directory into a sibling `<hostname>_<timestamp>.tar.gz`.
-The on-disk layout mirrors the per-rep nesting of the run dir so a row
-in `main.log` ("invocation_003 rep=02 mg_version=v3.5.4 FAILED") points
-directly at the file you need to open:
+Each try writes its logs into
+`logs/<test_name>/<hostname>_<timestamp>/try_N/` and bundles that try's
+subtree into a per-try archive `<hostname>_<timestamp>_try{N}.tar.gz`
+under `logs/<test_name>/`. The on-disk layout mirrors the result-dir's
+`try_N/` structure so a row in `main.log` ("invocation_003 rep=02
+mg_version=v3.5.4 FAILED") points directly at the file you need to
+open — and old failure logs are preserved naturally because each retry
+writes a fresh `try_{N+1}/` subtree instead of overwriting the
+previous one.
 
 ```
 logs/<test_name>/<hostname>_<timestamp>/
-├── main.log
-├── metadata.yml
-└── <mg_version>/              # omitted when mg_version is "none"
-    ├── proc_gen/              # only when proc_cards: is set
-    │   ├── <card>.stdout.log
-    │   └── <card>.stderr.log
-    └── invocation_NNN/
-        └── RR/
-            ├── stdout.log
-            └── stderr.log
+├── try_0/                     # the original `madbench run`
+│   ├── main.log
+│   ├── metadata.yml
+│   └── <mg_version>/          # omitted when mg_version is "none"
+│       ├── proc_gen/          # only when proc_cards: is set
+│       │   ├── <card>.stdout.log
+│       │   └── <card>.stderr.log
+│       └── invocation_NNN/
+│           └── RR/
+│               ├── stdout.log
+│               └── stderr.log
+└── try_1/                     # only present after `madbench retry`
+    ├── main.log
+    └── ...                    # logs for the reps this retry re-ran
 ```
 
 - `main.log` — only MadBench's own orchestration messages: host summary,
@@ -548,12 +589,12 @@ logs/<test_name>/<hostname>_<timestamp>/
   `cuda_visible_devices` / `hip_visible_devices` overrides),
   per-execution `{exit_code, wall_time, invocation_id, repetition,
   mg_version}`, `csv_path`, `summary_csv_path`, `metadata_yml_path`
-  (pointing at the per-run `metadata.yml` in
-  `results/<test_name>/<hostname>_<timestamp>/`), `mg_versions`, and
-  `run_dirs` (one entry per `mg_version`).
+  (pointing at the per-try `metadata.yml` in
+  `results/<test_name>/<hostname>_<timestamp>/try_N/`), `mg_versions`,
+  and `run_dirs` (one entry per `mg_version`).
 
 This `metadata.yml` inside the log tar is the run-time audit log; the
-per-run `metadata.yml` sibling of `results.csv` is the smaller,
+per-try `metadata.yml` sibling of `results.csv` is the smaller,
 analysis-friendly environment snapshot you'd join your CSV rows
 against.
 

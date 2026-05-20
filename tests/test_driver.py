@@ -58,6 +58,21 @@ def run_dir(ws_root: Path, test_name: str) -> Path:
     return matches[0]
 
 
+def try_dir(ws_root: Path, test_name: str, n: int = 0) -> Path:
+    """Return ``results/<test>/<host>_<ts>/try_N/`` for the single run."""
+    return run_dir(ws_root, test_name) / f"try_{n}"
+
+
+def latest_archive(ws_root: Path, test_name: str) -> Path:
+    """Return the most recent ``logs/<test>/<host>_<ts>_tryN.tar.gz``."""
+    archives = sorted(
+        (ws_root / "logs" / test_name).glob("*.tar.gz"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    assert archives, f"No log archives for {test_name!r}"
+    return archives[-1]
+
+
 # -----------------------------------------------------------------------
 # load_test
 # -----------------------------------------------------------------------
@@ -356,6 +371,8 @@ def test_run_end_to_end(tmp_path):
 
     archives = list((ws_root / "logs" / "e2e_test").glob("*.tar.gz"))
     assert len(archives) == 1
+    # Per-try archive naming: <host>_<ts>_try0.tar.gz
+    assert archives[0].name.endswith("_try0.tar.gz")
 
     with tarfile.open(archives[0]) as tar:
         names = tar.getnames()
@@ -384,8 +401,8 @@ def test_run_end_to_end(tmp_path):
         ).read().decode()
         assert "hello" in stdout_1
 
-    # CSV exists with both invocations, inside the per-run subdir.
-    csv_path = run_dir(ws_root, "e2e_test") / "results.csv"
+    # CSV exists with both invocations, inside try_0/.
+    csv_path = try_dir(ws_root, "e2e_test") / "results.csv"
     assert csv_path.exists()
     lines = csv_path.read_text().splitlines()
     assert len(lines) == 3  # header + 2 rows
@@ -473,7 +490,7 @@ def test_run_reads_outputs_json_and_writes_csv(tmp_path):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    csv_path = run_dir(ws_root, "without") / "results.csv"
+    csv_path = try_dir(ws_root, "without") / "results.csv"
     rows = csv_path.read_text().splitlines()
     header = rows[0].split(",")
     # arg `throughput` and output `throughput` collide on column name; this
@@ -501,7 +518,7 @@ def test_run_missing_outputs_json_writes_blanks(tmp_path, capsys):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    csv_path = run_dir(ws_root, "missing") / "results.csv"
+    csv_path = try_dir(ws_root, "missing") / "results.csv"
     rows = csv_path.read_text().splitlines()
     assert len(rows) == 2  # header + 1 row
     # 'throughput' column exists, value is empty
@@ -596,9 +613,9 @@ def test_run_sets_env_vars(tmp_path):
     test_file = make_test_yaml(ws_root, yaml_data)
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "envcheck").glob("*.tar.gz"))
-    with tarfile.open(archives[0]) as tar:
-        run_dir_name = archives[0].name[: -len(".tar.gz")]
+    archive = latest_archive(ws_root, "envcheck")
+    with tarfile.open(archive) as tar:
+        run_dir_name = archive.name[: -len(".tar.gz")]
         log = tar.extractfile(
             f"{run_dir_name}/invocation_001/01/stdout.log"
         ).read().decode()
@@ -651,8 +668,8 @@ def test_two_runs_produce_isolated_subdirs(tmp_path):
 
     subdirs = sorted((ws_root / "results" / "schema").iterdir())
     assert len(subdirs) == 2
-    h1 = (subdirs[0] / "results.csv").read_text().splitlines()[0]
-    h2 = (subdirs[1] / "results.csv").read_text().splitlines()[0]
+    h1 = (subdirs[0] / "try_0" / "results.csv").read_text().splitlines()[0]
+    h2 = (subdirs[1] / "try_0" / "results.csv").read_text().splitlines()[0]
     assert h1 != h2  # different schemas, in different subdirs
     # No per-test rollup CSV must exist — each subdir is self-contained.
     assert not (ws_root / "results" / "schema" / "results.csv").exists()
@@ -823,9 +840,9 @@ def test_run_exposes_mg_env_vars(tmp_path):
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "envmg").glob("*.tar.gz"))
-    with tarfile.open(archives[0]) as tar:
-        run_dir_name = archives[0].name[: -len(".tar.gz")]
+    archive = latest_archive(ws_root, "envmg")
+    with tarfile.open(archive) as tar:
+        run_dir_name = archive.name[: -len(".tar.gz")]
         log = tar.extractfile(
             f"{run_dir_name}/v3.5.4/invocation_001/01/stdout.log"
         ).read().decode()
@@ -851,9 +868,9 @@ def test_run_mg_bin_empty_when_version_is_none(tmp_path):
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "envnone").glob("*.tar.gz"))
-    with tarfile.open(archives[0]) as tar:
-        run_dir_name = archives[0].name[: -len(".tar.gz")]
+    archive = latest_archive(ws_root, "envnone")
+    with tarfile.open(archive) as tar:
+        run_dir_name = archive.name[: -len(".tar.gz")]
         log = tar.extractfile(
             f"{run_dir_name}/invocation_001/01/stdout.log"
         ).read().decode()
@@ -874,7 +891,7 @@ def test_run_csv_includes_mg_version_column(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "csvmg") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "csvmg") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "mg_version" in header
     mgv_idx = header.index("mg_version")
@@ -893,7 +910,7 @@ def test_run_csv_mg_version_column_when_unset(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "csvnone") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "csvnone") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "mg_version" in header
     mgv_idx = header.index("mg_version")
@@ -990,14 +1007,18 @@ def test_run_writes_metadata_yml(tmp_path):
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "runmeta")
-    meta = yaml.safe_load((rd / "metadata.yml").read_text())
+    meta = yaml.safe_load(
+        (try_dir(ws_root, "runmeta") / "metadata.yml").read_text()
+    )
     assert meta["test_name"] == "runmeta"
-    assert meta["hostname"] == socket.gethostname()
+    # hostname lives inside the `hardware` block now (single source of truth);
+    # `repeat` lives in the verbatim `test.yml` at the top of result_dir.
+    assert "hostname" not in meta
+    assert "repeat" not in meta
+    assert meta["hardware"]["hostname"] == socket.gethostname()
     assert "timestamp" in meta
-    assert "hardware" in meta and "gpus" in meta["hardware"]
+    assert "gpus" in meta["hardware"]
     assert isinstance(meta["mg_versions"], list)
-    assert meta["repeat"] == 1
 
 
 def test_two_runs_create_separate_subdirs(tmp_path):
@@ -1022,11 +1043,11 @@ def test_two_runs_create_separate_subdirs(tmp_path):
     subdirs = sorted((ws_root / "results" / "twice").iterdir())
     assert len(subdirs) == 2
     for sd in subdirs:
-        assert (sd / "results.csv").exists()
-        assert (sd / "metadata.yml").exists()
+        assert (sd / "try_0" / "results.csv").exists()
+        assert (sd / "try_0" / "metadata.yml").exists()
     # Timestamps must differ — proves runs are isolated, not overwriting.
-    m1 = yaml.safe_load((subdirs[0] / "metadata.yml").read_text())
-    m2 = yaml.safe_load((subdirs[1] / "metadata.yml").read_text())
+    m1 = yaml.safe_load((subdirs[0] / "try_0" / "metadata.yml").read_text())
+    m2 = yaml.safe_load((subdirs[1] / "try_0" / "metadata.yml").read_text())
     assert m1["timestamp"] != m2["timestamp"]
 
 
@@ -1174,7 +1195,7 @@ def test_run_proc_cards_requires_mg_version(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "needsmg") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "needsmg") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1200,7 +1221,7 @@ def test_run_proc_cards_missing_mg_binary(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "noghost") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "noghost") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1234,7 +1255,7 @@ def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
     mb.run(test_file)
 
     assert not marker.exists()  # script never ran
-    rows = (run_dir(ws_root, "mgfail") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "mgfail") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
@@ -1260,7 +1281,7 @@ def test_run_proc_cards_one_version_fails_others_continue(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "mixed") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "mixed") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     mgv_idx = header.index("mg_version")
@@ -1287,9 +1308,9 @@ def test_run_processes_env_var_set_even_without_proc_cards(tmp_path):
     )
     mb.run(test_file)
 
-    archives = list((ws_root / "logs" / "penv").glob("*.tar.gz"))
-    with tarfile.open(archives[0]) as tar:
-        run_dir_name = archives[0].name[: -len(".tar.gz")]
+    archive = latest_archive(ws_root, "penv")
+    with tarfile.open(archive) as tar:
+        run_dir_name = archive.name[: -len(".tar.gz")]
         log = tar.extractfile(
             f"{run_dir_name}/invocation_001/01/stdout.log"
         ).read().decode()
@@ -1393,7 +1414,7 @@ def test_run_csv_has_repetition_column_with_row_per_rep(tmp_path):
     )
     mb.run(test_file)
 
-    rows = (run_dir(ws_root, "csvr") / "results.csv").read_text().splitlines()
+    rows = (try_dir(ws_root, "csvr") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     assert "repetition" in header
     rep_idx = header.index("repetition")
@@ -1455,7 +1476,7 @@ def test_run_summary_csv_mean_std_n_successful(tmp_path):
     )
     mb.run(test_file)
 
-    summary = run_dir(ws_root, "sum") / "summary.csv"
+    summary = run_dir(ws_root, "sum") / "summary.csv"  # top-level (single across tries)
     assert summary.exists()
     rows = summary.read_text().splitlines()
     header = rows[0].split(",")
@@ -1850,11 +1871,12 @@ def test_run_metadata_yml_points_at_sibling_test_yml(tmp_path):
     mb.run(test_file)
 
     meta = yaml.safe_load(
-        (run_dir(ws_root, "metayml") / "metadata.yml").read_text()
+        (try_dir(ws_root, "metayml") / "metadata.yml").read_text()
     )
-    # test_definition is no longer in metadata.yml; the sibling test.yml is.
+    # test_definition is no longer in metadata.yml; the top-level test.yml is.
     assert "test_definition" not in meta
-    assert meta["test_yml"] == "test.yml"
+    # metadata.yml now lives inside try_N/; the verbatim test.yml is one level up.
+    assert meta["test_yml"] == "../test.yml"
 
 
 # -----------------------------------------------------------------------
@@ -1886,8 +1908,7 @@ def test_run_writes_failed_yml_when_some_runs_fail(tmp_path):
     )
     mb.run(test_file)
 
-    rd = run_dir(ws_root, "flaky")
-    failed_yml = rd / "failed.yml"
+    failed_yml = try_dir(ws_root, "flaky") / "failed.yml"
     assert failed_yml.exists()
     payload = yaml.safe_load(failed_yml.read_text())
     assert payload["test_name"] == "flaky"
@@ -1914,14 +1935,14 @@ def test_run_no_failed_yml_when_all_pass(tmp_path):
     mb.run(test_file)
 
     rd = run_dir(ws_root, "happy")
-    assert not (rd / "failed.yml").exists()
+    assert not (rd / "try_0" / "failed.yml").exists()
 
 
 def test_retry_reruns_only_failed_combos_with_preserved_ids(tmp_path):
-    """retry() picks rows with exit_code != 0 and replays them, preserving
-    invocation_id / repetition / mg_version. The script is now patched so
-    the same args succeed — the retry's results.csv should hold one row,
-    matching the originally-failing invocation."""
+    """retry() picks the latest try_N/failed.yml and replays each failure
+    preserving invocation_id / repetition / mg_version. The script is now
+    patched so the same args succeed — try_1/results.csv should hold one
+    row, matching the originally-failing invocation."""
     ws_root = make_workspace(tmp_path)
     _make_flaky_script(ws_root, fail_when="2")
     mb = MadBench(find_workspace(ws_root))
@@ -1932,17 +1953,15 @@ def test_retry_reruns_only_failed_combos_with_preserved_ids(tmp_path):
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "retried")
+    rd = run_dir(ws_root, "retried")
 
     # Patch the script so x=2 now succeeds, then retry.
     make_script(ws_root)  # back to always-succeeding body
-    mb.retry(original)
+    mb.retry(rd)
 
-    rd_dirs = sorted((ws_root / "results" / "retried").iterdir())
-    assert len(rd_dirs) == 2
-    retry_dir = [d for d in rd_dirs if d != original][0]
-
-    rows = (retry_dir / "results.csv").read_text().splitlines()
+    # Same result_dir, gained a try_1/ folder.
+    assert (rd / "try_0").is_dir() and (rd / "try_1").is_dir()
+    rows = (rd / "try_1" / "results.csv").read_text().splitlines()
     assert len(rows) == 2  # header + 1 retried row
     header = rows[0].split(",")
     cells = rows[1].split(",")
@@ -1967,16 +1986,21 @@ def test_retry_writes_retry_of_pointer_in_metadata(tmp_path):
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "retrymeta")
+    rd = run_dir(ws_root, "retrymeta")
 
-    mb.retry(original)
+    mb.retry(rd)
 
-    retry_dir = [
-        d for d in (ws_root / "results" / "retrymeta").iterdir()
-        if d != original
-    ][0]
-    meta = yaml.safe_load((retry_dir / "metadata.yml").read_text())
-    assert meta["retry_of"] == str(original)
+    meta = yaml.safe_load((rd / "try_1" / "metadata.yml").read_text())
+    # retry_of is a *relative* path pointing at the previous try's failed.yml.
+    assert meta["retry_of"] == "try_0/failed.yml"
+
+    # failed.yml in try_1 also carries the same retry_of marker, even if
+    # this retry is now passing — but if every retry passed, no failed.yml
+    # is written. Force a failure that persists to verify the chain marker.
+    failed = rd / "try_1" / "failed.yml"
+    if failed.exists():
+        payload = yaml.safe_load(failed.read_text())
+        assert payload["retry_of"] == "try_0/failed.yml"
 
 
 def test_retry_noop_when_no_failures(tmp_path, capsys):
@@ -1990,21 +2014,20 @@ def test_retry_noop_when_no_failures(tmp_path, capsys):
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "happy_retry")
+    rd = run_dir(ws_root, "happy_retry")
 
-    mb.retry(original)
+    mb.retry(rd)
 
     captured = capsys.readouterr()
     assert "Nothing to retry" in captured.out
-    # No second results dir was created.
-    assert len(list((ws_root / "results" / "happy_retry").iterdir())) == 1
+    # No try_1/ folder was created.
+    assert not (rd / "try_1").exists()
 
 
 def test_retry_works_without_original_workspace_test_yaml(tmp_path):
-    """retry() rebuilds the TestDefinition from the sibling ``test.yml``
-    that lives inside the per-run results dir, so deleting/renaming the
-    canonical ``tests/<name>.yml`` between the failing run and the retry
-    is fine."""
+    """retry() rebuilds the TestDefinition from ``result_dir/test.yml``,
+    so deleting/renaming the canonical ``tests/<name>.yml`` between the
+    failing run and the retry is fine."""
     ws_root = make_workspace(tmp_path)
     _make_flaky_script(ws_root, fail_when="2")
     mb = MadBench(find_workspace(ws_root))
@@ -2015,28 +2038,24 @@ def test_retry_works_without_original_workspace_test_yaml(tmp_path):
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "noyml")
+    rd = run_dir(ws_root, "noyml")
 
     # Delete the canonical YAML — retry should still work because the
-    # sibling test.yml inside the original run dir is authoritative.
+    # top-level test.yml inside the result dir is authoritative.
     test_file.unlink()
     make_script(ws_root)  # script now succeeds for x=2 too
-    mb.retry(original)
+    mb.retry(rd)
 
-    retry_dir = [
-        d for d in (ws_root / "results" / "noyml").iterdir()
-        if d != original
-    ][0]
-    rows = (retry_dir / "results.csv").read_text().splitlines()
+    rows = (rd / "try_1" / "results.csv").read_text().splitlines()
     assert len(rows) == 2  # header + 1 retried row
-    # And the retry run also dropped a copy of test.yml.
-    assert (retry_dir / "test.yml").exists()
+    # The top-level test.yml is still here (and remains the single shared
+    # copy across all tries).
+    assert (rd / "test.yml").exists()
 
 
-def test_retry_errors_when_sibling_test_yml_missing(tmp_path):
-    """If the per-run ``test.yml`` was manually deleted (or the run
-    pre-dates the sibling-test.yml feature), retry surfaces a clear
-    error rather than silently doing the wrong thing."""
+def test_retry_errors_when_top_test_yml_missing(tmp_path):
+    """If ``result_dir/test.yml`` was manually deleted, retry surfaces a
+    clear error rather than silently doing the wrong thing."""
     ws_root = make_workspace(tmp_path)
     _make_flaky_script(ws_root, fail_when="2")
     mb = MadBench(find_workspace(ws_root))
@@ -2047,18 +2066,18 @@ def test_retry_errors_when_sibling_test_yml_missing(tmp_path):
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "deletedyml")
+    rd = run_dir(ws_root, "deletedyml")
 
-    (original / "test.yml").unlink()
+    (rd / "test.yml").unlink()
 
     with pytest.raises(FileNotFoundError, match="test.yml missing"):
-        mb.retry(original)
+        mb.retry(rd)
 
 
 def test_retry_replays_per_mg_version_failures(tmp_path):
     """Sweep across two mg_versions where only v_bad's invocations fail.
     The retry should run only v_bad's failed combos — v_good never enters
-    the retry's mg_versions list, so no scratch dir for v_good is created.
+    the retry's mg_versions list, so no scratch dir for v_good is touched.
     """
     ws_root = make_workspace(tmp_path)
     make_script(
@@ -2078,25 +2097,182 @@ def test_retry_replays_per_mg_version_failures(tmp_path):
         },
     )
     mb.run(test_file)
-    original = run_dir(ws_root, "mgretry")
+    rd = run_dir(ws_root, "mgretry")
 
     # Flip the script: now v_bad succeeds. Retry should re-run only v_bad.
     make_script(ws_root)
-    mb.retry(original)
+    mb.retry(rd)
 
-    retry_dir = [
-        d for d in (ws_root / "results" / "mgretry").iterdir()
-        if d != original
-    ][0]
-    rows = (retry_dir / "results.csv").read_text().splitlines()
+    rows = (rd / "try_1" / "results.csv").read_text().splitlines()
     assert len(rows) == 3  # header + 2 retried rows (x=1 and x=2 under v_bad)
     header = rows[0].split(",")
     mgv_idx = header.index("mg_version")
     mg_versions = {row.split(",")[mgv_idx] for row in rows[1:]}
     assert mg_versions == {"v_bad"}
 
-    # No v_good scratch dir for the retry run.
-    retry_ts = retry_dir.name[len("mgretry_"):]
-    assert not list(
-        (ws_root / "scratch" / "v_good").glob(f"mgretry_{retry_ts.rsplit('_', 1)[0]}*")
+    # Only one mgretry_* dir per mg_version (the original one). retry reuses
+    # the same scratch dir keyed off the run's original timestamp; no fresh
+    # _retry-suffixed dir is spawned.
+    assert len(list((ws_root / "scratch" / "v_bad").glob("mgretry_*"))) == 1
+    assert len(list((ws_root / "scratch" / "v_good").glob("mgretry_*"))) == 1
+
+
+def test_retry_updates_top_summary_csv_with_merged_rows(tmp_path):
+    """summary.csv at the result_dir top level reflects the latest row
+    for each (invocation, rep, mg_version) across all tries — a successful
+    retry must turn a 0-of-N rep into N-of-N for that combo."""
+    ws_root = make_workspace(tmp_path)
+    # x=2 fails on the first run; will succeed after we swap the script.
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"2\" ]; then exit 1; fi\n"
+            "echo \"{\\\"v\\\": $1}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
     )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "smerge", "script": "hello.sh", "args": {"x": [1, 2]},
+            "outputs": ["v"],
+        },
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "smerge")
+
+    # Patch the script so x=2 now succeeds.
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "echo \"{\\\"v\\\": $1}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb.retry(rd)
+
+    rows = (rd / "summary.csv").read_text().splitlines()
+    header = rows[0].split(",")
+    by_x = {r.split(",")[header.index("x")]: dict(zip(header, r.split(",")))
+            for r in rows[1:]}
+    # x=1 always passed (n_successful=1). x=2 was 0 before the retry, 1
+    # after, because the retry's row replaces try_0's failed row.
+    assert by_x["1"]["n_successful"] == "1"
+    assert by_x["2"]["n_successful"] == "1"
+    assert float(by_x["2"]["v_mean"]) == 2.0
+
+
+def test_retry_blocks_on_hardware_mismatch(tmp_path, monkeypatch):
+    """A retry whose current hardware doesn't match try_0/metadata.yml
+    aborts unless --force is passed."""
+    from madbench import driver as _driver
+
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "hwcheck", "script": "hello.sh", "args": {"x": [1, 2]},
+        },
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "hwcheck")
+
+    # Simulate a different host by patching detect_hardware on the retry.
+    real_detect = _driver.detect_hardware
+
+    def _fake_detect():
+        hw = real_detect()
+        hw["hostname"] = "different-machine"
+        hw["cpu_model"] = "Pretend CPU"
+        return hw
+
+    monkeypatch.setattr(_driver, "detect_hardware", _fake_detect)
+    make_script(ws_root)
+
+    with pytest.raises(ValueError, match="Hardware mismatch"):
+        mb.retry(rd)
+    # No try_1 was created.
+    assert not (rd / "try_1").exists()
+
+    # --force bypasses the check and writes try_1.
+    mb.retry(rd, force=True)
+    assert (rd / "try_1" / "results.csv").exists()
+
+
+def test_retry_invocation_artifacts_overwritten_in_place(tmp_path):
+    """Artifacts of a retried rep replace the failed run's artifacts at the
+    same top-level invocation/<rep>/ path."""
+    ws_root = make_workspace(tmp_path)
+    # On first run x=2 fails (so no artifact for that rep). Second time x=2
+    # succeeds and emits "after".
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"2\" ]; then exit 1; fi\n"
+            "echo \"before $1\" > out.log\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "art", "script": "hello.sh", "args": {"x": [1, 2]},
+            "artifacts": ["out.log"],
+        },
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "art")
+
+    # Patched script — now x=2 succeeds with "after 2".
+    make_script(
+        ws_root,
+        body="#!/bin/bash\necho \"after $1\" > out.log\n",
+    )
+    mb.retry(rd)
+
+    # x=1 artifact (invocation_001) is unchanged.
+    assert (rd / "invocation_001" / "01" / "out.log").read_text().strip() == "before 1"
+    # x=2 artifact (invocation_002) now reflects the retry, at the SAME
+    # top-level path (no new sibling result dir).
+    assert (rd / "invocation_002" / "01" / "out.log").read_text().strip() == "after 2"
+
+
+def test_retry_chain_two_levels(tmp_path):
+    """try_N+1's failed.yml points at try_N/failed.yml. A second retry
+    creates try_2 with retry_of: try_1/failed.yml."""
+    ws_root = make_workspace(tmp_path)
+    # x=2 always fails so each retry still has something to do.
+    make_script(
+        ws_root,
+        body="#!/bin/bash\nif [ \"$1\" = \"2\" ]; then exit 1; fi\necho ok\n",
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "chain", "script": "hello.sh", "args": {"x": [1, 2]},
+        },
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "chain")
+
+    mb.retry(rd)
+    mb.retry(rd)
+
+    assert (rd / "try_0" / "failed.yml").exists()
+    assert (rd / "try_1" / "failed.yml").exists()
+    assert (rd / "try_2" / "failed.yml").exists()
+
+    m1 = yaml.safe_load((rd / "try_1" / "metadata.yml").read_text())
+    m2 = yaml.safe_load((rd / "try_2" / "metadata.yml").read_text())
+    assert m1["retry_of"] == "try_0/failed.yml"
+    assert m2["retry_of"] == "try_1/failed.yml"
+
+    f1 = yaml.safe_load((rd / "try_1" / "failed.yml").read_text())
+    f2 = yaml.safe_load((rd / "try_2" / "failed.yml").read_text())
+    assert f1["retry_of"] == "try_0/failed.yml"
+    assert f2["retry_of"] == "try_1/failed.yml"
