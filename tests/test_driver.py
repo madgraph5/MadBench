@@ -378,14 +378,17 @@ def test_run_end_to_end(tmp_path):
         names = tar.getnames()
         run_dir_name = archives[0].name[: -len(".tar.gz")]
         assert f"{run_dir_name}/main.log" in names
-        assert f"{run_dir_name}/metadata.yml" in names
+        # try.yml is the per-try audit record inside the log archive
+        # (sibling of main.log, distinct from the slim try.yml in the
+        # results tree).
+        assert f"{run_dir_name}/try.yml" in names
         # Per-rep stdout/stderr split: subprocess output no longer lands in
         # main.log; it goes to <run>/<invocation>/<rep>/stdout.log etc.
         assert f"{run_dir_name}/invocation_001/01/stdout.log" in names
         assert f"{run_dir_name}/invocation_002/01/stdout.log" in names
 
         meta = yaml.safe_load(
-            tar.extractfile(f"{run_dir_name}/metadata.yml").read(),
+            tar.extractfile(f"{run_dir_name}/try.yml").read(),
         )
         assert meta["test_name"] == "e2e_test"
         assert len(meta["commands"]) == 2
@@ -972,7 +975,7 @@ def test_run_artifacts_scoped_per_version(tmp_path):
 
 
 # -----------------------------------------------------------------------
-# Per-run environment metadata (metadata.yml inside per-run subdir)
+# Per-try environment metadata (try.yml inside try_N/ subdir)
 # -----------------------------------------------------------------------
 
 
@@ -995,8 +998,8 @@ def test_run_dir_naming(tmp_path):
 
 
 def test_run_writes_metadata_yml(tmp_path):
-    """Each run writes its own metadata.yml inside the per-run subdir
-    capturing the environment that produced the rows in this subdir."""
+    """Each run writes its own try.yml inside try_N/ capturing the
+    environment that produced the rows in that try."""
     import socket
     ws_root = make_workspace(tmp_path)
     make_script(ws_root)
@@ -1008,7 +1011,7 @@ def test_run_writes_metadata_yml(tmp_path):
     mb.run(test_file)
 
     meta = yaml.safe_load(
-        (try_dir(ws_root, "runmeta") / "metadata.yml").read_text()
+        (try_dir(ws_root, "runmeta") / "try.yml").read_text()
     )
     assert meta["test_name"] == "runmeta"
     # hostname lives inside the `hardware` block now (single source of truth);
@@ -1044,10 +1047,10 @@ def test_two_runs_create_separate_subdirs(tmp_path):
     assert len(subdirs) == 2
     for sd in subdirs:
         assert (sd / "try_0" / "results.csv").exists()
-        assert (sd / "try_0" / "metadata.yml").exists()
+        assert (sd / "try_0" / "try.yml").exists()
     # Timestamps must differ — proves runs are isolated, not overwriting.
-    m1 = yaml.safe_load((subdirs[0] / "try_0" / "metadata.yml").read_text())
-    m2 = yaml.safe_load((subdirs[1] / "try_0" / "metadata.yml").read_text())
+    m1 = yaml.safe_load((subdirs[0] / "try_0" / "try.yml").read_text())
+    m2 = yaml.safe_load((subdirs[1] / "try_0" / "try.yml").read_text())
     assert m1["timestamp"] != m2["timestamp"]
 
 
@@ -1871,11 +1874,11 @@ def test_run_metadata_yml_points_at_sibling_test_yml(tmp_path):
     mb.run(test_file)
 
     meta = yaml.safe_load(
-        (try_dir(ws_root, "metayml") / "metadata.yml").read_text()
+        (try_dir(ws_root, "metayml") / "try.yml").read_text()
     )
-    # test_definition is no longer in metadata.yml; the top-level test.yml is.
+    # test_definition is no longer in try.yml; the top-level test.yml is.
     assert "test_definition" not in meta
-    # All paths in metadata.yml resolve from the result_dir root, so the
+    # All paths in try.yml resolve from the result_dir root, so the
     # pointer is just ``test.yml`` (one consistent anchor with retry_of).
     assert meta["test_yml"] == "test.yml"
 
@@ -1991,7 +1994,7 @@ def test_retry_writes_retry_of_pointer_in_metadata(tmp_path):
 
     mb.retry(rd)
 
-    meta = yaml.safe_load((rd / "try_1" / "metadata.yml").read_text())
+    meta = yaml.safe_load((rd / "try_1" / "try.yml").read_text())
     # retry_of is a *relative* path pointing at the previous try's failed.yml.
     assert meta["retry_of"] == "try_0/failed.yml"
 
@@ -2165,7 +2168,7 @@ def test_retry_updates_top_summary_csv_with_merged_rows(tmp_path):
 
 
 def test_retry_blocks_on_hardware_mismatch(tmp_path, monkeypatch):
-    """A retry whose current hardware doesn't match try_0/metadata.yml
+    """A retry whose current hardware doesn't match try_0/try.yml
     aborts unless --force is passed."""
     from madbench import driver as _driver
 
@@ -2324,9 +2327,10 @@ def test_run_does_not_wipe_existing_rep_workdir(tmp_path):
     assert (scratch_path / "preseeded").exists()
 
 
-def test_tries_yml_written_after_run(tmp_path):
-    """A fresh ``madbench run`` drops ``tries.yml`` at the result_dir top
-    with a single hardware group covering ``try_0``."""
+def test_run_manifest_written_after_run(tmp_path):
+    """A fresh ``madbench run`` drops ``metadata.yml`` (the per-run
+    manifest) at the result_dir top with a single hardware group
+    covering ``try_0``."""
     import socket
 
     ws_root = make_workspace(tmp_path)
@@ -2339,7 +2343,7 @@ def test_tries_yml_written_after_run(tmp_path):
     mb.run(test_file)
 
     rd = run_dir(ws_root, "tindex")
-    payload = yaml.safe_load((rd / "tries.yml").read_text())
+    payload = yaml.safe_load((rd / "metadata.yml").read_text())
     assert payload["test_name"] == "tindex"
     assert payload["n_tries"] == 1
     assert len(payload["hardware_index"]) == 1
@@ -2348,7 +2352,7 @@ def test_tries_yml_written_after_run(tmp_path):
     assert group["hardware"]["hostname"] == socket.gethostname()
 
 
-def test_tries_yml_groups_same_host_retries(tmp_path):
+def test_run_manifest_groups_same_host_retries(tmp_path):
     """Consecutive same-host retries land in the same hardware group;
     ``tries`` lists every try in chronological order."""
     ws_root = make_workspace(tmp_path)
@@ -2367,17 +2371,17 @@ def test_tries_yml_groups_same_host_retries(tmp_path):
     mb.retry(rd)
     mb.retry(rd)
 
-    payload = yaml.safe_load((rd / "tries.yml").read_text())
+    payload = yaml.safe_load((rd / "metadata.yml").read_text())
     assert payload["n_tries"] == 3
     # All three tries ran on the same machine → one group.
     assert len(payload["hardware_index"]) == 1
     assert payload["hardware_index"][0]["tries"] == ["try_0", "try_1", "try_2"]
 
 
-def test_tries_yml_splits_groups_on_force_cross_host(tmp_path, monkeypatch):
+def test_run_manifest_splits_groups_on_force_cross_host(tmp_path, monkeypatch):
     """A ``--force`` retry on a different hardware fingerprint creates a
-    new hardware group in tries.yml — so the audit of who-ran-what-where
-    is always one file lookup away."""
+    new hardware group in the run manifest — so the audit of
+    who-ran-what-where is always one file lookup away."""
     from madbench import driver as _driver
 
     ws_root = make_workspace(tmp_path)
@@ -2404,7 +2408,7 @@ def test_tries_yml_splits_groups_on_force_cross_host(tmp_path, monkeypatch):
     monkeypatch.setattr(_driver, "detect_hardware", _fake_detect)
     mb.retry(rd, force=True)
 
-    payload = yaml.safe_load((rd / "tries.yml").read_text())
+    payload = yaml.safe_load((rd / "metadata.yml").read_text())
     assert payload["n_tries"] == 2
     assert len(payload["hardware_index"]) == 2
     hostnames = [g["hardware"]["hostname"] for g in payload["hardware_index"]]
@@ -2440,8 +2444,8 @@ def test_retry_chain_two_levels(tmp_path):
     assert (rd / "try_1" / "failed.yml").exists()
     assert (rd / "try_2" / "failed.yml").exists()
 
-    m1 = yaml.safe_load((rd / "try_1" / "metadata.yml").read_text())
-    m2 = yaml.safe_load((rd / "try_2" / "metadata.yml").read_text())
+    m1 = yaml.safe_load((rd / "try_1" / "try.yml").read_text())
+    m2 = yaml.safe_load((rd / "try_2" / "try.yml").read_text())
     assert m1["retry_of"] == "try_0/failed.yml"
     assert m2["retry_of"] == "try_1/failed.yml"
 
