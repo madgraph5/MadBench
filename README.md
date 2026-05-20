@@ -493,6 +493,47 @@ What happens:
   re-execute in the same `scratch/<test>_<ts>/` tree as the first run
   (recreating it if it was deleted).
 
+### What retry mutates vs preserves
+
+Retries are deliberately a mix of in-place overwrites (where the failed
+run's contents are not useful any more) and append-only writes (where
+the audit trail matters). The rules below are the contract — counting on
+them is safe; everything else is not.
+
+**Overwritten / wiped:**
+
+- `<scratch>/<test>_<ts>/<mg_version>/invocation_NNN/RR/` — the per-rep
+  scratch workdir of each **retried** rep is `rmtree`'d before the
+  script re-runs, so the new attempt sees a clean directory. Failed
+  scripts can leave half-written files, partial gridpacks, stale
+  `.madbench_output.json`, etc. that would otherwise contaminate the
+  retry. Successful reps' scratch workdirs are left alone, and so are
+  the shared per-version `staged/` and `processes/` directories (those
+  are re-staged / re-generated idempotently).
+- `results/<test>/<host>_<ts>/invocation_NNN/RR/` — the result-side
+  artifact directory for each **retried** rep is overwritten by
+  `shutil.copy2` / `copytree(..., dirs_exist_ok=True)`. The retry's
+  curated `artifacts:` are what live there afterwards. Reps not part
+  of this retry are untouched.
+- `results/<test>/<host>_<ts>/summary.csv` — recomputed from scratch
+  after every try, with the latest row per
+  `(invocation_id, repetition, mg_version)` winning.
+
+**Preserved (audit trail):**
+
+- `logs/<test>/<host>_<ts>/try_N/...` — each try writes to its own
+  `try_N/` log subtree, so the failed rep's `stdout.log` / `stderr.log`
+  from `try_0` survives intact when `try_1` re-runs the same rep. The
+  per-try `<host>_<ts>_try{N}.tar.gz` archive is append-only — one
+  more file per retry, no prior archive is ever rewritten.
+- `results/<test>/<host>_<ts>/try_N/{results.csv,failed.yml,metadata.yml}`
+  — each try's CSV / failure list / metadata snapshot is final once
+  written. Walking the `try_*/failed.yml` chain reconstructs the full
+  failure history.
+
+The contract in one line: **failed scratch and failed result artifacts
+are not part of the audit trail — `failed.yml` + the per-try logs are.**
+
 **Hardware check.** Before running the retry, the current host's
 hardware is compared against `try_0/metadata.yml`'s `hardware` block.
 If it doesn't match (different hostname, CPU model, core count, or GPU

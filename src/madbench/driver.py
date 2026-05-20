@@ -1287,6 +1287,16 @@ class MadBench:
                     log_version_dir = self._version_log_dir(try_log_dir, mgv)
 
                     rep_dir = run_dir / invocation_id / rep_id
+                    # On retries (try_n > 0) wipe any leftover scratch from
+                    # the previous attempt at this rep so the new run sees
+                    # a clean slate — failed scripts can leave half-written
+                    # files, partial gridpacks, stale ``.madbench_output.json``,
+                    # etc. that would otherwise contaminate the retry. The
+                    # rep's failure log is already preserved under the prior
+                    # ``logs/.../try_{N-1}/...`` subtree, so nothing
+                    # forensically useful is lost here.
+                    if try_n > 0 and rep_dir.exists():
+                        shutil.rmtree(rep_dir, ignore_errors=True)
                     rep_dir.mkdir(parents=True, exist_ok=True)
                     output_file = rep_dir / OUTPUT_FILE_NAME
 
