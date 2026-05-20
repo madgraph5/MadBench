@@ -183,6 +183,7 @@ results/my_test/
     myLaptop_20260515T140000/            # one folder per madbench run
         test.yml                          # verbatim test definition (shared across tries)
         summary.csv                       # aggregate across every try — latest row wins
+        tries.yml                         # manifest: which try ran on which hardware
         invocation_001/
             01/                           # artifacts for invocation_001, rep 01
                 timings.txt               # overwritten in place if a retry re-runs this rep
@@ -223,6 +224,7 @@ results/my_test/
     myLaptop_20260515T140000/
         test.yml
         summary.csv
+        tries.yml
         v3.5.4/
             invocation_001/
                 01/ 02/ ...
@@ -340,11 +342,19 @@ hardware:
   cuda_visible_devices: "0"          # only when set
 run_dirs:
   v3.5.4: scratch/v3.5.4/my_test_20260515T140000
-test_yml: ../test.yml               # the executed test definition lives
-                                    # one level up — shared across tries.
-retry_of: try_0/failed.yml          # only on retry runs (try_N>0); relative
-                                    # to the result_dir root.
+test_yml: test.yml                  # shared verbatim test definition;
+                                    # see "path convention" below.
+retry_of: try_0/failed.yml          # only on retry runs (try_N>0); the
+                                    # previous try's failed.yml.
 ```
+
+**Path convention.** Every relative path inside `metadata.yml` resolves
+from the **result_dir root** (the folder that contains `test.yml`,
+`summary.csv`, `tries.yml`, and the `try_*/` subdirs) — **not** from
+this `metadata.yml`'s own location. So `test_yml: test.yml` and
+`retry_of: try_0/failed.yml` share the same anchor: open the result
+dir, follow the path. No `..` traversal, one consistent rule for every
+field that takes a path.
 
 `hostname` is **not** a top-level key — it lives inside `hardware` so
 there's a single source of truth. `repeat` isn't here either; it's part
@@ -354,6 +364,58 @@ the `(hostname, timestamp)` pair encoded in the result-folder name is
 the stable key linking back to the hardware that produced the rows.
 `retry_of:` (when present) threads a retry try back to the previous
 try's `failed.yml` — see the "Retrying failed runs" section.
+
+## `tries.yml` (per run)
+
+The per-run manifest at the top of the result folder. Pairs with
+`summary.csv` as the two files you'll look at 99% of the time:
+`summary.csv` for the aggregated numbers, `tries.yml` for "who ran
+what, where". Refreshed after every `run` / `retry` so it always lists
+every existing try grouped by the hardware it ran on.
+
+```yaml
+# results/my_test/myLaptop_20260515T140000/tries.yml
+test_name: my_test
+n_tries: 3
+hardware_index:
+  - hardware:
+      hostname: myLaptop
+      fqdn: myLaptop.local
+      cpu_model: 13th Gen Intel(R) Core(TM) i5-1345U
+      cpu_arch: x86_64
+      cpu_count_physical: 10
+      cpu_count_logical: 12
+      cpu_count_available: 12
+      platform: Linux-...
+      gpus: []
+    tries: [try_0, try_1]
+  - hardware:
+      hostname: bigBox
+      cpu_model: AMD EPYC 9654 96-Core Processor
+      cpu_count_physical: 96
+      ...
+    tries: [try_2]
+```
+
+Behaviour worth knowing:
+
+- **Grouping uses the same fingerprint as the `--force` check.** Hostname,
+  fqdn, cpu_model, cpu_arch, core count, and the GPU set
+  `(vendor, name, memory_mb)` are what decide whether two tries land in
+  the same group or get split. The cross-host check and this index can
+  never disagree about "is this the same machine?".
+- **The hardware block per group is the verbatim dict from the *first*
+  try in that group.** That makes `tries.yml` self-contained — no need
+  to open any `try_N/metadata.yml` to know what machine the listed
+  tries belong to.
+- **The tries list is in chronological order** (`try_0` before `try_1`,
+  etc.), which matches the order on disk and in the `retry_of:` chain.
+- **A `--force`-d cross-host retry creates a new group.** Same-host
+  retries append to their group. So a glance at the file tells you
+  whether anything cross-host happened during this run's lifetime.
+- **Cheap and idempotent.** Rebuilt from scratch by walking
+  `try_*/metadata.yml`, so dropping/renaming a try directory and
+  re-running fixes the index automatically.
 
 ## `test.yml` (per run)
 
@@ -540,8 +602,9 @@ If it doesn't match (different hostname, CPU model, core count, or GPU
 set), the retry aborts with a clear error — performance tests aren't
 meaningful when re-run on a different machine. Pass `--force` to
 override (for the deliberate "I want to compare across machines" case);
-each try's `metadata.yml` still records its own hardware snapshot, so
-a forced cross-host retry is auditable.
+each try's `metadata.yml` still records its own hardware snapshot, and
+the top-level `tries.yml` splits its `hardware_index` into one group
+per machine, so a forced cross-host retry is fully auditable.
 
 Each `try_N/` gets a `failed.yml` whenever at least one row failed —
 human-readable summary of which `(invocation_id, repetition,

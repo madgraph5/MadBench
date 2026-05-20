@@ -1875,8 +1875,9 @@ def test_run_metadata_yml_points_at_sibling_test_yml(tmp_path):
     )
     # test_definition is no longer in metadata.yml; the top-level test.yml is.
     assert "test_definition" not in meta
-    # metadata.yml now lives inside try_N/; the verbatim test.yml is one level up.
-    assert meta["test_yml"] == "../test.yml"
+    # All paths in metadata.yml resolve from the result_dir root, so the
+    # pointer is just ``test.yml`` (one consistent anchor with retry_of).
+    assert meta["test_yml"] == "test.yml"
 
 
 # -----------------------------------------------------------------------
@@ -2321,6 +2322,96 @@ def test_run_does_not_wipe_existing_rep_workdir(tmp_path):
     # retry-only guard — a fresh run never reaches our pre-seeded path.
     mb.run(test_file)
     assert (scratch_path / "preseeded").exists()
+
+
+def test_tries_yml_written_after_run(tmp_path):
+    """A fresh ``madbench run`` drops ``tries.yml`` at the result_dir top
+    with a single hardware group covering ``try_0``."""
+    import socket
+
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "tindex", "script": "hello.sh", "args": {"x": [1, 2]}},
+    )
+    mb.run(test_file)
+
+    rd = run_dir(ws_root, "tindex")
+    payload = yaml.safe_load((rd / "tries.yml").read_text())
+    assert payload["test_name"] == "tindex"
+    assert payload["n_tries"] == 1
+    assert len(payload["hardware_index"]) == 1
+    group = payload["hardware_index"][0]
+    assert group["tries"] == ["try_0"]
+    assert group["hardware"]["hostname"] == socket.gethostname()
+
+
+def test_tries_yml_groups_same_host_retries(tmp_path):
+    """Consecutive same-host retries land in the same hardware group;
+    ``tries`` lists every try in chronological order."""
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body="#!/bin/bash\nif [ \"$1\" = \"2\" ]; then exit 1; fi\necho ok\n",
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "tgroup", "script": "hello.sh", "args": {"x": [1, 2]}},
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "tgroup")
+
+    mb.retry(rd)
+    mb.retry(rd)
+
+    payload = yaml.safe_load((rd / "tries.yml").read_text())
+    assert payload["n_tries"] == 3
+    # All three tries ran on the same machine → one group.
+    assert len(payload["hardware_index"]) == 1
+    assert payload["hardware_index"][0]["tries"] == ["try_0", "try_1", "try_2"]
+
+
+def test_tries_yml_splits_groups_on_force_cross_host(tmp_path, monkeypatch):
+    """A ``--force`` retry on a different hardware fingerprint creates a
+    new hardware group in tries.yml — so the audit of who-ran-what-where
+    is always one file lookup away."""
+    from madbench import driver as _driver
+
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body="#!/bin/bash\nif [ \"$1\" = \"2\" ]; then exit 1; fi\necho ok\n",
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "tsplit", "script": "hello.sh", "args": {"x": [1, 2]}},
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "tsplit")
+
+    real_detect = _driver.detect_hardware
+
+    def _fake_detect():
+        hw = real_detect()
+        hw["hostname"] = "other-host"
+        hw["cpu_model"] = "Pretend CPU"
+        return hw
+
+    monkeypatch.setattr(_driver, "detect_hardware", _fake_detect)
+    mb.retry(rd, force=True)
+
+    payload = yaml.safe_load((rd / "tries.yml").read_text())
+    assert payload["n_tries"] == 2
+    assert len(payload["hardware_index"]) == 2
+    hostnames = [g["hardware"]["hostname"] for g in payload["hardware_index"]]
+    assert hostnames[0] != "other-host"  # try_0's machine first
+    assert hostnames[1] == "other-host"  # try_1 (forced)
+    assert payload["hardware_index"][0]["tries"] == ["try_0"]
+    assert payload["hardware_index"][1]["tries"] == ["try_1"]
 
 
 def test_retry_chain_two_levels(tmp_path):
