@@ -46,7 +46,7 @@ Each `madbench run` writes one folder under `results/<test_name>/` named
 results/<test_name>/<hostname>_<timestamp>/
 ├── results.csv           # one row per (invocation, rep)
 ├── summary.csv           # mean / std across reps for `stats:` columns + wall_time
-├── metadata.yml          # host, hardware, git SHA, sweep parameters
+├── metadata.yml          # host, hardware, toolchain versions, git SHA, sweep parameters
 ├── test.yml              # verbatim copy of the test YAML used for this run
 └── invocation_NNN/RR/    # artifacts the script produced, per rep
 ```

@@ -11,7 +11,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .utils import detect_hardware, format_hardware_summary, get_git_sha, get_timestamp
+from .utils import (
+    detect_hardware,
+    detect_software_versions,
+    format_hardware_summary,
+    format_software_summary,
+    get_git_sha,
+    get_timestamp,
+)
 from .workspace import (
     WorkspaceConfig,
     find_workspace,
@@ -319,6 +326,7 @@ class MadBench:
 
         git_sha = get_git_sha(self.workspace.root)
         hardware = detect_hardware()
+        software = detect_software_versions()
         hostname = hardware["hostname"]
 
         result_dir = (
@@ -334,6 +342,7 @@ class MadBench:
             "git_sha": git_sha,
             "timestamp": timestamp,
             "hardware": hardware,
+            "software": software,
             "test_definition": test.raw,
             "commands": [" ".join(cmd) for cmd in commands],
             "script": str(script_path),
@@ -357,6 +366,7 @@ class MadBench:
             hostname=hostname,
             git_sha=git_sha,
             hardware=hardware,
+            software=software,
             run_dirs=run_dirs,
             result_dir=result_dir,
             run_log_dir=run_log_dir,
@@ -441,6 +451,7 @@ class MadBench:
         retry_mg_versions = list(dict.fromkeys(u.mg_version for u in units))
 
         hardware = detect_hardware()
+        software = detect_software_versions()
         if not force:
             self._check_hardware_compatible(result_dir, hardware)
 
@@ -476,6 +487,7 @@ class MadBench:
             "git_sha": git_sha,
             "timestamp": timestamp,
             "hardware": hardware,
+            "software": software,
             "test_definition": test.raw,
             "commands": [" ".join(u.cmd) for u in units],
             "script": str(script_path),
@@ -502,6 +514,7 @@ class MadBench:
             hostname=hostname,
             git_sha=git_sha,
             hardware=hardware,
+            software=software,
             run_dirs=run_dirs,
             result_dir=result_dir,
             run_log_dir=run_log_dir,
@@ -1086,6 +1099,7 @@ class MadBench:
         timestamp: str,
         git_sha: Optional[str],
         hardware: dict,
+        software: dict,
         run_dirs: dict[str, Path],
         try_dir: Path,
         retry_of: Optional[str] = None,
@@ -1112,6 +1126,7 @@ class MadBench:
             "git_sha": git_sha,
             "mg_versions": list(run_dirs.keys()),
             "hardware": hardware,
+            "software": software,
             "run_dirs": {mgv: str(p) for mgv, p in run_dirs.items()},
             # Path convention for this file: every relative path inside
             # try.yml resolves from the result_dir root (the dir that
@@ -1244,6 +1259,7 @@ class MadBench:
         hostname: str,
         git_sha: Optional[str],
         hardware: dict,
+        software: dict,
         run_dirs: dict[str, Path],
         result_dir: Path,
         run_log_dir: Path,
@@ -1318,6 +1334,7 @@ class MadBench:
         try:
             with MainLog(main_log) as tee:
                 tee.log(f"[madbench] Host: {format_hardware_summary(hardware)}")
+                tee.log(f"[madbench] Toolchain: {format_software_summary(software)}")
                 # Dump the full run metadata (hardware block included) up
                 # front so the machine's proper spec is visible from the
                 # first log lines — no need to wait for the run to finish
@@ -1558,7 +1575,7 @@ class MadBench:
             if failed_yml_path is not None:
                 metadata["failed_yml_path"] = str(failed_yml_path)
             try_yml_path = self._write_try_metadata(
-                test, timestamp, git_sha, hardware,
+                test, timestamp, git_sha, hardware, software,
                 run_dirs, try_dir, retry_of=retry_of,
                 note=metadata.get("note"),
             )
@@ -1757,6 +1774,7 @@ class MadBench:
 
         print("[madbench] DRY RUN — no files will be created or scripts executed")
         print(f"[madbench] Host: {format_hardware_summary(metadata['hardware'])}")
+        print(f"[madbench] Toolchain: {format_software_summary(metadata['software'])}")
         if metadata.get("note"):
             print(f"[madbench] Note: {metadata['note']}")
         print(f"[madbench] Test: {test.name}")

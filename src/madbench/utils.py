@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
+import shutil
 import socket
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -229,6 +232,114 @@ def _detect_cpu_info() -> dict:
             info["cpu_model"] = proc
 
     return info
+
+
+# Toolchain whose versions matter for reproducing a run — especially
+# gridpack generation, which shells out to the system Fortran/C/C++
+# compilers and will simply refuse to build against an incompatible
+# ``g++``/``gfortran``/glibc. Order is roughly "most likely to matter"
+# first so the emitted ``software`` block reads top-down.
+DEFAULT_SOFTWARE_TOOLS: tuple[str, ...] = (
+    "gcc",
+    "g++",
+    "gfortran",
+    "nvcc",
+    "hipcc",
+    "python3",
+    "python",
+    "make",
+    "cmake",
+    "ld",       # binutils linker — ABI/relocation issues surface here
+    "ldd",      # `ldd --version` reports the glibc version (GLIBC_x.y errors)
+)
+
+# A clean dotted version token: "11.4.0", "12.2", "2.35". Requires at
+# least one dot so bare years in copyright lines (e.g. nvcc's
+# "2005-2023") don't match. Distro packaging suffixes ("-5.el9",
+# "-1ubuntu1") are deliberately dropped here — the full string is kept
+# verbatim in each tool's ``raw`` field.
+_VERSION_RE = re.compile(r"\b(\d+(?:\.\d+){1,3})\b")
+
+
+def _extract_version(output: str) -> tuple[str | None, str | None]:
+    """From a tool's ``--version`` output, return ``(version, raw_line)``.
+
+    Picks the first non-empty line that contains a dotted version token
+    (so nvcc's ``Cuda compilation tools, release 12.2, V12.2.140`` wins
+    over its banner/copyright lines); falls back to the first non-empty
+    line. ``version`` is the extracted token from that line, or ``None``
+    if the chosen line has none."""
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if not lines:
+        return None, None
+    chosen = next((ln for ln in lines if _VERSION_RE.search(ln)), lines[0])
+    m = _VERSION_RE.search(chosen)
+    return (m.group(1) if m else None), chosen
+
+
+def _detect_tool_version(name: str) -> dict | None:
+    """Return ``{version?, path, raw?}`` for a tool on ``PATH``, or ``None``
+    if it isn't installed. Version output on either stream is accepted
+    (some tools print to stderr); a non-zero exit is tolerated as long as
+    something version-looking comes back."""
+    path = shutil.which(name)
+    if path is None:
+        return None
+    try:
+        r = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"path": path}
+    version, raw = _extract_version((r.stdout or "") + "\n" + (r.stderr or ""))
+    info: dict = {}
+    if version:
+        info["version"] = version
+    info["path"] = path
+    if raw:
+        info["raw"] = raw
+    return info
+
+
+def detect_software_versions(tools: tuple[str, ...] | None = None) -> dict:
+    """Return a dict of relevant toolchain versions on this host.
+
+    Each present tool maps to ``{version, path, raw}`` (``version``/``raw``
+    omitted when they can't be parsed); tools not found on ``PATH`` are
+    left out entirely. ``madbench_python`` always records the interpreter
+    actually running madbench, which need not be the ``python``/``python3``
+    on ``PATH``.
+
+    The default tool set (``DEFAULT_SOFTWARE_TOOLS``) targets what makes a
+    run reproducible — chiefly the compilers gridpack generation depends
+    on. Pass ``tools`` to override it."""
+    names = DEFAULT_SOFTWARE_TOOLS if tools is None else tools
+    software: dict = {}
+    for name in names:
+        info = _detect_tool_version(name)
+        if info is not None:
+            software[name] = info
+    software["madbench_python"] = {
+        "version": platform.python_version(),
+        "path": sys.executable,
+    }
+    return software
+
+
+def format_software_summary(sw: dict) -> str:
+    """Compact one-line summary of ``detect_software_versions()`` for the
+    run log, e.g. ``gcc 11.4.0 | g++ 11.4.0 | gfortran 11.4.0 | nvcc 12.2``.
+    Tools without a parsed version are shown as ``name ?``; the running
+    interpreter is folded in as ``python <ver>``."""
+    parts: list[str] = []
+    for name, info in sw.items():
+        if name == "madbench_python":
+            continue
+        parts.append(f"{name} {info.get('version', '?')}")
+    py = sw.get("madbench_python", {}).get("version")
+    if py:
+        parts.append(f"python {py}")
+    return " | ".join(parts) if parts else "no toolchain detected"
 
 
 def detect_hardware() -> dict:

@@ -314,8 +314,8 @@ aggregated since MadBench measures it itself.
 ## `try.yml` (per try)
 
 Sibling of `try_N/results.csv` / `try_N/failed.yml`. Records the
-environment that produced *this try's* CSV — host, hardware, git SHA,
-sweep parameters, scratch run dirs. Each `madbench run` writes
+environment that produced *this try's* CSV — host, hardware, toolchain
+versions (`software`), git SHA, sweep parameters, scratch run dirs. Each `madbench run` writes
 `try_0/try.yml`; each `madbench retry` writes `try_{N+1}/try.yml` with
 a `retry_of:` pointer.
 
@@ -340,6 +340,18 @@ hardware:
     - {vendor: nvidia, index: 0, name: NVIDIA A100-SXM4-80GB, memory_mb: 81920,
        driver_version: "550.54.15", compute_cap: "8.0"}
   cuda_visible_devices: "0"          # only when set
+software:                            # toolchain versions on PATH; tools not
+  gcc:                               # found are omitted. Matters for reproducing
+    version: 11.4.0                  # gridpack generation, which shells out to
+    path: /usr/bin/gcc               # the system compilers.
+    raw: gcc (GCC) 11.4.0            # the selected --version line, verbatim
+  g++: {version: 11.4.0, path: /usr/bin/g++, raw: "g++ (GCC) 11.4.0"}
+  gfortran: {version: 11.4.0, path: /usr/bin/gfortran, raw: "GNU Fortran (GCC) 11.4.0"}
+  nvcc: {version: "12.2", path: /usr/local/cuda/bin/nvcc, raw: "Cuda compilation tools, release 12.2, V12.2.140"}
+  ldd: {version: "2.35", path: /usr/bin/ldd, raw: "ldd (GNU libc) 2.35"}
+  madbench_python:                   # the interpreter running madbench itself,
+    version: 3.11.5                  # which need not be the PATH python/python3
+    path: /usr/bin/python3
 run_dirs:
   v3.5.4: scratch/v3.5.4/my_test_20260515T140000
 test_yml: test.yml                  # shared verbatim test definition;

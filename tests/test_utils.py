@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 from pathlib import Path
 
 import pytest
 
 from madbench.utils import (
+    _extract_version,
     _parse_nvidia_smi,
     _parse_rocm_smi,
     detect_hardware,
+    detect_software_versions,
     format_hardware_summary,
+    format_software_summary,
     get_git_sha,
     get_timestamp,
 )
@@ -248,3 +252,82 @@ def test_format_hardware_summary_collapses_duplicates():
     assert "h (h.example.com)" in s
     assert "2× A100 (81920MB)" in s
     assert "visible=0" in s
+
+
+# -----------------------------------------------------------------------
+# Software / toolchain version detection
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("output, version, raw", [
+    # gcc / g++ / gfortran: version on the first line.
+    ("gcc (GCC) 11.4.0", "11.4.0", "gcc (GCC) 11.4.0"),
+    # Distro packaging suffix is dropped from `version`, kept in `raw`.
+    (
+        "GNU ld version 2.41-5.el9_7.1",
+        "2.41",
+        "GNU ld version 2.41-5.el9_7.1",
+    ),
+    # nvcc: banner + copyright year come first; the release line must win
+    # (a bare year like 2005-2023 has no dot and must not match).
+    (
+        "nvcc: NVIDIA (R) Cuda compiler driver\n"
+        "Copyright (c) 2005-2023 NVIDIA Corporation\n"
+        "Cuda compilation tools, release 12.2, V12.2.140",
+        "12.2",
+        "Cuda compilation tools, release 12.2, V12.2.140",
+    ),
+    ("Python 3.9.25", "3.9.25", "Python 3.9.25"),
+    # ldd reports the glibc version — the field that decides portability.
+    ("ldd (GNU libc) 2.34", "2.34", "ldd (GNU libc) 2.34"),
+    # No dotted token anywhere -> version None, raw is the first line.
+    ("some tool without a number", None, "some tool without a number"),
+    ("", None, None),
+])
+def test_extract_version(output, version, raw):
+    assert _extract_version(output) == (version, raw)
+
+
+def test_detect_software_versions_records_running_python():
+    sw = detect_software_versions()
+    assert "madbench_python" in sw
+    py = sw["madbench_python"]
+    assert py["version"] == platform.python_version()
+    assert py["path"]
+
+
+def test_detect_software_versions_custom_tool_set():
+    # A tool that certainly isn't on PATH is simply omitted; a present one
+    # (the interpreter running the tests) is reported with a path.
+    sw = detect_software_versions(tools=("definitely-not-a-real-binary-xyz",))
+    assert "definitely-not-a-real-binary-xyz" not in sw
+    # madbench_python is always injected regardless of the tool set.
+    assert "madbench_python" in sw
+
+
+def test_detect_software_versions_present_tool_shape():
+    # `python3` should exist in any environment running this test suite.
+    sw = detect_software_versions(tools=("python3",))
+    if "python3" in sw:
+        info = sw["python3"]
+        assert "path" in info
+        # version/raw are best-effort but python3 --version is well-behaved.
+        assert info.get("version")
+
+
+def test_format_software_summary():
+    sw = {
+        "gcc": {"version": "11.4.0", "path": "/usr/bin/gcc"},
+        "nvcc": {"path": "/usr/bin/nvcc"},  # no parsed version
+        "madbench_python": {"version": "3.11.5", "path": "/usr/bin/python"},
+    }
+    s = format_software_summary(sw)
+    assert "gcc 11.4.0" in s
+    assert "nvcc ?" in s          # unknown version rendered as '?'
+    assert "python 3.11.5" in s   # running interpreter folded in
+    # madbench_python is surfaced as `python`, not `madbench_python`.
+    assert "madbench_python" not in s
+
+
+def test_format_software_summary_empty():
+    assert format_software_summary({}) == "no toolchain detected"
