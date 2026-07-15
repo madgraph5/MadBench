@@ -1318,6 +1318,19 @@ class MadBench:
         try:
             with MainLog(main_log) as tee:
                 tee.log(f"[madbench] Host: {format_hardware_summary(hardware)}")
+                # Dump the full run metadata (hardware block included) up
+                # front so the machine's proper spec is visible from the
+                # first log lines — no need to wait for the run to finish
+                # and the try.yml to be written to inspect what hardware
+                # the benchmark is actually running on.
+                import yaml as _yaml
+
+                tee.log("[madbench] Run metadata:")
+                tee.log(
+                    _yaml.safe_dump(
+                        metadata, sort_keys=False, allow_unicode=True,
+                    ).rstrip("\n")
+                )
                 note = metadata.get("note")
                 if note:
                     tee.log(f"[madbench] Note: {note}")
