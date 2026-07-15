@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tarfile
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Optional
 
@@ -42,8 +43,21 @@ class MainLog:
                 self._fh = None
 
     def log(self, msg: str = "") -> None:
-        """Write a line (newline appended) to both stdout and main.log."""
-        line = f"{msg}\n"
+        """Write a timestamped line (newline appended) to both stdout and
+        main.log.
+
+        Each line of ``msg`` is prefixed with an ``[YYYY-MM-DD HH:MM:SS]``
+        stamp so the orchestration narrative is self-dating — a glance at
+        main.log tells you when each step ran and how long the gaps were.
+        Blank lines are left blank (no stamp) so intentional visual
+        separators survive, and multi-line messages (e.g. a dumped YAML
+        block) get every content line stamped consistently.
+        """
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = (
+            "\n".join(f"[{ts}] {ln}" if ln else "" for ln in msg.split("\n"))
+            + "\n"
+        )
         with self._lock:
             sys.stdout.write(line)
             sys.stdout.flush()
