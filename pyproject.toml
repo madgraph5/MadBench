@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "madbench"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight benchmarking framework for MadGraph performance tests"
 requires-python = ">=3.9"
 dependencies = [
