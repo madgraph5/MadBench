@@ -6,6 +6,7 @@ import platform
 from pathlib import Path
 
 import pytest
+import madbench.utils as utils
 
 from madbench.utils import (
     _extract_version,
@@ -109,6 +110,38 @@ def test_parse_nvidia_smi_skips_na_compute_cap():
     gpu = _parse_nvidia_smi(out)[0]
     assert gpu["driver_version"] == "470.57.02"
     assert "compute_cap" not in gpu
+
+
+def test_parse_nvidia_smi_keeps_mig_device_with_na_memory():
+    """MIG-backed/container views may not expose physical total memory."""
+    assert _parse_nvidia_smi("0, NVIDIA H100, [N/A], 550.54.15, 9.0\n") == [{
+        "vendor": "nvidia",
+        "index": 0,
+        "name": "NVIDIA H100",
+        "memory_mb": None,
+        "driver_version": "550.54.15",
+        "compute_cap": "9.0",
+    }]
+
+
+def test_detect_nvidia_gpus_retries_unsupported_query_fields(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, timeout=5):
+        calls.append(cmd)
+        if "compute_cap" in cmd[1]:
+            return 2, ""
+        return 0, "0, NVIDIA H100, [N/A], 550.54.15\n"
+
+    monkeypatch.setattr(utils, "_run_silent", fake_run)
+    assert utils._detect_nvidia_gpus() == [{
+        "vendor": "nvidia",
+        "index": 0,
+        "name": "NVIDIA H100",
+        "memory_mb": None,
+        "driver_version": "550.54.15",
+    }]
+    assert len(calls) == 2
 
 
 def test_parse_nvidia_smi_multiple():

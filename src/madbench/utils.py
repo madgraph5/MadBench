@@ -48,19 +48,23 @@ def _parse_nvidia_smi(out: str) -> list[dict]:
     """Parse the CSV output of
     ``nvidia-smi --query-gpu=index,name,memory.total,driver_version,compute_cap
     --format=csv,noheader,nounits``. Memory is in MiB. ``driver_version`` and
-    ``compute_cap`` are optional — older drivers may omit ``compute_cap`` and
-    fields beyond the first three are filled in only when present so the parser
-    keeps working against a 3-column legacy invocation.
+    ``memory.total`` and ``compute_cap`` can be unavailable for some MIG or
+    older-driver views. Optional fields are filled in only when present so the
+    parser also works with reduced legacy invocations.
     """
     gpus: list[dict] = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 3 and parts[0].isdigit() and parts[2].isdigit():
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1]:
             gpu: dict = {
                 "vendor": "nvidia",
                 "index": int(parts[0]),
                 "name": parts[1],
-                "memory_mb": int(parts[2]),
+                "memory_mb": (
+                    int(parts[2])
+                    if len(parts) >= 3 and parts[2].isdigit()
+                    else None
+                ),
             }
             if len(parts) >= 4 and parts[3] and parts[3] != "[N/A]":
                 gpu["driver_version"] = parts[3]
@@ -109,14 +113,28 @@ def _parse_rocm_smi(out: str) -> list[dict]:
 
 
 def _detect_nvidia_gpus() -> list[dict]:
-    rc, out = _run_silent([
-        "nvidia-smi",
-        "--query-gpu=index,name,memory.total,driver_version,compute_cap",
-        "--format=csv,noheader,nounits",
-    ])
-    if rc != 0:
-        return []
-    return _parse_nvidia_smi(out)
+    # Query support varies with the driver and with the kind of device exposed
+    # to a container.  In particular, MIG devices can report memory.total as
+    # N/A, and older drivers reject compute_cap by failing the whole command.
+    # Retry with progressively older field sets instead of turning either case
+    # into the misleading "no GPU detected" result.
+    field_sets = (
+        "index,name,memory.total,driver_version,compute_cap",
+        "index,name,memory.total,driver_version",
+        "index,name,memory.total",
+        "index,name",
+    )
+    for fields in field_sets:
+        rc, out = _run_silent([
+            "nvidia-smi",
+            f"--query-gpu={fields}",
+            "--format=csv,noheader,nounits",
+        ])
+        if rc == 0:
+            gpus = _parse_nvidia_smi(out)
+            if gpus:
+                return gpus
+    return []
 
 
 def _detect_amd_driver_version() -> str | None:

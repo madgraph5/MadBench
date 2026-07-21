@@ -722,10 +722,13 @@ against.
 
 GPU detection is best-effort: MadBench shells out to `nvidia-smi` for
 NVIDIA cards and `rocm-smi --json` for AMD; if neither is on `PATH`, the
-`gpus` list is just empty. If the script's view of the GPU is constrained
-(`CUDA_VISIBLE_DEVICES=0` etc.), that constraint is captured separately so
-the metadata reflects both "what the machine has" and "what the run could
-see".
+`gpus` list is just empty. NVIDIA query fields are progressively reduced for
+compatibility with older drivers and MIG/container views; unavailable values
+such as a MIG device's physical total memory are omitted from the summary
+rather than causing the device itself to be discarded. If the script's view of
+the GPU is constrained (`CUDA_VISIBLE_DEVICES=0` etc.), that constraint is
+captured separately so the metadata reflects both "what the machine has" and
+"what the run could see".
 
 The CPU side mirrors that distinction:
 
