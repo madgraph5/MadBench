@@ -382,8 +382,11 @@ try's `failed.yml` — see the "Retrying failed runs" section.
 The per-run manifest at the top of the result folder. Pairs with
 `summary.csv` as the two files you'll look at 99% of the time:
 `summary.csv` for the aggregated numbers, `metadata.yml` for "who ran
-what, where". Refreshed after every `run` / `retry` so it always lists
-every existing try grouped by the hardware it ran on. **Note the
+what, where". It is created before benchmark execution starts, initially
+with `n_tries: 0` and an empty `tries` list for the detected hardware, so it
+can be inspected while the run is active. It is refreshed after every
+`run` / `retry` so it lists every completed try grouped by the hardware it
+ran on. **Note the
 naming**: this file lives at the result_dir top and indexes the run
 as a whole; the per-try environment snapshots are called `try.yml`
 and live one level down under each `try_N/`.

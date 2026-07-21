@@ -948,7 +948,13 @@ class MadBench:
             gpus,
         )
 
-    def _write_run_manifest(self, result_dir: Path) -> Optional[Path]:
+    def _write_run_manifest(
+        self,
+        result_dir: Path,
+        *,
+        test_name: Optional[str] = None,
+        initial_hardware: Optional[dict] = None,
+    ) -> Optional[Path]:
         """Refresh ``result_dir/metadata.yml`` — the per-run manifest.
 
         Walks every ``try_*/try.yml`` under ``result_dir``, groups tries
@@ -956,7 +962,9 @@ class MadBench:
         check, so the index can't disagree with what ``--force`` is
         gating on), and writes one entry per unique machine listing the
         tries that ran there. Rewritten from scratch at the end of
-        each run / retry — cheap, and keeps the file always-current.
+        each run / retry — cheap, and keeps the file always-current.  For a
+        new run, ``test_name`` and ``initial_hardware`` allow an initial
+        manifest to be written before any try has completed.
 
         The hardware block emitted per group is the verbatim dict from
         the *first* try in that group, so the file is self-contained
@@ -978,15 +986,11 @@ class MadBench:
                 continue
             try_dirs.append((n, child))
         try_dirs.sort(key=lambda x: x[0])
-        if not try_dirs:
-            return None
-
         # Groups are keyed by fingerprint (hashable). Each group records
         # the verbatim hardware dict from its first try and an ordered
         # list of try names that landed in it.
         groups: list[dict[str, Any]] = []
         fingerprint_to_idx: dict[tuple, int] = {}
-        test_name: Optional[str] = None
         for _, try_path in try_dirs:
             meta_path = try_path / "try.yml"
             if not meta_path.exists():
@@ -1010,9 +1014,17 @@ class MadBench:
             else:
                 groups[idx]["tries"].append(try_path.name)
 
+        # Before the first subprocess starts there is no try.yml to discover,
+        # but the manifest should already identify the machine running it.
+        if not groups and initial_hardware is not None:
+            groups.append({"hardware": initial_hardware, "tries": []})
+
+        if test_name is None and not groups:
+            return None
+
         payload: dict[str, Any] = {
             "test_name": test_name,
-            "n_tries": len(try_dirs),
+            "n_tries": sum(len(group["tries"]) for group in groups),
             "hardware_index": groups,
         }
         path = result_dir / "metadata.yml"
@@ -1290,9 +1302,6 @@ class MadBench:
         # Prepare per-version run dirs + inputs + processes (once per
         # version actually exercised by this set of units).
         result_dir.mkdir(parents=True, exist_ok=True)
-        try_dir.mkdir(parents=True, exist_ok=True)
-        run_log_dir.mkdir(parents=True, exist_ok=True)
-        try_log_dir.mkdir(parents=True, exist_ok=True)
         # Drop a verbatim copy of the test YAML at the *top* of the result
         # dir so all tries share one canonical reference. ``retry()`` reads
         # it back to rebuild the TestDefinition. Only copy on the first try
@@ -1300,6 +1309,17 @@ class MadBench:
         top_test_yml = result_dir / "test.yml"
         if not top_test_yml.exists():
             shutil.copyfile(test_yml_source, top_test_yml)
+        # Make the machine metadata inspectable in results before staging,
+        # process generation, or any benchmark subprocess begins. At the end
+        # of the try this is rebuilt with the completed try in its group.
+        self._write_run_manifest(
+            result_dir,
+            test_name=test.name,
+            initial_hardware=hardware,
+        )
+        try_dir.mkdir(parents=True, exist_ok=True)
+        run_log_dir.mkdir(parents=True, exist_ok=True)
+        try_log_dir.mkdir(parents=True, exist_ok=True)
         for mgv, rd in run_dirs.items():
             rd.mkdir(parents=True, exist_ok=True)
             inputs_dir = rd / STAGED_DIR_NAME

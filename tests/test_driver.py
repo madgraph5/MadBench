@@ -2352,6 +2352,39 @@ def test_run_manifest_written_after_run(tmp_path):
     assert group["hardware"]["hostname"] == socket.gethostname()
 
 
+def test_run_manifest_exists_before_benchmark_subprocess(tmp_path):
+    """The benchmark can inspect the initial manifest while it is running."""
+    ws_root = make_workspace(tmp_path)
+    observed = tmp_path / "metadata-seen-by-script.yml"
+    results = ws_root / "results" / "tearly"
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            f'meta=$(find "{results}" -name metadata.yml -print -quit)\n'
+            'test -n "$meta" || exit 91\n'
+            f'cp "$meta" "{observed}"\n'
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {"name": "tearly", "script": "hello.sh", "args": {"x": 1}},
+    )
+
+    mb.run(test_file)
+
+    initial = yaml.safe_load(observed.read_text())
+    assert initial["test_name"] == "tearly"
+    assert initial["n_tries"] == 0
+    assert initial["hardware_index"][0]["tries"] == []
+    assert initial["hardware_index"][0]["hardware"]["hostname"]
+
+    final = yaml.safe_load((run_dir(ws_root, "tearly") / "metadata.yml").read_text())
+    assert final["n_tries"] == 1
+    assert final["hardware_index"][0]["tries"] == ["try_0"]
+
+
 def test_run_manifest_groups_same_host_retries(tmp_path):
     """Consecutive same-host retries land in the same hardware group;
     ``tries`` lists every try in chronological order."""
