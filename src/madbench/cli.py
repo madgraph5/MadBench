@@ -90,7 +90,6 @@ def _cmd_init(args: argparse.Namespace) -> None:
 
 def _cmd_run(args: argparse.Namespace) -> None:
     from .driver import MadBench
-    from .workspace import find_workspace
 
     try:
         mb = MadBench()

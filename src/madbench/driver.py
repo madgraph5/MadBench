@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import itertools
 import json
 import os
@@ -9,7 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional, Union
 
 from .utils import (
     detect_hardware,
@@ -28,6 +27,7 @@ from .workspace import (
 )
 from ._logging import MainLog, bundle_logs
 from .results import append_row, select_results_csv
+from .pipeline import PipelineDefinition, PipelineRunner, parse_pipeline
 
 
 _REQUIRED_FIELDS = {"name", "script", "args"}
@@ -72,6 +72,8 @@ class _ExecUnit:
 @dataclass
 class TestDefinition:
     """Parsed content of a test YAML file."""
+
+    __test__: ClassVar[bool] = False
 
     name: str
     description: str
@@ -209,7 +211,9 @@ class MadBench:
     # Public API
     # ------------------------------------------------------------------
 
-    def load_test(self, test_path: Path) -> TestDefinition:
+    def load_test(
+        self, test_path: Path,
+    ) -> Union[TestDefinition, PipelineDefinition]:
         """Parse a test YAML file into a TestDefinition.
 
         `test_path` can be absolute or relative to cwd.
@@ -222,6 +226,8 @@ class MadBench:
 
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
+        if isinstance(raw, dict) and "steps" in raw:
+            return parse_pipeline(raw, source=str(path))
         return self._test_from_dict(raw, source=str(path))
 
     @staticmethod
@@ -280,13 +286,20 @@ class MadBench:
     ) -> None:
         """Main entry point. Loads the test, builds commands, runs them."""
         test = self.load_test(test_path)
-        script_path = resolve_script(self.workspace, test.script)
-        # Resolve to an absolute path so the verbatim copy into the
-        # result dir is unambiguous even if cwd changes later.
         test_yml_abs = (
             test_path if test_path.is_absolute() else Path.cwd() / test_path
         ).resolve()
-
+        if isinstance(test, PipelineDefinition):
+            PipelineRunner(self.workspace).run(
+                test,
+                test_yml_abs,
+                dry_run=dry_run,
+                note=note,
+            )
+            return
+        script_path = resolve_script(self.workspace, test.script)
+        # Resolve to an absolute path so the verbatim copy into the
+        # result dir is unambiguous even if cwd changes later.
         sweep_points = self._build_sweep_points(test)
         commands = [
             [str(script_path)] + [str(combo[k]) for k in test.args]
@@ -407,6 +420,13 @@ class MadBench:
                 "test definition to retry against."
             )
 
+        test = self.load_test(top_test_yml)
+        if isinstance(test, PipelineDefinition):
+            raise ValueError(
+                "retry is not yet supported for pipeline-style tests; rerun "
+                "the pipeline, which will reuse successful cached steps"
+            )
+
         latest_try_n = self._find_latest_try_n(result_dir)
         if latest_try_n < 0:
             raise FileNotFoundError(
@@ -421,8 +441,6 @@ class MadBench:
                 "Nothing to retry."
             )
             return
-
-        test = self.load_test(top_test_yml)
 
         failures = self._read_failed_yml(prev_failed_yml, test)
         if not failures:
@@ -567,7 +585,9 @@ class MadBench:
             result_dir = self.workspace.results_dir / test.name
             has_results = result_dir.exists() and any(result_dir.iterdir())
 
-            plot_path = resolve_plot_module(self.workspace, test.plot or "")
+            plot_path = resolve_plot_module(
+                self.workspace, getattr(test, "plot", None) or "",
+            )
             has_plot = plot_path is not None
 
             results.append({
