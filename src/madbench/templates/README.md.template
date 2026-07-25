@@ -47,6 +47,7 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
 ├── result.json
 ├── results.csv
+├── step_timings.csv  # one row per step execution
 ├── summary.csv       # when the final step repeats
 ├── logs/             # stdout and stderr per step execution
 └── artifacts/        # artifacts declared with save: true

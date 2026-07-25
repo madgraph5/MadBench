@@ -250,6 +250,12 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
     result_dir = only_result_dir(root, "pipe")
     manifest = json.loads((result_dir / "result.json").read_text())
     assert len(manifest["steps"]) == 2 + 8
+    assert all(entry["total_time"] >= 0 for entry in manifest["steps"])
+    assert all(
+        entry["execution_time"] is not None
+        for entry in manifest["steps"]
+        if entry["status"] == "success"
+    )
     assert all(
         Path(entry["arguments"]["proc_card"]).is_absolute()
         for entry in manifest["steps"]
@@ -274,6 +280,12 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
     assert {row["compile.compile_seconds"] for row in rows} == {"2"}
     assert {row["benchmark.runtime"] for row in rows} == {"1", "2"}
     assert (result_dir / "summary.csv").is_file()
+    with open(result_dir / "step_timings.csv", newline="") as file:
+        timing_rows = list(csv.DictReader(file))
+    assert len(timing_rows) == 10
+    assert {
+        "execution_time", "materialization_time", "total_time",
+    }.issubset(timing_rows[0])
     assert len(list((result_dir / "artifacts" / "compile").rglob("executable"))) == 2
 
 
@@ -377,6 +389,12 @@ def test_step_cache_restores_outputs_and_artifacts(tmp_path):
     second = json.loads((result_dirs[-1] / "result.json").read_text())
     assert second["steps"][0]["cache"] == "hit"
     assert second["steps"][0]["outputs"]["count"] == 1
+    assert second["steps"][0]["execution_time"] is None
+    assert second["steps"][0]["materialization_time"] is not None
+    assert (
+        second["steps"][0]["total_time"]
+        >= second["steps"][0]["materialization_time"]
+    )
 
 
 def test_madgraph_process_action(tmp_path):

@@ -104,7 +104,9 @@ class ExecutionResult:
     repetition: int
     status: str
     exit_code: Optional[int]
-    wall_time: float
+    execution_time: Optional[float]
+    materialization_time: Optional[float]
+    total_time: float
     cache: str
     arguments: dict[str, Any]
     outputs: dict[str, Any]
@@ -666,7 +668,9 @@ class PipelineRunner:
                         repetition=execution.repetition,
                         status="blocked",
                         exit_code=None,
-                        wall_time=0.0,
+                        execution_time=None,
+                        materialization_time=None,
+                        total_time=0.0,
                         cache="not-applicable",
                         arguments={},
                         outputs={},
@@ -691,6 +695,7 @@ class PipelineRunner:
 
         self._write_manifest(result_dir, manifest, all_results)
         self._write_flat_csv(pipeline, result_dir, result_index)
+        self._write_step_timings(pipeline, result_dir, all_results)
         self._write_summary(pipeline, result_dir, result_index)
         print(f"[madbench] Pipeline complete: {result_dir}")
 
@@ -811,6 +816,7 @@ class PipelineRunner:
         staged_dir: Path,
         result_dir: Path,
     ) -> ExecutionResult:
+        total_started = time.monotonic()
         step = execution.step
         rep = f"{execution.repetition:02d}"
         workdir = run_dir / "steps" / step.id / execution.identity / rep
@@ -849,13 +855,17 @@ class PipelineRunner:
             pipeline, execution, arguments, upstream,
         ) if step.cache.enabled else None
         cache_dir = self._cache_dir(pipeline, step, cache_key) if cache_key else None
-        if cache_dir is not None and self._restore_cache(
-            step, cache_dir, workdir,
-        ):
+        materialization_started = time.monotonic()
+        cache_restored = (
+            cache_dir is not None
+            and self._restore_cache(step, cache_dir, workdir)
+        )
+        if cache_restored:
             outputs = json.loads((cache_dir / "outputs.json").read_text())
             artifacts, digests, saved = self._collect_artifacts(
                 pipeline, execution, workdir, result_dir,
             )
+            materialization_time = time.monotonic() - materialization_started
             return ExecutionResult(
                 step_id=step.id,
                 identity=execution.identity,
@@ -863,7 +873,9 @@ class PipelineRunner:
                 repetition=execution.repetition,
                 status="success",
                 exit_code=0,
-                wall_time=0.0,
+                execution_time=None,
+                materialization_time=round(materialization_time, 4),
+                total_time=round(time.monotonic() - total_started, 4),
                 cache="hit",
                 arguments=arguments,
                 outputs=outputs,
@@ -873,7 +885,7 @@ class PipelineRunner:
                 saved_artifacts=saved,
             )
 
-        started = time.monotonic()
+        execution_started = time.monotonic()
         with open(stdout, "w") as stdout_file, open(stderr, "w") as stderr_file:
             if step.script is not None:
                 script = resolve_script(self.workspace, step.script)
@@ -891,7 +903,7 @@ class PipelineRunner:
                 exit_code = self._run_action(
                     step, arguments, workdir, env, stdout_file, stderr_file,
                 )
-        wall_time = time.monotonic() - started
+        execution_time = time.monotonic() - execution_started
         if exit_code != 0:
             return ExecutionResult(
                 step_id=step.id,
@@ -900,7 +912,9 @@ class PipelineRunner:
                 repetition=execution.repetition,
                 status="failed",
                 exit_code=exit_code,
-                wall_time=round(wall_time, 4),
+                execution_time=round(execution_time, 4),
+                materialization_time=None,
+                total_time=round(time.monotonic() - total_started, 4),
                 cache="miss" if step.cache.enabled else "disabled",
                 arguments=arguments,
                 outputs={},
@@ -924,7 +938,9 @@ class PipelineRunner:
             repetition=execution.repetition,
             status="success",
             exit_code=exit_code,
-            wall_time=round(wall_time, 4),
+            execution_time=round(execution_time, 4),
+            materialization_time=None,
+            total_time=round(time.monotonic() - total_started, 4),
             cache="miss" if step.cache.enabled else "disabled",
             arguments=arguments,
             outputs=outputs,
@@ -1209,7 +1225,9 @@ class PipelineRunner:
                 "repetition": result.repetition,
                 "status": result.status,
                 "exit_code": result.exit_code,
-                "wall_time": result.wall_time,
+                "execution_time": result.execution_time,
+                "materialization_time": result.materialization_time,
+                "total_time": result.total_time,
                 "cache": result.cache,
                 "arguments": result.arguments,
                 "outputs": result.outputs,
@@ -1273,7 +1291,9 @@ class PipelineRunner:
                 "repetition",
                 "status",
                 "exit_code",
-                "wall_time",
+                "execution_time",
+                "materialization_time",
+                "total_time",
                 "execution_id",
             ]
         )
@@ -1296,8 +1316,52 @@ class PipelineRunner:
                     "repetition": result.repetition,
                     "status": result.status,
                     "exit_code": result.exit_code,
-                    "wall_time": result.wall_time,
+                    "execution_time": result.execution_time,
+                    "materialization_time": result.materialization_time,
+                    "total_time": result.total_time,
                     "execution_id": result.identity,
+                })
+                writer.writerow(row)
+
+    @staticmethod
+    def _write_step_timings(
+        pipeline: PipelineDefinition,
+        result_dir: Path,
+        results: list[ExecutionResult],
+    ) -> None:
+        """Write a CI-like timing view with one row per step execution."""
+        fieldnames = (
+            [
+                "step_id",
+                "execution_id",
+                "repetition",
+                "status",
+                "exit_code",
+                "cache",
+                "execution_time",
+                "materialization_time",
+                "total_time",
+            ]
+            + list(pipeline.matrix)
+        )
+        with open(result_dir / "step_timings.csv", "w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in results:
+                row: dict[str, Any] = {
+                    "step_id": result.step_id,
+                    "execution_id": result.identity,
+                    "repetition": result.repetition,
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "cache": result.cache,
+                    "execution_time": result.execution_time,
+                    "materialization_time": result.materialization_time,
+                    "total_time": result.total_time,
+                }
+                row.update({
+                    name: result.dimensions.get(name, "")
+                    for name in pipeline.matrix
                 })
                 writer.writerow(row)
 

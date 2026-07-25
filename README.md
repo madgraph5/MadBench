@@ -613,6 +613,7 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
 ├── result.json
 ├── results.csv
+├── step_timings.csv
 ├── summary.csv
 ├── logs/
 └── artifacts/
@@ -626,13 +627,30 @@ results/<pipeline>/<hostname>_<timestamp>/
 - Staged input paths and digests.
 - Every step execution and its dimensions.
 - Resolved arguments.
-- Status, exit code, wall time, and cache status.
+- Status, exit code, detailed timing, and cache status.
 - Outputs and artifact digests.
 - Per-execution stdout and stderr log paths.
 - Repetitions and blocked dependencies.
 
 `results.csv` is a flattened view of final-step observations. Upstream values
 are repeated where necessary and use qualified column names.
+
+`step_timings.csv` is the CI-like timing view. It contains one row for every
+step execution and repetition, including its matrix dimensions, status,
+cache state, and three timing fields:
+
+- `execution_time`: time spent running the script or built-in action. It is
+  empty on cache hits because nothing executed.
+- `materialization_time`: time spent validating and extracting a cache hit,
+  calculating restored artifact digests, and copying any `save: true`
+  artifacts. It is empty when the step executes normally.
+- `total_time`: complete time spent handling the step, including workdir and
+  argument preparation, execution or cache restoration, output validation,
+  artifact collection, and cache storage where applicable.
+
+The same fields are retained for every execution in `result.json`. Blocked
+steps have no execution or materialization duration and a zero total because
+they are recorded without being scheduled.
 
 `summary.csv` is created when the final step repeats.
 
