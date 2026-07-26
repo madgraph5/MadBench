@@ -34,6 +34,9 @@ STEP_REF_RE = re.compile(
     r"^steps\.([A-Za-z_][A-Za-z0-9_-]*)\.(outputs|artifacts)"
     r"\.([A-Za-z_][A-Za-z0-9_-]*)$"
 )
+ARTIFACT_MATRIX_REF_RE = re.compile(
+    r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+)
 INPUT_REF_RE = re.compile(r"^inputs\.([A-Za-z_][A-Za-z0-9_-]*)$")
 
 
@@ -177,6 +180,22 @@ def _normalize_outputs(value: Any, step_id: str) -> dict[str, Optional[str]]:
     )
 
 
+def _artifact_path_dimensions(path: str, step_id: str, name: str) -> list[str]:
+    dimensions = ARTIFACT_MATRIX_REF_RE.findall(path)
+    remainder = ARTIFACT_MATRIX_REF_RE.sub("value", path)
+    if "${{" in remainder or "}}" in remainder:
+        raise ValueError(
+            f"step {step_id!r} artifact {name!r} path contains an unsupported "
+            "expression; artifact paths may reference only matrix dimensions"
+        )
+    normalized = Path(remainder)
+    if normalized.is_absolute() or ".." in normalized.parts:
+        raise ValueError(
+            f"step {step_id!r} artifact {name!r} path must be safe and relative"
+        )
+    return list(dict.fromkeys(dimensions))
+
+
 def _normalize_artifacts(value: Any, step_id: str) -> dict[str, ArtifactDefinition]:
     if value is None:
         return {}
@@ -197,11 +216,7 @@ def _normalize_artifacts(value: Any, step_id: str) -> dict[str, ArtifactDefiniti
             raise ValueError(
                 f"step {step_id!r} artifact {name!r} 'save' must be boolean"
             )
-        path = Path(spec["path"])
-        if path.is_absolute() or ".." in path.parts:
-            raise ValueError(
-                f"step {step_id!r} artifact {name!r} path must be safe and relative"
-            )
+        _artifact_path_dimensions(spec["path"], step_id, name)
         result[name] = ArtifactDefinition(path=spec["path"], save=save)
     return result
 
@@ -360,6 +375,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 "available actions: ['madgraph/process']"
             )
         arguments = _normalize_arguments(step_raw.get("with"), step_id)
+        artifacts = _normalize_artifacts(step_raw.get("artifacts"), step_id)
         if action == "madgraph/process":
             if "mg_version" not in matrix:
                 raise ValueError(
@@ -373,6 +389,16 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         direct_dimensions, referenced_steps, referenced_inputs = _extract_references(
             arguments
         )
+        artifact_dimensions = [
+            dimension
+            for artifact_name, artifact in artifacts.items()
+            for dimension in _artifact_path_dimensions(
+                artifact.path, step_id, artifact_name,
+            )
+        ]
+        direct_dimensions = list(dict.fromkeys(
+            direct_dimensions + artifact_dimensions
+        ))
         unknown_dimensions = set(direct_dimensions) - set(matrix)
         if unknown_dimensions:
             raise ValueError(
@@ -412,7 +438,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             action=action,
             arguments=arguments,
             outputs=outputs,
-            artifacts=_normalize_artifacts(step_raw.get("artifacts"), step_id),
+            artifacts=artifacts,
             cache=_normalize_cache(step_raw.get("cache"), step_id),
             repeat=repeat,
             stats=stats,
@@ -823,6 +849,11 @@ class PipelineRunner:
         if workdir.exists():
             shutil.rmtree(workdir)
         workdir.mkdir(parents=True)
+        # Resolve and validate produced paths before invoking user code. Matrix
+        # values must never turn an artifact declaration into an absolute path
+        # or parent traversal.
+        for name, spec in execution.step.artifacts.items():
+            self._artifact_path(execution, name, spec)
         output_file = workdir / OUTPUT_FILE_NAME
         arguments = {
             name: self._resolve_value(value, execution, upstream, staged_dir)
@@ -858,7 +889,7 @@ class PipelineRunner:
         materialization_started = time.monotonic()
         cache_restored = (
             cache_dir is not None
-            and self._restore_cache(step, cache_dir, workdir)
+            and self._restore_cache(execution, cache_dir, workdir)
         )
         if cache_restored:
             outputs = json.loads((cache_dir / "outputs.json").read_text())
@@ -930,7 +961,7 @@ class PipelineRunner:
             pipeline, execution, workdir, result_dir,
         )
         if cache_dir is not None:
-            self._store_cache(step, cache_dir, workdir, outputs)
+            self._store_cache(execution, cache_dir, workdir, outputs)
         return ExecutionResult(
             step_id=step.id,
             identity=execution.identity,
@@ -1036,6 +1067,30 @@ class PipelineRunner:
                 f"got {type(value).__name__}"
             )
 
+    @staticmethod
+    def _artifact_path(
+        execution: StepExecution,
+        name: str,
+        spec: ArtifactDefinition,
+    ) -> Path:
+        def replace(match: re.Match[str]) -> str:
+            dimension = match.group(1)
+            if dimension not in execution.values:
+                raise ValueError(
+                    f"step {execution.step.id!r} artifact {name!r} references "
+                    f"unavailable matrix dimension {dimension!r}"
+                )
+            return str(execution.values[dimension])
+
+        resolved = ARTIFACT_MATRIX_REF_RE.sub(replace, spec.path)
+        path = Path(resolved)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(
+                f"step {execution.step.id!r} artifact {name!r} resolved to "
+                f"unsafe path {resolved!r}"
+            )
+        return path
+
     def _collect_artifacts(
         self,
         pipeline: PipelineDefinition,
@@ -1047,7 +1102,8 @@ class PipelineRunner:
         digests: dict[str, str] = {}
         saved: dict[str, str] = {}
         for name, spec in execution.step.artifacts.items():
-            source = workdir / spec.path
+            artifact_path = self._artifact_path(execution, name, spec)
+            source = workdir / artifact_path
             if not source.exists():
                 raise FileNotFoundError(
                     f"step {execution.step.id!r} declared missing artifact "
@@ -1167,8 +1223,9 @@ class PipelineRunner:
 
     @staticmethod
     def _restore_cache(
-        step: StepDefinition, cache_dir: Path, workdir: Path,
+        execution: StepExecution, cache_dir: Path, workdir: Path,
     ) -> bool:
+        step = execution.step
         manifest = cache_dir / "outputs.json"
         archive = cache_dir / "artifacts.tar.gz"
         if not manifest.is_file() or not archive.is_file():
@@ -1176,8 +1233,10 @@ class PipelineRunner:
         try:
             with tarfile.open(archive, "r:gz") as tf:
                 names = [Path(member.name) for member in tf.getmembers()]
-            for artifact in step.artifacts.values():
-                expected = Path(artifact.path)
+            for name, artifact in step.artifacts.items():
+                expected = PipelineRunner._artifact_path(
+                    execution, name, artifact,
+                )
                 if not any(
                     name == expected or expected in name.parents
                     for name in names
@@ -1187,25 +1246,28 @@ class PipelineRunner:
         except (OSError, tarfile.TarError, json.JSONDecodeError):
             return False
         _safe_extract(archive, workdir)
-        for artifact in step.artifacts.values():
-            if not (workdir / artifact.path).exists():
+        for name, artifact in step.artifacts.items():
+            path = PipelineRunner._artifact_path(execution, name, artifact)
+            if not (workdir / path).exists():
                 return False
         return True
 
     @staticmethod
     def _store_cache(
-        step: StepDefinition,
+        execution: StepExecution,
         cache_dir: Path,
         workdir: Path,
         outputs: dict[str, Any],
     ) -> None:
+        step = execution.step
         cache_dir.mkdir(parents=True, exist_ok=True)
         archive_tmp = cache_dir / ".artifacts.tar.gz.tmp"
         outputs_tmp = cache_dir / ".outputs.json.tmp"
         with tarfile.open(archive_tmp, "w:gz") as tf:
-            for artifact in step.artifacts.values():
-                source = workdir / artifact.path
-                tf.add(source, arcname=artifact.path)
+            for name, artifact in step.artifacts.items():
+                path = PipelineRunner._artifact_path(execution, name, artifact)
+                source = workdir / path
+                tf.add(source, arcname=path)
         outputs_tmp.write_text(json.dumps(outputs, indent=2, sort_keys=True))
         os.replace(archive_tmp, cache_dir / "artifacts.tar.gz")
         os.replace(outputs_tmp, cache_dir / "outputs.json")

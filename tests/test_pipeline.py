@@ -92,6 +92,41 @@ def test_parse_infers_dimensions_and_projects_matrix():
     assert len(expanded["benchmark"]) == 8
 
 
+def test_artifact_path_expression_infers_dimension():
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {"process": ["a", "b"], "backend": ["cuda", "cpp"]},
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "artifacts": {
+                "gridpack": {
+                    "path": "gridpacks/${{ matrix.process }}.tar.gz",
+                },
+            },
+        }],
+    }, source="test")
+
+    assert pipeline.steps[0].dimensions == ["process"]
+    assert len(build_step_executions(pipeline)["build"]) == 2
+
+
+def test_artifact_path_expression_rejects_unknown_dimension():
+    with pytest.raises(ValueError, match="unknown matrix dimensions"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "build",
+                "script": "build.sh",
+                "artifacts": {
+                    "gridpack": {
+                        "path": "gridpacks/${{ matrix.missing }}.tar.gz",
+                    },
+                },
+            }],
+        }, source="test")
+
+
 def test_zip_constructs_global_points_before_step_projection():
     pipeline = parse_pipeline({
         "name": "p",
@@ -287,6 +322,69 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
         "execution_time", "materialization_time", "total_time",
     }.issubset(timing_rows[0])
     assert len(list((result_dir / "artifacts" / "compile").rglob("executable"))) == 2
+
+
+def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "build.sh",
+        'process=$1\n'
+        'mkdir -p gridpacks\n'
+        'printf "%s" "$process" > "gridpacks/${process}.tar.gz"\n',
+    )
+    raw = {
+        "name": "dynamic_artifact",
+        "matrix": {"process": ["one", "two"]},
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "with": {"process": "${{ matrix.process }}"},
+            "artifacts": {
+                "gridpack": {
+                    "path": "gridpacks/${{ matrix.process }}.tar.gz",
+                    "save": True,
+                },
+            },
+            "cache": True,
+        }],
+    }
+    path = make_pipeline(root, raw)
+    runner = MadBench(find_workspace(root))
+    runner.run(path)
+    runner.run(path)
+
+    result_dirs = sorted((root / "results" / "dynamic_artifact").iterdir())
+    assert len(result_dirs) == 2
+    latest = json.loads((result_dirs[-1] / "result.json").read_text())
+    assert {step["cache"] for step in latest["steps"]} == {"hit"}
+    artifact_paths = {
+        Path(step["artifacts"]["gridpack"]["path"])
+        for step in latest["steps"]
+    }
+    assert {path.name for path in artifact_paths} == {
+        "one.tar.gz", "two.tar.gz",
+    }
+
+
+def test_pipeline_rejects_unsafe_resolved_artifact_path(tmp_path):
+    root = make_workspace(tmp_path)
+    marker = root / "script-ran"
+    make_script(root, "build.sh", f"touch {marker}\n")
+    path = make_pipeline(root, {
+        "name": "unsafe_artifact",
+        "matrix": {"artifact_path": ["../escape"]},
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "artifacts": {
+                "product": {"path": "${{ matrix.artifact_path }}"},
+            },
+        }],
+    })
+    with pytest.raises(ValueError, match="resolved to unsafe path"):
+        MadBench(find_workspace(root)).run(path)
+    assert not marker.exists()
 
 
 def test_input_wrapper_requires_staged_file(tmp_path):

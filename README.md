@@ -503,6 +503,20 @@ artifacts:
     save: true
 ```
 
+Artifact paths may contain matrix expressions. This is useful when a script
+produces a meaningfully named file:
+
+```yaml
+artifacts:
+  gridpack:
+    path: gridpacks/${{ matrix.process }}.tar.gz
+    save: true
+```
+
+Artifact-path expressions are also inferred as step dimensions. After
+resolution, paths must remain relative to the step work directory and cannot
+contain parent traversal.
+
 Every artifact is available to later steps:
 
 ```yaml
