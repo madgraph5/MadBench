@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import itertools
@@ -70,6 +71,7 @@ class StepDefinition:
     outputs: dict[str, Optional[str]]
     artifacts: dict[str, ArtifactDefinition]
     cache: CacheDefinition
+    condition: Any
     repeat: int
     stats: list[str]
     needs: list[str]
@@ -268,6 +270,115 @@ def _normalize_arguments(value: Any, step_id: str) -> dict[str, Any]:
     return {k: _normalize_argument_value(v) for k, v in value.items()}
 
 
+def _condition_tree(value: Any, step_id: str) -> tuple[ast.Expression, list[str]]:
+    if isinstance(value, bool):
+        expression = str(value)
+    elif isinstance(value, str):
+        match = EXPR_RE.match(value)
+        if not match:
+            raise ValueError(
+                f"step {step_id!r} 'if' must be a boolean or a complete "
+                "${{ ... }} expression"
+            )
+        expression = match.group(1).strip()
+    else:
+        raise ValueError(
+            f"step {step_id!r} 'if' must be a boolean or expression"
+        )
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(
+            f"step {step_id!r} has invalid 'if' expression: {expression!r}"
+        ) from exc
+
+    dimensions: list[str] = []
+
+    def validate(node: ast.AST) -> None:
+        if isinstance(node, ast.Expression):
+            validate(node.body)
+        elif isinstance(node, ast.Constant):
+            if not isinstance(node.value, (str, int, float, bool, type(None))):
+                raise ValueError
+        elif isinstance(node, ast.Attribute):
+            if not isinstance(node.value, ast.Name) or node.value.id != "matrix":
+                raise ValueError
+            dimensions.append(node.attr)
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            for child in node.elts:
+                validate(child)
+        elif isinstance(node, ast.BoolOp) and isinstance(
+            node.op, (ast.And, ast.Or),
+        ):
+            for child in node.values:
+                validate(child)
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            validate(node.operand)
+        elif isinstance(node, ast.Compare):
+            validate(node.left)
+            for operator in node.ops:
+                if not isinstance(operator, (
+                    ast.Eq, ast.NotEq, ast.In, ast.NotIn,
+                    ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+                )):
+                    raise ValueError
+            for child in node.comparators:
+                validate(child)
+        else:
+            raise ValueError
+
+    try:
+        validate(tree)
+    except ValueError as exc:
+        raise ValueError(
+            f"step {step_id!r} 'if' uses unsupported syntax; conditions support "
+            "matrix values, literals, comparisons, membership, and/or/not"
+        ) from exc
+    return tree, list(dict.fromkeys(dimensions))
+
+
+def _evaluate_condition(value: Any, dimensions: dict[str, Any], step_id: str) -> bool:
+    tree, _ = _condition_tree(value, step_id)
+
+    def evaluate(node: ast.AST) -> Any:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Attribute):
+            return dimensions[node.attr]
+        if isinstance(node, ast.List):
+            return [evaluate(child) for child in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(evaluate(child) for child in node.elts)
+        if isinstance(node, ast.BoolOp):
+            values = [bool(evaluate(child)) for child in node.values]
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.UnaryOp):
+            return not bool(evaluate(node.operand))
+        if isinstance(node, ast.Compare):
+            left = evaluate(node.left)
+            for operator, comparator in zip(node.ops, node.comparators):
+                right = evaluate(comparator)
+                matches = {
+                    ast.Eq: lambda: left == right,
+                    ast.NotEq: lambda: left != right,
+                    ast.In: lambda: left in right,
+                    ast.NotIn: lambda: left not in right,
+                    ast.Lt: lambda: left < right,
+                    ast.LtE: lambda: left <= right,
+                    ast.Gt: lambda: left > right,
+                    ast.GtE: lambda: left >= right,
+                }[type(operator)]()
+                if not matches:
+                    return False
+                left = right
+            return True
+        raise AssertionError(f"unvalidated condition node: {type(node).__name__}")
+
+    return bool(evaluate(tree))
+
+
 def _extract_references(value: Any) -> tuple[list[str], list[str], list[str]]:
     matrix: list[str] = []
     steps: list[str] = []
@@ -376,6 +487,10 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             )
         arguments = _normalize_arguments(step_raw.get("with"), step_id)
         artifacts = _normalize_artifacts(step_raw.get("artifacts"), step_id)
+        condition = step_raw.get("if")
+        condition_dimensions: list[str] = []
+        if condition is not None:
+            _, condition_dimensions = _condition_tree(condition, step_id)
         if action == "madgraph/process":
             if "mg_version" not in matrix:
                 raise ValueError(
@@ -397,7 +512,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             )
         ]
         direct_dimensions = list(dict.fromkeys(
-            direct_dimensions + artifact_dimensions
+            direct_dimensions + artifact_dimensions + condition_dimensions
         ))
         unknown_dimensions = set(direct_dimensions) - set(matrix)
         if unknown_dimensions:
@@ -440,6 +555,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             outputs=outputs,
             artifacts=artifacts,
             cache=_normalize_cache(step_raw.get("cache"), step_id),
+            condition=condition,
             repeat=repeat,
             stats=stats,
             needs=needs,
@@ -683,16 +799,19 @@ class PipelineRunner:
         for step in pipeline.steps:
             step_results: list[ExecutionResult] = []
             for execution in expanded[step.id]:
-                upstream, blocked = self._select_upstream(
-                    execution, pipeline, result_index,
+                should_run = (
+                    step.condition is None
+                    or _evaluate_condition(
+                        step.condition, execution.values, step.id,
+                    )
                 )
-                if blocked:
+                if not should_run:
                     result = ExecutionResult(
                         step_id=step.id,
                         identity=execution.identity,
                         dimensions=execution.values,
                         repetition=execution.repetition,
-                        status="blocked",
+                        status="skipped",
                         exit_code=None,
                         execution_time=None,
                         materialization_time=None,
@@ -703,17 +822,39 @@ class PipelineRunner:
                         artifacts={},
                         artifact_digests={},
                         workdir="",
-                        blocked_by=blocked,
                     )
                 else:
-                    result = self._execute(
-                        pipeline=pipeline,
-                        execution=execution,
-                        upstream=upstream,
-                        run_dir=run_dir,
-                        staged_dir=staged_dir,
-                        result_dir=result_dir,
+                    upstream, blocked = self._select_upstream(
+                        execution, pipeline, result_index,
                     )
+                    if blocked:
+                        result = ExecutionResult(
+                            step_id=step.id,
+                            identity=execution.identity,
+                            dimensions=execution.values,
+                            repetition=execution.repetition,
+                            status="blocked",
+                            exit_code=None,
+                            execution_time=None,
+                            materialization_time=None,
+                            total_time=0.0,
+                            cache="not-applicable",
+                            arguments={},
+                            outputs={},
+                            artifacts={},
+                            artifact_digests={},
+                            workdir="",
+                            blocked_by=blocked,
+                        )
+                    else:
+                        result = self._execute(
+                            pipeline=pipeline,
+                            execution=execution,
+                            upstream=upstream,
+                            run_dir=run_dir,
+                            staged_dir=staged_dir,
+                            result_dir=result_dir,
+                        )
                 step_results.append(result)
                 all_results.append(result)
                 self._write_manifest(result_dir, manifest, all_results)
@@ -1494,6 +1635,12 @@ class PipelineRunner:
             n_identities = len({
                 execution.identity for execution in expanded[step.id]
             })
+            eligible = [
+                execution for execution in expanded[step.id]
+                if step.condition is None or _evaluate_condition(
+                    step.condition, execution.values, step.id,
+                )
+            ]
             print(f"[madbench] Step {step.id}:")
             print(f"  kind: {'script' if step.script else 'action'}")
             print(f"  target: {step.script or step.action}")
@@ -1501,5 +1648,9 @@ class PipelineRunner:
             print(f"  executions: {n_identities}")
             print(f"  repetitions: {step.repeat}")
             print(f"  total runs: {len(expanded[step.id])}")
+            if step.condition is not None:
+                print(f"  if: {step.condition}")
+                print(f"  eligible runs: {len(eligible)}")
+                print(f"  skipped runs: {len(expanded[step.id]) - len(eligible)}")
             print(f"  upstream: {step.upstream_steps}")
             print(f"  cache: {'enabled' if step.cache.enabled else 'disabled'}")

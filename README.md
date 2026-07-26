@@ -196,6 +196,29 @@ Use `madbench run TEST.yml --dry-run` to inspect the global matrix size,
 inferred dimensions, execution count, repetitions, dependencies, and cache
 configuration before running anything.
 
+## Conditional steps
+
+A step can use `if` to run only for selected matrix points:
+
+```yaml
+- id: profile
+  script: profile.sh
+  if: ${{ matrix.backend == 'cuda' }}
+  with:
+    executable: ${{ steps.compile.artifacts.executable }}
+    backend: ${{ matrix.backend }}
+```
+
+Conditions support matrix values, literals, `==`, `!=`, `<`, `<=`, `>`, `>=`,
+`in`, `not in`, `and`, `or`, `not`, and parentheses. Matrix values referenced
+only by `if` are inferred as step dimensions.
+
+A false condition records the execution as `skipped` without invoking its
+script, action, or cache. A later execution that consumes a skipped step is
+blocked, unless its own condition also skips that execution. Skipped final
+steps remain in `results.csv`, along with outputs inherited from successful
+earlier steps.
+
 ## Step arguments
 
 `with` is an ordered mapping. Values are passed to scripts positionally in

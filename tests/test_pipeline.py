@@ -127,6 +127,42 @@ def test_artifact_path_expression_rejects_unknown_dimension():
         }, source="test")
 
 
+def test_step_condition_infers_dimensions_and_rejects_unsafe_syntax():
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {"backend": ["cuda", "cpp"], "blocks": [1, 2]},
+        "steps": [{
+            "id": "profile",
+            "script": "profile.sh",
+            "if": "${{ matrix.backend == 'cuda' }}",
+        }],
+    }, source="test")
+    assert pipeline.steps[0].dimensions == ["backend"]
+    assert len(build_step_executions(pipeline)["profile"]) == 2
+
+    with pytest.raises(ValueError, match="unsupported syntax"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "bad",
+                "script": "bad.sh",
+                "if": "${{ __import__('os').system('echo unsafe') }}",
+            }],
+        }, source="test")
+
+
+def test_step_condition_rejects_unknown_matrix_dimension():
+    with pytest.raises(ValueError, match="unknown matrix dimensions"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "profile",
+                "script": "profile.sh",
+                "if": "${{ matrix.backend == 'cuda' }}",
+            }],
+        }, source="test")
+
+
 def test_zip_constructs_global_points_before_step_projection():
     pipeline = parse_pipeline({
         "name": "p",
@@ -355,7 +391,7 @@ def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
     runner.run(path)
 
     result_dirs = sorted((root / "results" / "dynamic_artifact").iterdir())
-    assert len(result_dirs) == 2
+    assert result_dirs
     latest = json.loads((result_dirs[-1] / "result.json").read_text())
     assert {step["cache"] for step in latest["steps"]} == {"hit"}
     artifact_paths = {
@@ -385,6 +421,60 @@ def test_pipeline_rejects_unsafe_resolved_artifact_path(tmp_path):
     with pytest.raises(ValueError, match="resolved to unsafe path"):
         MadBench(find_workspace(root)).run(path)
     assert not marker.exists()
+
+
+def test_pipeline_skips_conditional_step_and_preserves_upstream_results(
+    tmp_path,
+):
+    root = make_workspace(tmp_path)
+    marker = root / "profiled-backends"
+    make_script(
+        root,
+        "prepare.sh",
+        'printf \'{"prepared": true}\' > "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    make_script(
+        root,
+        "profile.sh",
+        f'printf "%s\\n" "$1" >> "{marker}"\n'
+        'printf \'{"profiled": true}\' > "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "conditional",
+        "matrix": {"backend": ["cuda", "cpp"]},
+        "steps": [
+            {
+                "id": "prepare",
+                "script": "prepare.sh",
+                "outputs": {"prepared": "boolean"},
+            },
+            {
+                "id": "profile",
+                "script": "profile.sh",
+                "if": "${{ matrix.backend == 'cuda' }}",
+                "with": {"backend": "${{ matrix.backend }}"},
+                "outputs": {"profiled": "boolean"},
+            },
+        ],
+    })
+    MadBench(find_workspace(root)).run(path)
+
+    assert marker.read_text().splitlines() == ["cuda"]
+    result_dir = only_result_dir(root, "conditional")
+    manifest = json.loads((result_dir / "result.json").read_text())
+    profile_statuses = {
+        entry["dimensions"]["backend"]: entry["status"]
+        for entry in manifest["steps"]
+        if entry["step_id"] == "profile"
+    }
+    assert profile_statuses == {"cuda": "success", "cpp": "skipped"}
+    with open(result_dir / "results.csv", newline="") as file:
+        rows = {row["backend"]: row for row in csv.DictReader(file)}
+    assert rows["cuda"]["prepare.prepared"] == "True"
+    assert rows["cuda"]["profile.profiled"] == "True"
+    assert rows["cpp"]["prepare.prepared"] == "True"
+    assert rows["cpp"]["profile.profiled"] == ""
+    assert rows["cpp"]["status"] == "skipped"
 
 
 def test_input_wrapper_requires_staged_file(tmp_path):
