@@ -252,6 +252,30 @@ ${{ steps.STEP_ID.artifacts.NAME }}
 
 A step may reference only earlier steps.
 
+### JSON field arguments
+
+A step argument can select any value from a staged JSON file:
+
+```yaml
+inputs:
+  - inputs/config.json
+
+steps:
+  - id: prepare
+    script: prepare.sh
+    with:
+      settings:
+        from:
+          json: inputs/config.json
+          field: catalogue.defaults.settings
+```
+
+Unlike a JSON source under `matrix`, an argument source does not create
+executions and its selected value does not need to be an array. Objects,
+arrays, strings, numbers, booleans, and null are supported. Objects and arrays
+are retained as structured values in `$MADBENCH_ARGS_FILE` and passed to the
+script's positional argument as compact JSON.
+
 ## Inputs: staging and explicit resolution
 
 Inputs have two related but distinct roles:
@@ -464,6 +488,11 @@ paired proc card and launch card. Given `inputs/processes.json`:
 
 ```json
 {
+  "launch": {
+    "madspin": "OFF",
+    "reweight": "OFF",
+    "generation.events": 10000
+  },
   "processes": [
     {
       "id": "pp_jets",
@@ -475,7 +504,10 @@ paired proc card and launch card. Given `inputs/processes.json`:
       "id": "fcc_ee_zh",
       "model": "sm",
       "process": ["generate e+ e- > z h"],
-      "launch": {"beam.energy": 120}
+      "launch": {
+        "beam.energy": 120,
+        "generation.events": 20000
+      }
     }
   ]
 }
@@ -498,6 +530,10 @@ steps:
     action: madgraph/cards
     with:
       process: ${{ matrix.process }}
+      default_launch:
+        from:
+          json: inputs/processes.json
+          field: launch
 
   - id: generate
     action: madgraph/process
@@ -513,7 +549,9 @@ plans any executions, so dry runs and downstream dimension inference see one
 
 The action requires each selected value to contain `id`, `model`, and a
 non-empty list of MadGraph commands under `process`; `launch` defaults to an
-empty mapping.
+empty mapping. Its optional `default_launch` argument is a mapping of settings
+applied to every process. Settings under the individual process's `launch`
+mapping override defaults with the same name.
 
 The action automatically declares two artifacts:
 
@@ -532,6 +570,9 @@ output fcc_ee_zh
 
 # launch_card.dat
 launch fcc_ee_zh
+set madspin OFF
+set reweight OFF
+set generation.events 20000
 set beam.energy 120
 ```
 

@@ -57,6 +57,14 @@ class JsonMatrixSource:
     field: str
 
 
+@dataclass(frozen=True)
+class JsonArgumentSource:
+    """A step argument loaded from a field in a staged JSON input."""
+
+    path: str
+    field: str
+
+
 @dataclass
 class ArtifactDefinition:
     path: str
@@ -256,6 +264,11 @@ def _normalize_cache(value: Any, step_id: str) -> CacheDefinition:
 def _normalize_argument_value(value: Any) -> Any:
     if isinstance(value, dict) and set(value) == {"input"}:
         return InputArgument(_normalize_argument_value(value["input"]))
+    if isinstance(value, dict) and set(value) == {"from"}:
+        path, field_name = _normalize_json_source(
+            value["from"], "step argument",
+        )
+        return JsonArgumentSource(path=path, field=field_name)
     if isinstance(value, list):
         return [_normalize_argument_value(x) for x in value]
     if isinstance(value, dict):
@@ -279,10 +292,9 @@ def _normalize_arguments(value: Any, step_id: str) -> dict[str, Any]:
     return {k: _normalize_argument_value(v) for k, v in value.items()}
 
 
-def _normalize_matrix_value(value: Any, name: str) -> Any:
-    if not isinstance(value, dict) or set(value) != {"from"}:
-        return value
-    source = value["from"]
+def _normalize_json_source(
+    source: Any, context: str,
+) -> tuple[str, str]:
     if (
         not isinstance(source, dict)
         or set(source) != {"json", "field"}
@@ -292,22 +304,31 @@ def _normalize_matrix_value(value: Any, name: str) -> Any:
         or not source["field"]
     ):
         raise ValueError(
-            f"matrix dimension {name!r} source must contain exactly "
+            f"{context} JSON source must contain exactly "
             "non-empty string 'json' and 'field' values"
         )
     path = Path(source["json"])
     if path.is_absolute() or ".." in path.parts:
         raise ValueError(
-            f"matrix dimension {name!r} JSON path must be safe and "
+            f"{context} JSON path must be safe and "
             "workspace-relative"
         )
     fields = source["field"].split(".")
     if any(not part for part in fields):
         raise ValueError(
-            f"matrix dimension {name!r} field must be a dot-separated "
+            f"{context} JSON field must be a dot-separated "
             "sequence of non-empty names"
         )
-    return JsonMatrixSource(path=source["json"], field=source["field"])
+    return source["json"], source["field"]
+
+
+def _normalize_matrix_value(value: Any, name: str) -> Any:
+    if not isinstance(value, dict) or set(value) != {"from"}:
+        return value
+    path, field_name = _normalize_json_source(
+        value["from"], f"matrix dimension {name!r}",
+    )
+    return JsonMatrixSource(path=path, field=field_name)
 
 
 def _condition_tree(value: Any, step_id: str) -> tuple[ast.Expression, list[str]]:
@@ -425,8 +446,9 @@ def _extract_references(value: Any) -> tuple[list[str], list[str], list[str]]:
     inputs: list[str] = []
 
     def visit(item: Any) -> None:
-        if isinstance(item, InputArgument):
-            visit(item.value)
+        if isinstance(item, (InputArgument, JsonArgumentSource)):
+            if isinstance(item, InputArgument):
+                visit(item.value)
             return
         if isinstance(item, str):
             match = EXPR_RE.match(item)
@@ -656,8 +678,9 @@ def _validate_step_references(
     step: StepDefinition, by_id: dict[str, StepDefinition],
 ) -> None:
     def visit(value: Any) -> None:
-        if isinstance(value, InputArgument):
-            visit(value.value)
+        if isinstance(value, (InputArgument, JsonArgumentSource)):
+            if isinstance(value, InputArgument):
+                visit(value.value)
             return
         if isinstance(value, str):
             match = EXPR_RE.match(value)
@@ -774,6 +797,26 @@ def _path_digest(path: Path) -> str:
             digest.update(str(child.relative_to(path)).encode())
             digest.update(child.read_bytes())
     return digest.hexdigest()
+
+
+def _read_json_field(source: Path, field_name: str, context: str) -> Any:
+    try:
+        selected: Any = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{context} contains invalid JSON: {source}: {exc}"
+        ) from exc
+    traversed: list[str] = []
+    for part in field_name.split("."):
+        traversed.append(part)
+        if not isinstance(selected, dict) or part not in selected:
+            location = ".".join(traversed)
+            raise ValueError(
+                f"{context} field {field_name!r} was not found in {source} "
+                f"(missing {location!r})"
+            )
+        selected = selected[part]
+    return selected
 
 
 def _safe_extract(archive: Path, destination: Path) -> None:
@@ -951,23 +994,9 @@ class PipelineRunner:
                 raise FileNotFoundError(
                     f"matrix dimension {name!r} JSON source not found: {source}"
                 )
-            try:
-                selected: Any = json.loads(source.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"matrix dimension {name!r} source contains invalid JSON: "
-                    f"{source}: {exc}"
-                ) from exc
-            traversed: list[str] = []
-            for field_name in value.field.split("."):
-                traversed.append(field_name)
-                if not isinstance(selected, dict) or field_name not in selected:
-                    location = ".".join(traversed)
-                    raise ValueError(
-                        f"matrix dimension {name!r} field {value.field!r} "
-                        f"was not found in {source} (missing {location!r})"
-                    )
-                selected = selected[field_name]
+            selected = _read_json_field(
+                source, value.field, f"matrix dimension {name!r} source",
+            )
             if not isinstance(selected, list) or not selected:
                 raise ValueError(
                     f"matrix dimension {name!r} field {value.field!r} in "
@@ -1031,6 +1060,21 @@ class PipelineRunner:
         upstream: dict[str, ExecutionResult],
         staged_dir: Path,
     ) -> Any:
+        if isinstance(value, JsonArgumentSource):
+            source = (staged_dir / value.path).resolve()
+            try:
+                source.relative_to(staged_dir.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"JSON argument source escapes the staging root: "
+                    f"{value.path!r}"
+                ) from exc
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"JSON argument source does not exist: {value.path!r} "
+                    f"(expected {source}); declare it under top-level 'inputs'"
+                )
+            return _read_json_field(source, value.field, "step argument source")
         if isinstance(value, InputArgument):
             logical = self._resolve_value(
                 value.value, execution, upstream, staged_dir,
@@ -1171,7 +1215,14 @@ class PipelineRunner:
         with open(stdout, "w") as stdout_file, open(stderr, "w") as stderr_file:
             if step.script is not None:
                 script = resolve_script(self.workspace, step.script)
-                cmd = [str(script)] + [str(value) for value in arguments.values()]
+                cmd = [str(script)] + [
+                    (
+                        json.dumps(value, separators=(",", ":"))
+                        if isinstance(value, (dict, list))
+                        else str(value)
+                    )
+                    for value in arguments.values()
+                ]
                 completed = subprocess.run(
                     cmd,
                     cwd=workdir,
@@ -1297,6 +1348,7 @@ class PipelineRunner:
         model = process.get("model")
         commands = process.get("process")
         launch = process.get("launch", {})
+        default_launch = arguments.get("default_launch", {})
         if (
             not isinstance(process_id, str)
             or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", process_id)
@@ -1325,6 +1377,12 @@ class PipelineRunner:
             raise ValueError(
                 "action 'madgraph/cards' process.launch must be a mapping"
             )
+        if not isinstance(default_launch, dict) or not all(
+            isinstance(name, str) and name for name in default_launch
+        ):
+            raise ValueError(
+                "action 'madgraph/cards' with.default_launch must be a mapping"
+            )
 
         proc_lines = [f"import model {model.strip()}"]
         proc_lines.extend(command.strip() for command in commands)
@@ -1345,9 +1403,10 @@ class PipelineRunner:
             )
 
         launch_lines = [f"launch {process_id}"]
+        launch_values = {**default_launch, **launch}
         launch_lines.extend(
             f"set {name} {launch_value(value)}"
-            for name, value in launch.items()
+            for name, value in launch_values.items()
         )
         (workdir / "launch_card.dat").write_text(
             "\n".join(launch_lines) + "\n", encoding="utf-8",

@@ -735,6 +735,11 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
     inputs = root / "inputs"
     inputs.mkdir()
     (inputs / "processes.json").write_text(json.dumps({
+        "launch": {
+            "madspin": "OFF",
+            "reweight": "OFF",
+            "generation.events": 10000,
+        },
         "catalogue": {
             "processes": [
                 {
@@ -747,7 +752,10 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
                     "id": "fcc_ee_zh",
                     "model": "sm",
                     "process": ["generate e+ e- > z h"],
-                    "launch": {"beam.energy": 120},
+                    "launch": {
+                        "beam.energy": 120,
+                        "generation.events": 20000,
+                    },
                 },
             ],
         },
@@ -758,6 +766,10 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
         'proc_id=$(sed -n "s/^output //p" "$1")\n'
         'launch_id=$(sed -n "s/^launch //p" "$2")\n'
         'test "$proc_id" = "$launch_id"\n'
+        'grep -q "^set madspin OFF$" "$2"\n'
+        'if test "$proc_id" = fcc_ee_zh; then events=20000; '
+        'else events=10000; fi\n'
+        'grep -q "^set generation.events ${events}$" "$2"\n'
         'printf \'{"id": "%s", "backend": "%s"}\' "$proc_id" "$3" '
         '> "$MADBENCH_OUTPUT_FILE"\n',
     )
@@ -777,7 +789,15 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
             {
                 "id": "cards",
                 "action": "madgraph/cards",
-                "with": {"process": "${{ matrix.process }}"},
+                "with": {
+                    "process": "${{ matrix.process }}",
+                    "default_launch": {
+                        "from": {
+                            "json": "inputs/processes.json",
+                            "field": "launch",
+                        },
+                    },
+                },
             },
             {
                 "id": "consume",
@@ -811,3 +831,43 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
         ("fcc_ee_zh", "cpp"),
         ("fcc_ee_zh", "cuda"),
     }
+
+
+def test_json_argument_source_passes_nested_value_as_json_to_script(tmp_path):
+    root = make_workspace(tmp_path)
+    inputs = root / "inputs"
+    inputs.mkdir()
+    (inputs / "config.json").write_text(json.dumps({
+        "nested": {
+            "settings": [["madspin", "OFF"], ["generation.events", 10000]],
+        },
+    }))
+    make_script(
+        root,
+        "check_json_arg.sh",
+        'test "$1" = \'[["madspin","OFF"],["generation.events",10000]]\'\n'
+        'python -c \'import json, os; '
+        'assert json.load(open(os.environ["MADBENCH_ARGS_FILE"]))["settings"]'
+        ' == [["madspin", "OFF"], ["generation.events", 10000]]\'\n',
+    )
+    path = make_pipeline(root, {
+        "name": "json_argument",
+        "inputs": ["inputs/config.json"],
+        "steps": [{
+            "id": "check",
+            "script": "check_json_arg.sh",
+            "with": {
+                "settings": {
+                    "from": {
+                        "json": "inputs/config.json",
+                        "field": "nested.settings",
+                    },
+                },
+            },
+        }],
+    })
+    MadBench(find_workspace(root)).run(path)
+    result = json.loads(
+        (only_result_dir(root, "json_argument") / "result.json").read_text()
+    )
+    assert result["steps"][0]["status"] == "success"
