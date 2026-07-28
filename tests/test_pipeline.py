@@ -212,6 +212,72 @@ def test_action_requires_mg_version_and_proc_card():
         }, source="test")
 
 
+def test_cards_action_requires_process_and_declares_default_artifacts():
+    with pytest.raises(ValueError, match="with.process"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{"id": "cards", "action": "madgraph/cards"}],
+        }, source="test")
+
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {
+            "process": [{
+                "id": "pp_jets",
+                "model": "sm",
+                "process": ["generate p p > j j"],
+                "launch": {},
+            }],
+        },
+        "steps": [{
+            "id": "cards",
+            "action": "madgraph/cards",
+            "with": {"process": "${{ matrix.process }}"},
+        }],
+    }, source="test")
+    assert pipeline.steps[0].artifacts["proc_card"].path == "proc_card.dat"
+    assert pipeline.steps[0].artifacts["launch_card"].path == "launch_card.dat"
+
+
+def test_json_matrix_source_is_validated_before_expansion():
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {
+            "process": {
+                "from": {
+                    "json": "inputs/processes.json",
+                    "field": "benchmarks.processes",
+                },
+            },
+        },
+        "steps": [{
+            "id": "cards",
+            "action": "madgraph/cards",
+            "with": {"process": "${{ matrix.process }}"},
+        }],
+    }, source="test")
+    source = pipeline.matrix["process"]
+    assert source.path == "inputs/processes.json"
+    assert source.field == "benchmarks.processes"
+    with pytest.raises(ValueError, match="unresolved JSON matrix sources"):
+        build_matrix_points(pipeline)
+
+    with pytest.raises(ValueError, match="exactly.*'json'.*'field'"):
+        parse_pipeline({
+            "name": "p",
+            "matrix": {
+                "process": {
+                    "from": {"json": "inputs/processes.json"},
+                },
+            },
+            "steps": [{
+                "id": "cards",
+                "action": "madgraph/cards",
+                "with": {"process": "${{ matrix.process }}"},
+            }],
+        }, source="test")
+
+
 def test_unknown_or_forward_step_references_are_rejected():
     with pytest.raises(ValueError, match="not earlier"):
         parse_pipeline({
@@ -620,3 +686,128 @@ def test_madgraph_process_action(tmp_path):
     MadBench(find_workspace(root)).run(path)
     result_dir = only_result_dir(root, "action")
     assert list((result_dir / "artifacts").rglob("value"))
+
+
+def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "check_cards.sh",
+        'grep -q "^import model sm$" "$1"\n'
+        'grep -q "^generate e+ e- > z h$" "$1"\n'
+        'grep -q "^output fcc_ee_zh$" "$1"\n'
+        'grep -q "^launch fcc_ee_zh$" "$2"\n'
+        'grep -q "^set beam.energy 120$" "$2"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "cards",
+        "matrix": {
+            "process": [{
+                "id": "fcc_ee_zh",
+                "model": "sm",
+                "process": ["generate e+ e- > z h"],
+                "launch": {"beam.energy": 120},
+            }],
+        },
+        "steps": [
+            {
+                "id": "cards",
+                "action": "madgraph/cards",
+                "with": {"process": "${{ matrix.process }}"},
+            },
+            {
+                "id": "check",
+                "script": "check_cards.sh",
+                "with": {
+                    "proc_card": "${{ steps.cards.artifacts.proc_card }}",
+                    "launch_card": "${{ steps.cards.artifacts.launch_card }}",
+                },
+            },
+        ],
+    })
+    MadBench(find_workspace(root)).run(path)
+    result = json.loads((only_result_dir(root, "cards") / "result.json").read_text())
+    assert [step["status"] for step in result["steps"]] == ["success", "success"]
+
+
+def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
+    root = make_workspace(tmp_path)
+    inputs = root / "inputs"
+    inputs.mkdir()
+    (inputs / "processes.json").write_text(json.dumps({
+        "catalogue": {
+            "processes": [
+                {
+                    "id": "pp_jets",
+                    "model": "sm",
+                    "process": ["generate p p > j j"],
+                    "launch": {},
+                },
+                {
+                    "id": "fcc_ee_zh",
+                    "model": "sm",
+                    "process": ["generate e+ e- > z h"],
+                    "launch": {"beam.energy": 120},
+                },
+            ],
+        },
+    }))
+    make_script(
+        root,
+        "record_pair.sh",
+        'proc_id=$(sed -n "s/^output //p" "$1")\n'
+        'launch_id=$(sed -n "s/^launch //p" "$2")\n'
+        'test "$proc_id" = "$launch_id"\n'
+        'printf \'{"id": "%s", "backend": "%s"}\' "$proc_id" "$3" '
+        '> "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "json_fanout",
+        "matrix": {
+            "process": {
+                "from": {
+                    "json": "inputs/processes.json",
+                    "field": "catalogue.processes",
+                },
+            },
+            "backend": ["cpp", "cuda"],
+        },
+        "inputs": ["inputs/processes.json"],
+        "steps": [
+            {
+                "id": "cards",
+                "action": "madgraph/cards",
+                "with": {"process": "${{ matrix.process }}"},
+            },
+            {
+                "id": "consume",
+                "script": "record_pair.sh",
+                "with": {
+                    "proc_card": "${{ steps.cards.artifacts.proc_card }}",
+                    "launch_card": "${{ steps.cards.artifacts.launch_card }}",
+                    "backend": "${{ matrix.backend }}",
+                },
+                "outputs": {"id": "string", "backend": "string"},
+            },
+        ],
+    })
+    mb = MadBench(find_workspace(root))
+    mb.run(path)
+    result = json.loads(
+        (only_result_dir(root, "json_fanout") / "result.json").read_text()
+    )
+    cards = [step for step in result["steps"] if step["step_id"] == "cards"]
+    consumers = [
+        step for step in result["steps"] if step["step_id"] == "consume"
+    ]
+    assert len(cards) == 2
+    assert len(consumers) == 4
+    assert {
+        (step["outputs"]["id"], step["outputs"]["backend"])
+        for step in consumers
+    } == {
+        ("pp_jets", "cpp"),
+        ("pp_jets", "cuda"),
+        ("fcc_ee_zh", "cpp"),
+        ("fcc_ee_zh", "cuda"),
+    }

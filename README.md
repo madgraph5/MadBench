@@ -457,6 +457,88 @@ A built-in action names behavior supplied by MadBench:
 
 `script` and `action` are mutually exclusive.
 
+### `madgraph/cards`
+
+This built-in action turns each process selected from a JSON file into a
+paired proc card and launch card. Given `inputs/processes.json`:
+
+```json
+{
+  "processes": [
+    {
+      "id": "pp_jets",
+      "model": "sm",
+      "process": ["generate p p > j j"],
+      "launch": {}
+    },
+    {
+      "id": "fcc_ee_zh",
+      "model": "sm",
+      "process": ["generate e+ e- > z h"],
+      "launch": {"beam.energy": 120}
+    }
+  ]
+}
+```
+
+Load its `processes` field as a matrix dimension:
+
+```yaml
+inputs:
+  - inputs/processes.json
+
+matrix:
+  process:
+    from:
+      json: inputs/processes.json
+      field: processes
+
+steps:
+  - id: cards
+    action: madgraph/cards
+    with:
+      process: ${{ matrix.process }}
+
+  - id: generate
+    action: madgraph/process
+    with:
+      proc_card: ${{ steps.cards.artifacts.proc_card }}
+```
+
+`json` is a safe workspace-relative filename. `field` selects the non-empty
+array used for that dimension and supports dot-separated nested fields, such
+as `catalogue.madgraph.processes`. Matrix sources are loaded before MadBench
+plans any executions, so dry runs and downstream dimension inference see one
+`matrix.process` value per JSON entry.
+
+The action requires each selected value to contain `id`, `model`, and a
+non-empty list of MadGraph commands under `process`; `launch` defaults to an
+empty mapping.
+
+The action automatically declares two artifacts:
+
+```yaml
+${{ steps.cards.artifacts.proc_card }}
+${{ steps.cards.artifacts.launch_card }}
+```
+
+For example, the second matrix entry produces:
+
+```text
+# proc_card.dat
+import model sm
+generate e+ e- > z h
+output fcc_ee_zh
+
+# launch_card.dat
+launch fcc_ee_zh
+set beam.energy 120
+```
+
+A downstream step referencing both artifacts inherits the `process` dimension.
+MadBench therefore selects both files from the same card-generation execution,
+while any additional downstream dimensions form the normal Cartesian product.
+
 ### `madgraph/process`
 
 The initial built-in action invokes:

@@ -12,7 +12,7 @@ import statistics
 import subprocess
 import tarfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,6 +39,7 @@ ARTIFACT_MATRIX_REF_RE = re.compile(
     r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
 )
 INPUT_REF_RE = re.compile(r"^inputs\.([A-Za-z_][A-Za-z0-9_-]*)$")
+BUILTIN_ACTIONS = ("madgraph/cards", "madgraph/process")
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,14 @@ class InputArgument:
     """A value which must resolve below the staged input root."""
 
     value: Any
+
+
+@dataclass(frozen=True)
+class JsonMatrixSource:
+    """A matrix dimension loaded from a field in a workspace JSON file."""
+
+    path: str
+    field: str
 
 
 @dataclass
@@ -270,6 +279,37 @@ def _normalize_arguments(value: Any, step_id: str) -> dict[str, Any]:
     return {k: _normalize_argument_value(v) for k, v in value.items()}
 
 
+def _normalize_matrix_value(value: Any, name: str) -> Any:
+    if not isinstance(value, dict) or set(value) != {"from"}:
+        return value
+    source = value["from"]
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"json", "field"}
+        or not isinstance(source["json"], str)
+        or not source["json"]
+        or not isinstance(source["field"], str)
+        or not source["field"]
+    ):
+        raise ValueError(
+            f"matrix dimension {name!r} source must contain exactly "
+            "non-empty string 'json' and 'field' values"
+        )
+    path = Path(source["json"])
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            f"matrix dimension {name!r} JSON path must be safe and "
+            "workspace-relative"
+        )
+    fields = source["field"].split(".")
+    if any(not part for part in fields):
+        raise ValueError(
+            f"matrix dimension {name!r} field must be a dot-separated "
+            "sequence of non-empty names"
+        )
+    return JsonMatrixSource(path=source["json"], field=source["field"])
+
+
 def _condition_tree(value: Any, step_id: str) -> tuple[ast.Expression, list[str]]:
     if isinstance(value, bool):
         expression = str(value)
@@ -436,6 +476,10 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         isinstance(k, str) for k in matrix
     ):
         raise ValueError("'matrix' must be a mapping")
+    matrix = {
+        key: _normalize_matrix_value(value, key)
+        for key, value in matrix.items()
+    }
     for key, value in matrix.items():
         if isinstance(value, list) and not value:
             raise ValueError(f"matrix dimension {key!r} cannot be empty")
@@ -480,10 +524,10 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             )
         if script is not None and not isinstance(script, str):
             raise ValueError(f"step {step_id!r} script must be a string")
-        if action is not None and action != "madgraph/process":
+        if action is not None and action not in BUILTIN_ACTIONS:
             raise ValueError(
                 f"step {step_id!r} uses unknown action {action!r}; "
-                "available actions: ['madgraph/process']"
+                f"available actions: {list(BUILTIN_ACTIONS)!r}"
             )
         arguments = _normalize_arguments(step_raw.get("with"), step_id)
         artifacts = _normalize_artifacts(step_raw.get("artifacts"), step_id)
@@ -501,6 +545,17 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 raise ValueError(
                     "action 'madgraph/process' requires 'with.proc_card'"
                 )
+        elif action == "madgraph/cards":
+            if "process" not in arguments:
+                raise ValueError(
+                    "action 'madgraph/cards' requires 'with.process'"
+                )
+            artifacts.setdefault(
+                "proc_card", ArtifactDefinition(path="proc_card.dat"),
+            )
+            artifacts.setdefault(
+                "launch_card", ArtifactDefinition(path="launch_card.dat"),
+            )
         direct_dimensions, referenced_steps, referenced_inputs = _extract_references(
             arguments
         )
@@ -632,6 +687,15 @@ def _validate_step_references(
 
 def build_matrix_points(pipeline: PipelineDefinition) -> list[dict[str, Any]]:
     """Expand Cartesian and zipped axes while preserving YAML order."""
+    unresolved = [
+        name for name, value in pipeline.matrix.items()
+        if isinstance(value, JsonMatrixSource)
+    ]
+    if unresolved:
+        raise ValueError(
+            f"unresolved JSON matrix sources: {unresolved}; matrix sources "
+            "must be loaded before expansion"
+        )
     name_to_group: dict[str, int] = {}
     for index, group in enumerate(pipeline.zip_groups):
         for name in group:
@@ -755,6 +819,7 @@ class PipelineRunner:
         dry_run: bool = False,
         note: Optional[str] = None,
     ) -> None:
+        pipeline = self._resolve_matrix_sources(pipeline)
         expanded = build_step_executions(pipeline)
         matrix_points = build_matrix_points(pipeline)
         if dry_run:
@@ -865,6 +930,51 @@ class PipelineRunner:
         self._write_step_timings(pipeline, result_dir, all_results)
         self._write_summary(pipeline, result_dir, result_index)
         print(f"[madbench] Pipeline complete: {result_dir}")
+
+    def _resolve_matrix_sources(
+        self, pipeline: PipelineDefinition,
+    ) -> PipelineDefinition:
+        matrix: dict[str, Any] = {}
+        for name, value in pipeline.matrix.items():
+            if not isinstance(value, JsonMatrixSource):
+                matrix[name] = value
+                continue
+            source = (self.workspace.root / value.path).resolve()
+            try:
+                source.relative_to(self.workspace.root.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"matrix dimension {name!r} JSON source escapes the "
+                    f"workspace: {value.path!r}"
+                ) from exc
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"matrix dimension {name!r} JSON source not found: {source}"
+                )
+            try:
+                selected: Any = json.loads(source.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"matrix dimension {name!r} source contains invalid JSON: "
+                    f"{source}: {exc}"
+                ) from exc
+            traversed: list[str] = []
+            for field_name in value.field.split("."):
+                traversed.append(field_name)
+                if not isinstance(selected, dict) or field_name not in selected:
+                    location = ".".join(traversed)
+                    raise ValueError(
+                        f"matrix dimension {name!r} field {value.field!r} "
+                        f"was not found in {source} (missing {location!r})"
+                    )
+                selected = selected[field_name]
+            if not isinstance(selected, list) or not selected:
+                raise ValueError(
+                    f"matrix dimension {name!r} field {value.field!r} in "
+                    f"{source} must contain a non-empty array"
+                )
+            matrix[name] = selected
+        return replace(pipeline, matrix=matrix)
 
     def _workdir_base(self, pipeline: PipelineDefinition) -> Path:
         if pipeline.workdir is None:
@@ -1138,6 +1248,8 @@ class PipelineRunner:
         stdout: Any,
         stderr: Any,
     ) -> int:
+        if step.action == "madgraph/cards":
+            return self._write_madgraph_cards(arguments, workdir)
         if step.action != "madgraph/process":
             raise RuntimeError(f"unsupported action {step.action!r}")
         proc_card = arguments.get("proc_card")
@@ -1160,6 +1272,87 @@ class PipelineRunner:
             check=False,
         )
         return completed.returncode
+
+    @staticmethod
+    def _write_madgraph_cards(
+        arguments: dict[str, Any], workdir: Path,
+    ) -> int:
+        """Materialize proc and launch cards from one JSON process object."""
+        process = arguments.get("process")
+        if isinstance(process, str):
+            try:
+                process = json.loads(process)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "action 'madgraph/cards' with.process must be a mapping "
+                    "or a JSON object"
+                ) from exc
+        if not isinstance(process, dict):
+            raise ValueError(
+                "action 'madgraph/cards' with.process must be a mapping "
+                "or a JSON object"
+            )
+
+        process_id = process.get("id")
+        model = process.get("model")
+        commands = process.get("process")
+        launch = process.get("launch", {})
+        if (
+            not isinstance(process_id, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", process_id)
+        ):
+            raise ValueError(
+                "action 'madgraph/cards' process.id must be a safe, "
+                "non-empty identifier"
+            )
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(
+                "action 'madgraph/cards' process.model must be a non-empty string"
+            )
+        if (
+            not isinstance(commands, list)
+            or not commands
+            or not all(isinstance(command, str) and command.strip()
+                       for command in commands)
+        ):
+            raise ValueError(
+                "action 'madgraph/cards' process.process must be a non-empty "
+                "list of command strings"
+            )
+        if not isinstance(launch, dict) or not all(
+            isinstance(name, str) and name for name in launch
+        ):
+            raise ValueError(
+                "action 'madgraph/cards' process.launch must be a mapping"
+            )
+
+        proc_lines = [f"import model {model.strip()}"]
+        proc_lines.extend(command.strip() for command in commands)
+        proc_lines.append(f"output {process_id}")
+        (workdir / "proc_card.dat").write_text(
+            "\n".join(proc_lines) + "\n", encoding="utf-8",
+        )
+
+        def launch_value(value: Any) -> str:
+            if value is None:
+                return "None"
+            if isinstance(value, bool):
+                return "True" if value else "False"
+            if isinstance(value, (str, int, float)):
+                return str(value)
+            raise ValueError(
+                "action 'madgraph/cards' launch values must be JSON scalars"
+            )
+
+        launch_lines = [f"launch {process_id}"]
+        launch_lines.extend(
+            f"set {name} {launch_value(value)}"
+            for name, value in launch.items()
+        )
+        (workdir / "launch_card.dat").write_text(
+            "\n".join(launch_lines) + "\n", encoding="utf-8",
+        )
+        return 0
 
     def _read_outputs(
         self, step: StepDefinition, output_file: Path,
