@@ -40,11 +40,11 @@ with:
 The YAML path remains workspace-relative; MadBench passes an absolute path
 below `$MADBENCH_INPUTS` to the step.
 
-To keep a test's execution work and cache outside the workspace, set its
-scratch root:
+To keep a test's execution work and cache outside the workspace, set its work
+root:
 
 ```yaml
-scratch_dir: /scratch/madbench
+workdir: /scratch/madbench
 ```
 
 This creates `/scratch/madbench/<test>_<timestamp>/` for staged inputs and

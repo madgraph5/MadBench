@@ -98,7 +98,6 @@ def test_load_test_basic(tmp_path):
     assert td.inputs == []
     assert td.outputs == []
     assert td.artifacts == []
-    assert td.scratch_dir is None
     assert td.workdir is None
 
 
@@ -123,39 +122,6 @@ def test_load_test_with_new_fields(tmp_path):
     assert td.outputs == ["throughput", "note"]
     assert td.artifacts == ["out.log", "gridpack_{seed}/timings.txt"]
     assert td.workdir == "/tmp/madbench-test"
-
-
-def test_load_test_with_scratch_dir(tmp_path):
-    ws_root = make_workspace(tmp_path)
-    mb = MadBench(find_workspace(ws_root))
-    test_file = make_test_yaml(ws_root, {
-        "name": "t",
-        "script": "hello.sh",
-        "args": {},
-        "scratch_dir": "/tmp/madbench-scratch",
-    })
-
-    td = mb.load_test(test_file)
-
-    assert td.scratch_dir == "/tmp/madbench-scratch"
-    assert td.workdir is None
-
-
-def test_load_test_rejects_scratch_dir_with_legacy_workdir(tmp_path):
-    ws_root = make_workspace(tmp_path)
-    mb = MadBench(find_workspace(ws_root))
-    test_file = make_test_yaml(ws_root, {
-        "name": "t",
-        "script": "hello.sh",
-        "args": {},
-        "scratch_dir": "/tmp/new",
-        "workdir": "/tmp/old",
-    })
-
-    with pytest.raises(ValueError, match="legacy alias"):
-        mb.load_test(test_file)
-
-
 def test_load_test_missing_fields(tmp_path):
     ws_root = make_workspace(tmp_path)
     ws = find_workspace(ws_root)

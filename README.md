@@ -102,13 +102,13 @@ steps:
 Steps execute strictly in declaration order. A step uses exactly one of
 `script` or `action`.
 
-## Scratch and cache placement
+## Work and cache placement
 
-Each test may select a scratch root independently of the workspace:
+Each test may select its work root independently of the workspace:
 
 ```yaml
 name: compile_and_benchmark
-scratch_dir: /scratch/madbench
+workdir: /scratch/madbench
 ```
 
 MadBench then keeps both execution work and the default step cache below that
@@ -121,11 +121,9 @@ root:
     └── compile_and_benchmark/           # reusable step caches
 ```
 
-Relative `scratch_dir` values are resolved from the workspace root. When it is
+Relative `workdir` values are resolved from the workspace root. When it is
 omitted, the workspace-level `workspace.scratch_dir` setting in
-`madbench.yml` is used. The older top-level `workdir` spelling remains
-supported as an alias, but new tests should use `scratch_dir`; declaring both
-is an error.
+`madbench.yml` is used.
 
 This setting does not move durable run records. Result JSON, CSV files, logs,
 and saved artifacts remain under the workspace's configured `results_dir`.
