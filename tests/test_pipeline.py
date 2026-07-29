@@ -92,6 +92,26 @@ def test_parse_infers_dimensions_and_projects_matrix():
     assert len(expanded["benchmark"]) == 8
 
 
+def test_repetitions_are_scheduled_outermost():
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {"process": ["a", "b"]},
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {"process": "${{ matrix.process }}"},
+            "repeat": 2,
+        }],
+    }, source="test")
+
+    executions = build_step_executions(pipeline)["run"]
+
+    assert [
+        (execution.repetition, execution.values["process"])
+        for execution in executions
+    ] == [(1, "a"), (1, "b"), (2, "a"), (2, "b")]
+
+
 def test_artifact_path_expression_infers_dimension():
     pipeline = parse_pipeline({
         "name": "p",
@@ -331,7 +351,7 @@ def test_nested_matrix_members_are_inferred_and_resolved_in_artifact_paths(
     assert pipeline.steps[0].dimensions == ["process"]
     MadBench(find_workspace(root)).run(path)
     manifest = json.loads(
-        (only_result_dir(root, "nested_matrix") / "result.json").read_text()
+        (only_result_dir(root, "nested_matrix") / "report.json").read_text()
     )
     assert {
         step["arguments"]["output"] for step in manifest["steps"]
@@ -403,7 +423,7 @@ def test_labelled_input_can_feed_matrix_and_json_arguments(tmp_path):
 
     MadBench(find_workspace(root)).run(path)
     manifest = json.loads(
-        (only_result_dir(root, "labelled_inputs") / "result.json").read_text()
+        (only_result_dir(root, "labelled_inputs") / "report.json").read_text()
     )
     assert len(manifest["steps"]) == 2
     assert all(step["status"] == "success" for step in manifest["steps"])
@@ -535,8 +555,63 @@ def test_pipeline_reports_live_progress_and_writes_logs_outside_results(
     assert list((log_dirs[0] / "run").rglob("stdout.log"))
     result_dir = only_result_dir(root, "logged")
     assert not (result_dir / "logs").exists()
-    result = json.loads((result_dir / "result.json").read_text())
+    result = json.loads((result_dir / "report.json").read_text())
     assert result["steps"][0]["stdout"].startswith(str(log_dirs[0]))
+
+
+def test_pipeline_updates_partial_csv_views_after_each_final_result(tmp_path):
+    root = make_workspace(tmp_path)
+    results_root = root / "results" / "live"
+    make_script(
+        root,
+        "run.sh",
+        'process=$1\n'
+        'if [ "$MADBENCH_REPETITION" = "02" ] && [ "$process" = "a" ]; then\n'
+        f'  result_csv=$(find "{results_root}" -name results.csv '
+        '-not -path "*/attempts/*")\n'
+        f'  summary_csv=$(find "{results_root}" -name summary.csv)\n'
+        f'  timings_csv=$(find "{results_root}" -name step_timings.csv '
+        '-not -path "*/attempts/*")\n'
+        '  test "$(tail -n +2 "$result_csv" | wc -l)" -eq 2\n'
+        '  test "$(tail -n +2 "$summary_csv" | wc -l)" -eq 2\n'
+        '  test "$(tail -n +2 "$timings_csv" | wc -l)" -eq 2\n'
+        'fi\n'
+        'printf \'{"value": 1}\' > "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "live",
+        "matrix": {"process": ["a", "b"]},
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {"process": "${{ matrix.process }}"},
+            "repeat": 2,
+            "outputs": {"value": "number"},
+            "stats": ["value"],
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+
+    result_dir = only_result_dir(root, "live")
+    with open(result_dir / "results.csv", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert [
+        (row["repetition"], row["process"]) for row in rows
+    ] == [("1", "a"), ("1", "b"), ("2", "a"), ("2", "b")]
+    with open(result_dir / "summary.csv", newline="") as file:
+        summaries = list(csv.DictReader(file))
+    assert all(row["n_expected"] == "2" for row in summaries)
+    assert all(row["n_completed"] == "2" for row in summaries)
+    assert all(row["complete"] == "True" for row in summaries)
+    attempt_dir = result_dir / "attempts" / "try_0"
+    assert (attempt_dir / "report.json").is_file()
+    assert (attempt_dir / "results.csv").read_text() == (
+        result_dir / "results.csv"
+    ).read_text()
+    assert (attempt_dir / "step_timings.csv").read_text() == (
+        result_dir / "step_timings.csv"
+    ).read_text()
 
 
 def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
@@ -608,7 +683,7 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
     MadBench(find_workspace(root)).run(path)
 
     result_dir = only_result_dir(root, "pipe")
-    manifest = json.loads((result_dir / "result.json").read_text())
+    manifest = json.loads((result_dir / "report.json").read_text())
     assert len(manifest["steps"]) == 2 + 8
     assert all(entry["total_time"] >= 0 for entry in manifest["steps"])
     assert all(
@@ -687,7 +762,7 @@ def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
 
     result_dirs = sorted((root / "results" / "dynamic_artifact").iterdir())
     assert result_dirs
-    latest = json.loads((result_dirs[-1] / "result.json").read_text())
+    latest = json.loads((result_dirs[-1] / "report.json").read_text())
     assert {step["cache"] for step in latest["steps"]} == {"hit"}
     artifact_paths = {
         Path(step["artifacts"]["gridpack"]["path"])
@@ -809,7 +884,7 @@ def test_pipeline_skips_conditional_step_and_preserves_upstream_results(
 
     assert marker.read_text().splitlines() == ["cuda"]
     result_dir = only_result_dir(root, "conditional")
-    manifest = json.loads((result_dir / "result.json").read_text())
+    manifest = json.loads((result_dir / "report.json").read_text())
     profile_statuses = {
         entry["dimensions"]["backend"]: entry["status"]
         for entry in manifest["steps"]
@@ -870,7 +945,7 @@ def test_failed_matrix_branch_blocks_only_its_downstream_branch(tmp_path):
     })
     MadBench(find_workspace(root)).run(path)
     manifest = json.loads(
-        (only_result_dir(root, "branches") / "result.json").read_text(),
+        (only_result_dir(root, "branches") / "report.json").read_text(),
     )
     statuses = [
         (entry["step_id"], entry["dimensions"]["case"], entry["status"])
@@ -922,7 +997,7 @@ def test_step_cache_restores_outputs_and_artifacts(tmp_path):
     mb.run(path)
     assert counter.read_text() == "1"
     result_dirs = sorted((root / "results" / "cached").iterdir())
-    second = json.loads((result_dirs[-1] / "result.json").read_text())
+    second = json.loads((result_dirs[-1] / "report.json").read_text())
     assert second["steps"][0]["cache"] == "hit"
     assert second["steps"][0]["outputs"]["count"] == 1
     assert second["steps"][0]["execution_time"] is None
@@ -998,7 +1073,7 @@ def test_madgraph_process_action(tmp_path):
     runner.run(path)
     runner.run(path)
     result_dir = sorted((root / "results" / "action").iterdir())[-1]
-    result = json.loads((result_dir / "result.json").read_text())
+    result = json.loads((result_dir / "report.json").read_text())
     step = result["steps"][0]
     assert step["cache"] == "hit"
     workspace = Path(step["artifacts"]["process_workspace"]["path"])
@@ -1070,7 +1145,9 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         ],
     })
     MadBench(find_workspace(root)).run(path)
-    result = json.loads((only_result_dir(root, "cards") / "result.json").read_text())
+    result = json.loads(
+        (only_result_dir(root, "cards") / "report.json").read_text()
+    )
     assert [step["status"] for step in result["steps"]] == ["success", "success"]
 
 
@@ -1173,7 +1250,7 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
     mb = MadBench(find_workspace(root))
     mb.run(path)
     result = json.loads(
-        (only_result_dir(root, "json_fanout") / "result.json").read_text()
+        (only_result_dir(root, "json_fanout") / "report.json").read_text()
     )
     cards = [step for step in result["steps"] if step["step_id"] == "cards"]
     consumers = [
@@ -1243,6 +1320,6 @@ def test_json_argument_source_passes_nested_value_as_json_to_script(tmp_path):
     })
     MadBench(find_workspace(root)).run(path)
     result = json.loads(
-        (only_result_dir(root, "json_argument") / "result.json").read_text()
+        (only_result_dir(root, "json_argument") / "report.json").read_text()
     )
     assert result["steps"][0]["status"] == "success"

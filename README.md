@@ -924,11 +924,12 @@ Preparation and compilation steps run once for each inferred matrix identity.
 Their artifacts are reused by every repetition of the final step.
 
 Each repetition receives its own work directory, output file, logs, and
-`MADBENCH_REPETITION` value.
+`MADBENCH_REPETITION` value. Repetition is the outer scheduling loop: rep 1
+runs for every final-step matrix point before rep 2 begins.
 
-`summary.csv` reports mean, standard deviation, successful count, and failed
-count for declared `stats`. When `stats` is omitted, numeric final-step
-outputs are selected.
+The live `summary.csv` reports mean, standard deviation, completion state, and
+successful/failed/blocked/skipped counts for declared `stats`. When `stats`
+is omitted, numeric final-step outputs are selected.
 
 Repeating an arbitrary range of steps is intentionally deferred.
 
@@ -957,10 +958,15 @@ Every run creates:
 ```text
 results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
-├── result.json
-├── results.csv
-├── step_timings.csv
-├── summary.csv
+├── report.json                    # live merged deep execution state
+├── results.csv                    # live final-step repetitions
+├── step_timings.csv               # live timings for every step
+├── summary.csv                    # live aggregate final-step statistics
+├── attempts/
+│   └── try_0/
+│       ├── report.json
+│       ├── results.csv
+│       └── step_timings.csv
 └── artifacts/
     └── <step>/<mg_version>/<rep>/<published path>
 
@@ -971,7 +977,12 @@ logs/<pipeline>/<hostname>_<timestamp>/
     └── stderr.log
 ```
 
-`result.json` is canonical. It records:
+All four top-level result views are created before the first step runs and
+updated atomically after every completed, failed, skipped, or blocked
+execution. Readers therefore see either the previous complete snapshot or the
+new one, never a partially written CSV or JSON file.
+
+`report.json` is the canonical deep-tracking record. It records:
 
 - Pipeline metadata and original matrix.
 - Hardware, software, and Git revision.
@@ -983,6 +994,7 @@ logs/<pipeline>/<hostname>_<timestamp>/
 - Outputs and artifact digests.
 - Per-execution stdout and stderr log paths.
 - Repetitions and blocked dependencies.
+- Attempt reports and their locations.
 
 During execution, `main.log` is mirrored to the terminal. It announces each
 step and execution with its matrix dimensions, repetition, cache result,
@@ -990,12 +1002,15 @@ timing, and exact stdout/stderr paths before the subprocess starts, making
 long-running logs immediately tail-able. Hashed execution directories remain
 stable internal identities; `main.log` is their human-readable index.
 
-`results.csv` is a flattened view of final-step observations. Upstream values
-are repeated where necessary and use qualified column names.
+`results.csv` is the readily plottable repetition-level view. It contains one
+row for every final-step execution and repetition recorded so far. Upstream
+values are repeated where necessary and use qualified column names. It is
+rewritten after every execution, so a long-running test can be inspected or
+plotted without waiting for completion.
 
-`step_timings.csv` is the CI-like timing view. It contains one row for every
-step execution and repetition, including its matrix dimensions, status,
-cache state, and three timing fields:
+`step_timings.csv` is the live CI-like timing view. It contains one row for
+every step execution and repetition recorded so far, including its matrix
+dimensions, status, cache state, and three timing fields:
 
 - `execution_time`: time spent running the script or built-in action. It is
   empty on cache hits because nothing executed.
@@ -1006,11 +1021,31 @@ cache state, and three timing fields:
   argument preparation, execution or cache restoration, output validation,
   artifact collection, and cache storage where applicable.
 
-The same fields are retained for every execution in `result.json`. Blocked
+The same fields are retained for every execution in `report.json`. Blocked
 steps have no execution or materialization duration and a zero total because
 they are recorded without being scheduled.
 
-`summary.csv` is created when the final step repeats.
+`summary.csv` is the live aggregate view and is always created, including for
+single-repetition pipelines. For each final-step matrix identity it contains
+the requested `stats` means and standard deviations plus `n_successful`,
+`n_failed`, `n_blocked`, `n_skipped`, `n_completed`, `n_expected`, and
+`complete`. Only successful repetitions contribute to statistics.
+
+Final-step repetitions are scheduled outermost:
+
+```text
+rep 1: every final-step matrix point
+rep 2: every final-step matrix point
+...
+```
+
+This makes `results.csv` broadly representative as early as possible: once
+rep 1 finishes, every matrix point has one observation available for plotting.
+
+The top-level files are the current merged campaign view. Files under
+`attempts/try_0/` record only the initial attempt. Pipeline retry is not yet
+implemented, but future retries will add `try_1`, `try_2`, and so on while
+updating the top-level merged views.
 
 ## Failure behavior
 

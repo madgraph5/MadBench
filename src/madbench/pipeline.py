@@ -888,9 +888,9 @@ def build_step_executions(
             values = {name: point[name] for name in step.dimensions}
             unique.setdefault(_canonical(values), values)
         executions: list[StepExecution] = []
-        for values in unique.values():
-            identity = _short_identity(step.id, values)
-            for repetition in range(1, step.repeat + 1):
+        for repetition in range(1, step.repeat + 1):
+            for values in unique.values():
+                identity = _short_identity(step.id, values)
                 executions.append(StepExecution(
                     step=step,
                     values=values,
@@ -1052,7 +1052,9 @@ class PipelineRunner:
         base = self._workdir_base(pipeline)
         run_dir = base / f"{pipeline.name}_{timestamp}"
         staged_dir = run_dir / STAGED_DIR_NAME
+        attempt_dir = result_dir / "attempts" / "try_0"
         result_dir.mkdir(parents=True, exist_ok=True)
+        attempt_dir.mkdir(parents=True, exist_ok=True)
         run_dir.mkdir(parents=True, exist_ok=True)
         if pipeline.inputs:
             stage_inputs(self.workspace.root, pipeline.inputs, staged_dir)
@@ -1074,6 +1076,10 @@ class PipelineRunner:
             "zip": pipeline.zip_groups,
             "matrix_points": matrix_points,
             "staged_inputs": self._staged_input_manifest(staged_dir),
+            "attempts": [{
+                "id": "try_0",
+                "report": "attempts/try_0/report.json",
+            }],
             "steps": [],
         }
 
@@ -1089,14 +1095,15 @@ class PipelineRunner:
                     run_dir=run_dir,
                     staged_dir=staged_dir,
                     result_dir=result_dir,
+                    attempt_dir=attempt_dir,
                     log_dir=log_dir,
                     manifest=manifest,
                     progress=progress,
                 )
-                self._write_manifest(result_dir, manifest, all_results)
-                self._write_flat_csv(pipeline, result_dir, result_index)
-                self._write_step_timings(pipeline, result_dir, all_results)
-                self._write_summary(pipeline, result_dir, result_index)
+                self._write_live_views(
+                    pipeline, result_dir, attempt_dir, manifest,
+                    result_index, all_results,
+                )
             except Exception as exc:
                 progress.log(f"[madbench] Pipeline failed: {exc}")
                 raise
@@ -1110,12 +1117,19 @@ class PipelineRunner:
         run_dir: Path,
         staged_dir: Path,
         result_dir: Path,
+        attempt_dir: Path,
         log_dir: Path,
         manifest: dict[str, Any],
         progress: MainLog,
     ) -> tuple[dict[str, list[ExecutionResult]], list[ExecutionResult]]:
-        result_index: dict[str, list[ExecutionResult]] = {}
+        result_index: dict[str, list[ExecutionResult]] = {
+            step.id: [] for step in pipeline.steps
+        }
         all_results: list[ExecutionResult] = []
+        self._write_live_views(
+            pipeline, result_dir, attempt_dir, manifest,
+            result_index, all_results,
+        )
         step_count = len(pipeline.steps)
         for step_number, step in enumerate(pipeline.steps, start=1):
             step_results: list[ExecutionResult] = []
@@ -1211,7 +1225,11 @@ class PipelineRunner:
                 )
                 step_results.append(result)
                 all_results.append(result)
-                self._write_manifest(result_dir, manifest, all_results)
+                result_index[step.id] = step_results
+                self._write_live_views(
+                    pipeline, result_dir, attempt_dir, manifest,
+                    result_index, all_results,
+                )
             result_index[step.id] = step_results
         return result_index, all_results
 
@@ -2060,9 +2078,36 @@ class PipelineRunner:
         os.replace(archive_tmp, cache_dir / "artifacts.tar.gz")
         os.replace(outputs_tmp, cache_dir / "outputs.json")
 
-    @staticmethod
-    def _write_manifest(
+    def _write_live_views(
+        self,
+        pipeline: PipelineDefinition,
         result_dir: Path,
+        attempt_dir: Path,
+        manifest: dict[str, Any],
+        result_index: dict[str, list[ExecutionResult]],
+        results: list[ExecutionResult],
+    ) -> None:
+        self._write_report(result_dir / "report.json", manifest, results)
+        self._write_report(attempt_dir / "report.json", manifest, results)
+        self._write_flat_csv(
+            pipeline, result_dir / "results.csv", result_index,
+        )
+        self._write_flat_csv(
+            pipeline, attempt_dir / "results.csv", result_index,
+        )
+        self._write_step_timings(
+            pipeline, result_dir / "step_timings.csv", results,
+        )
+        self._write_step_timings(
+            pipeline, attempt_dir / "step_timings.csv", results,
+        )
+        self._write_summary(
+            pipeline, result_dir / "summary.csv", result_index,
+        )
+
+    @staticmethod
+    def _write_report(
+        path: Path,
         manifest: dict[str, Any],
         results: list[ExecutionResult],
     ) -> None:
@@ -2096,8 +2141,7 @@ class PipelineRunner:
             }
             for result in results
         ]
-        path = result_dir / "result.json"
-        temporary = result_dir / ".result.json.tmp"
+        temporary = path.with_name(f".{path.name}.tmp")
         temporary.write_text(json.dumps(payload, indent=2, default=str))
         os.replace(temporary, path)
 
@@ -2124,11 +2168,11 @@ class PipelineRunner:
     def _write_flat_csv(
         self,
         pipeline: PipelineDefinition,
-        result_dir: Path,
+        path: Path,
         result_index: dict[str, list[ExecutionResult]],
     ) -> None:
         final_step = pipeline.steps[-1]
-        rows = result_index[final_step.id]
+        rows = result_index.get(final_step.id, [])
         output_columns = [
             f"{step.id}.{name}"
             for step in pipeline.steps
@@ -2147,7 +2191,8 @@ class PipelineRunner:
                 "execution_id",
             ]
         )
-        with open(result_dir / "results.csv", "w", newline="") as file:
+        temporary = path.with_name(f".{path.name}.tmp")
+        with open(temporary, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             for result in rows:
@@ -2172,11 +2217,12 @@ class PipelineRunner:
                     "execution_id": result.identity,
                 })
                 writer.writerow(row)
+        os.replace(temporary, path)
 
     @staticmethod
     def _write_step_timings(
         pipeline: PipelineDefinition,
-        result_dir: Path,
+        path: Path,
         results: list[ExecutionResult],
     ) -> None:
         """Write a CI-like timing view with one row per step execution."""
@@ -2194,7 +2240,8 @@ class PipelineRunner:
             ]
             + list(pipeline.matrix)
         )
-        with open(result_dir / "step_timings.csv", "w", newline="") as file:
+        temporary = path.with_name(f".{path.name}.tmp")
+        with open(temporary, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             for result in results:
@@ -2214,16 +2261,15 @@ class PipelineRunner:
                     for name in pipeline.matrix
                 })
                 writer.writerow(row)
+        os.replace(temporary, path)
 
     def _write_summary(
         self,
         pipeline: PipelineDefinition,
-        result_dir: Path,
+        path: Path,
         result_index: dict[str, list[ExecutionResult]],
     ) -> None:
         final_step = pipeline.steps[-1]
-        if final_step.repeat == 1:
-            return
         stats = final_step.stats or [
             name
             for name, kind in final_step.outputs.items()
@@ -2232,21 +2278,45 @@ class PipelineRunner:
         fieldnames = list(final_step.dimensions)
         for name in stats:
             fieldnames.extend([f"{name}_mean", f"{name}_std"])
-        fieldnames.extend(["n_successful", "n_failed", "execution_id"])
+        fieldnames.extend([
+            "n_successful",
+            "n_failed",
+            "n_blocked",
+            "n_skipped",
+            "n_completed",
+            "n_expected",
+            "complete",
+            "execution_id",
+        ])
         groups: dict[str, list[ExecutionResult]] = {}
-        for result in result_index[final_step.id]:
+        for result in result_index.get(final_step.id, []):
             groups.setdefault(result.identity, []).append(result)
-        with open(result_dir / "summary.csv", "w", newline="") as file:
+        temporary = path.with_name(f".{path.name}.tmp")
+        with open(temporary, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             for identity, results in groups.items():
                 successful = [
                     result for result in results if result.status == "success"
                 ]
+                failed = [
+                    result for result in results if result.status == "failed"
+                ]
+                blocked = [
+                    result for result in results if result.status == "blocked"
+                ]
+                skipped = [
+                    result for result in results if result.status == "skipped"
+                ]
                 row: dict[str, Any] = {
                     **results[0].dimensions,
                     "n_successful": len(successful),
-                    "n_failed": len(results) - len(successful),
+                    "n_failed": len(failed),
+                    "n_blocked": len(blocked),
+                    "n_skipped": len(skipped),
+                    "n_completed": len(results),
+                    "n_expected": final_step.repeat,
+                    "complete": len(results) == final_step.repeat,
                     "execution_id": identity,
                 }
                 for name in stats:
@@ -2264,6 +2334,7 @@ class PipelineRunner:
                         statistics.stdev(values) if len(values) > 1 else ""
                     )
                 writer.writerow(row)
+        os.replace(temporary, path)
 
     def _print_dry_run(
         self,

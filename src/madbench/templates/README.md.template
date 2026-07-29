@@ -18,7 +18,7 @@ madbench run tests/<name>.yml
 tests/      # pipeline definitions
 scripts/    # executable scripts used by pipeline steps
 inputs/     # repository resources staged for steps
-results/    # result.json, CSV views, and published artifacts
+results/    # live report.json, CSV views, and published artifacts
 scratch/    # work directories and disposable step caches
 logs/       # orchestration plus per-execution stdout and stderr
 gridpacks/  # reusable, repository-managed gridpack inputs
@@ -73,10 +73,12 @@ Every run creates:
 ```text
 results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
-├── result.json
-├── results.csv
-├── step_timings.csv  # one row per step execution
-├── summary.csv       # when the final step repeats
+├── report.json       # atomically updated deep execution record
+├── results.csv       # live final-step repetition rows
+├── step_timings.csv  # live row for every step execution
+├── summary.csv       # live aggregate statistics and completion counts
+├── attempts/
+│   └── try_0/        # attempt-scoped report/results/timings
 └── artifacts/        # <step>/<mg_version>/<rep>/<published path>
 
 logs/<pipeline>/<hostname>_<timestamp>/
@@ -86,9 +88,11 @@ logs/<pipeline>/<hostname>_<timestamp>/
     └── stderr.log
 ```
 
-`result.json` is the canonical result. See the MadBench project README for
-the complete pipeline, input-resolution, artifact, output, cache, and
-repetition reference.
+The top-level views are created before execution and atomically refreshed
+after every recorded step, so they are safe to inspect during multi-day runs.
+Final-step repetitions are scheduled outermost: every matrix point completes
+rep 1 before rep 2 begins. See the MadBench project README for the complete
+pipeline, input-resolution, artifact, output, cache, and repetition reference.
 
 ## Pipelines
 
