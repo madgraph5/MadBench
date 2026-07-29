@@ -18,7 +18,7 @@ madbench run tests/<name>.yml
 tests/      # pipeline definitions
 scripts/    # executable scripts used by pipeline steps
 inputs/     # repository resources staged for steps
-results/    # result.json, CSV views, and saved artifacts
+results/    # result.json, CSV views, and published artifacts
 scratch/    # work directories and disposable step caches
 logs/       # orchestration plus per-execution stdout and stderr
 gridpacks/  # reusable, repository-managed gridpack inputs
@@ -40,6 +40,23 @@ with:
 The YAML path remains workspace-relative; MadBench passes an absolute path
 below `$MADBENCH_INPUTS` to the step.
 
+Step artifacts use the same absolute-path handoff:
+
+```yaml
+artifacts:
+  workspace:
+    path: workspace
+
+# In a later step:
+with:
+  workspace: ${{ steps.prepare.artifacts.workspace }}
+```
+
+The artifact `path` is relative to its producer's workdir. Omitting `publish`
+keeps it available to downstream steps and caches without copying it into
+permanent results. Adding a safe relative `publish` path copies it to
+`results/.../artifacts/<step>/<mg_version>/<rep>/<publish>`.
+
 To keep a test's execution work and cache outside the workspace, set its work
 root:
 
@@ -60,7 +77,7 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── results.csv
 ├── step_timings.csv  # one row per step execution
 ├── summary.csv       # when the final step repeats
-└── artifacts/        # artifacts declared with save: true
+└── artifacts/        # <step>/<mg_version>/<rep>/<published path>
 
 logs/<pipeline>/<hostname>_<timestamp>/
 ├── main.log           # live orchestration narrative

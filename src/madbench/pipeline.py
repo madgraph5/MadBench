@@ -73,7 +73,7 @@ class JsonArgumentSource:
 @dataclass
 class ArtifactDefinition:
     path: str
-    save: bool = False
+    publish: Optional[str] = None
 
 
 @dataclass
@@ -144,7 +144,7 @@ class ExecutionResult:
     stdout: Optional[str] = None
     stderr: Optional[str] = None
     blocked_by: list[str] = field(default_factory=list)
-    saved_artifacts: dict[str, str] = field(default_factory=dict)
+    published_artifacts: dict[str, str] = field(default_factory=dict)
 
 
 def _string_list(value: Any, field_name: str) -> list[str]:
@@ -297,17 +297,29 @@ def _normalize_artifacts(value: Any, step_id: str) -> dict[str, ArtifactDefiniti
             raise ValueError(f"step {step_id!r} artifact names must be strings")
         if isinstance(spec, str):
             spec = {"path": spec}
-        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
+        if (
+            not isinstance(spec, dict)
+            or not set(spec) <= {"path", "publish"}
+            or not isinstance(spec.get("path"), str)
+        ):
             raise ValueError(
-                f"step {step_id!r} artifact {name!r} requires a string 'path'"
+                f"step {step_id!r} artifact {name!r} must contain 'path' and "
+                "optional 'publish' string values"
             )
-        save = spec.get("save", False)
-        if not isinstance(save, bool):
+        publish = spec.get("publish")
+        if publish is not None and (
+            not isinstance(publish, str) or not publish
+        ):
             raise ValueError(
-                f"step {step_id!r} artifact {name!r} 'save' must be boolean"
+                f"step {step_id!r} artifact {name!r} 'publish' must be a "
+                "non-empty string"
             )
         _artifact_path_dimensions(spec["path"], step_id, name)
-        result[name] = ArtifactDefinition(path=spec["path"], save=save)
+        if publish is not None:
+            _artifact_path_dimensions(publish, step_id, name)
+        result[name] = ArtifactDefinition(
+            path=spec["path"], publish=publish,
+        )
     return result
 
 
@@ -682,8 +694,10 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         artifact_dimensions = [
             dimension
             for artifact_name, artifact in artifacts.items()
+            for value in (artifact.path, artifact.publish)
+            if value is not None
             for dimension in _artifact_path_dimensions(
-                artifact.path, step_id, artifact_name,
+                value, step_id, artifact_name,
             )
         ]
         direct_dimensions = list(dict.fromkeys(
@@ -1017,12 +1031,21 @@ class PipelineRunner:
             self._print_dry_run(pipeline, expanded, matrix_points)
             return
 
-        timestamp = get_timestamp()
+        timestamp_base = get_timestamp()
         hardware = detect_hardware()
         hostname = hardware["hostname"]
+        timestamp = timestamp_base
         result_dir = (
             self.workspace.results_dir / pipeline.name / f"{hostname}_{timestamp}"
         )
+        suffix = 1
+        while result_dir.exists():
+            timestamp = f"{timestamp_base}_{suffix:02d}"
+            result_dir = (
+                self.workspace.results_dir / pipeline.name
+                / f"{hostname}_{timestamp}"
+            )
+            suffix += 1
         log_dir = (
             self.workspace.logs_dir / pipeline.name / f"{hostname}_{timestamp}"
         )
@@ -1450,7 +1473,7 @@ class PipelineRunner:
         )
         if cache_restored:
             outputs = json.loads((cache_dir / "outputs.json").read_text())
-            artifacts, digests, saved = self._collect_artifacts(
+            artifacts, digests, published = self._collect_artifacts(
                 pipeline, execution, workdir, result_dir,
             )
             materialization_time = time.monotonic() - materialization_started
@@ -1470,7 +1493,7 @@ class PipelineRunner:
                 artifacts=artifacts,
                 artifact_digests=digests,
                 workdir=str(workdir),
-                saved_artifacts=saved,
+                published_artifacts=published,
             )
 
         execution_started = time.monotonic()
@@ -1521,7 +1544,7 @@ class PipelineRunner:
             )
 
         outputs = self._read_outputs(step, output_file)
-        artifacts, digests, saved = self._collect_artifacts(
+        artifacts, digests, published = self._collect_artifacts(
             pipeline, execution, workdir, result_dir,
         )
         if cache_dir is not None:
@@ -1544,7 +1567,7 @@ class PipelineRunner:
             workdir=str(workdir),
             stdout=str(stdout),
             stderr=str(stderr),
-            saved_artifacts=saved,
+            published_artifacts=published,
         )
 
     def _mg_bin(self, mg_version: str) -> Optional[Path]:
@@ -1789,6 +1812,17 @@ class PipelineRunner:
         name: str,
         spec: ArtifactDefinition,
     ) -> Path:
+        return PipelineRunner._resolve_artifact_path(
+            execution, name, spec.path, "path",
+        )
+
+    @staticmethod
+    def _resolve_artifact_path(
+        execution: StepExecution,
+        name: str,
+        template: str,
+        field_name: str,
+    ) -> Path:
         def replace(match: re.Match[str]) -> str:
             dimension = match.group(1)
             if dimension not in execution.values:
@@ -1802,14 +1836,26 @@ class PipelineRunner:
                 match.group(0),
             ))
 
-        resolved = ARTIFACT_MATRIX_REF_RE.sub(replace, spec.path)
+        resolved = ARTIFACT_MATRIX_REF_RE.sub(replace, template)
         path = Path(resolved)
         if path.is_absolute() or ".." in path.parts:
             raise ValueError(
-                f"step {execution.step.id!r} artifact {name!r} resolved to "
-                f"unsafe path {resolved!r}"
+                f"step {execution.step.id!r} artifact {name!r} "
+                f"{field_name} resolved to unsafe path {resolved!r}"
             )
         return path
+
+    @staticmethod
+    def _published_artifact_path(
+        execution: StepExecution,
+        name: str,
+        spec: ArtifactDefinition,
+    ) -> Optional[Path]:
+        if spec.publish is None:
+            return None
+        return PipelineRunner._resolve_artifact_path(
+            execution, name, spec.publish, "publish",
+        )
 
     def _collect_artifacts(
         self,
@@ -1820,7 +1866,7 @@ class PipelineRunner:
     ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         artifacts: dict[str, str] = {}
         digests: dict[str, str] = {}
-        saved: dict[str, str] = {}
+        published: dict[str, str] = {}
         for name, spec in execution.step.artifacts.items():
             artifact_path = self._artifact_path(execution, name, spec)
             source = workdir / artifact_path
@@ -1842,11 +1888,35 @@ class PipelineRunner:
             )
             artifacts[name] = str(source.resolve())
             digests[name] = _path_digest(source)
-            if spec.save:
-                destination = (
-                    result_dir / "artifacts" / execution.step.id
-                    / execution.identity / f"{execution.repetition:02d}" / name
+            published_path = self._published_artifact_path(
+                execution, name, spec,
+            )
+            if published_path is not None:
+                mg_version = str(
+                    execution.values.get("mg_version", MG_VERSION_NONE)
                 )
+                if (
+                    not re.fullmatch(r"[A-Za-z0-9_.-]+", mg_version)
+                    or mg_version in {".", ".."}
+                ):
+                    raise ValueError(
+                        f"step {execution.step.id!r} cannot publish artifact "
+                        f"under unsafe mg_version {mg_version!r}"
+                    )
+                destination = (
+                    result_dir / "artifacts" / execution.step.id / mg_version
+                    / f"{execution.repetition:02d}" / published_path
+                )
+                if destination.exists():
+                    raise ValueError(
+                        f"step {execution.step.id!r} artifact {name!r} "
+                        "publish destination collides with another execution: "
+                        f"{destination}. MadBench automatically namespaces "
+                        "published artifacts by step, mg_version, and "
+                        "repetition; 'publish' must include enough user matrix "
+                        "values to distinguish executions within that scope "
+                        f"(current dimensions: {_canonical(execution.values)})"
+                    )
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if source.is_dir():
                     shutil.copytree(
@@ -1854,8 +1924,8 @@ class PipelineRunner:
                     )
                 else:
                     shutil.copy2(source, destination)
-                saved[name] = str(destination.resolve())
-        return artifacts, digests, saved
+                published[name] = str(destination.resolve())
+        return artifacts, digests, published
 
     def _cache_key(
         self,
@@ -2015,7 +2085,7 @@ class PipelineRunner:
                     name: {
                         "path": path,
                         "sha256": result.artifact_digests.get(name),
-                        "saved_path": result.saved_artifacts.get(name),
+                        "published_path": result.published_artifacts.get(name),
                     }
                     for name, path in result.artifacts.items()
                 },
@@ -2231,3 +2301,10 @@ class PipelineRunner:
                 print(f"  skipped runs: {len(expanded[step.id]) - len(eligible)}")
             print(f"  upstream: {step.upstream_steps}")
             print(f"  cache: {'enabled' if step.cache.enabled else 'disabled'}")
+            if step.artifacts:
+                print("  artifacts:")
+                for name, artifact in step.artifacts.items():
+                    detail = f"path={artifact.path}"
+                    if artifact.publish is not None:
+                        detail += f", publish={artifact.publish}"
+                    print(f"    {name}: {detail}")

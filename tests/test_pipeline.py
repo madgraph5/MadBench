@@ -321,7 +321,7 @@ def test_nested_matrix_members_are_inferred_and_resolved_in_artifact_paths(
             "artifacts": {
                 "gridpack": {
                     "path": "gridpacks/${{ matrix.process.id }}.tar.gz",
-                    "save": True,
+                    "publish": "${{ matrix.process.id }}.tar.gz",
                 },
             },
         }],
@@ -582,7 +582,10 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
                 },
                 "outputs": {"compile_seconds": "number"},
                 "artifacts": {
-                    "executable": {"path": "executable", "save": True},
+                    "executable": {
+                        "path": "executable",
+                        "publish": "executables/${{ matrix.process }}",
+                    },
                 },
             },
             {
@@ -627,8 +630,8 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
         entry for entry in manifest["steps"] if entry["step_id"] == "compile"
     ]
     assert all(
-        Path(entry["artifacts"]["executable"]["saved_path"]).is_file()
-        or Path(entry["artifacts"]["executable"]["saved_path"]).is_dir()
+        Path(entry["artifacts"]["executable"]["published_path"]).is_file()
+        or Path(entry["artifacts"]["executable"]["published_path"]).is_dir()
         for entry in compile_entries
     )
     with open(result_dir / "results.csv", newline="") as file:
@@ -643,7 +646,10 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
     assert {
         "execution_time", "materialization_time", "total_time",
     }.issubset(timing_rows[0])
-    assert len(list((result_dir / "artifacts" / "compile").rglob("executable"))) == 2
+    published_executables = (
+        result_dir / "artifacts" / "compile" / "none" / "01" / "executables"
+    )
+    assert {path.name for path in published_executables.iterdir()} == {"a", "b"}
 
 
 def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
@@ -657,7 +663,10 @@ def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
     )
     raw = {
         "name": "dynamic_artifact",
-        "matrix": {"process": ["one", "two"]},
+        "matrix": {
+            "mg_version": ["v1"],
+            "process": ["one", "two"],
+        },
         "steps": [{
             "id": "build",
             "script": "build.sh",
@@ -665,7 +674,7 @@ def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
             "artifacts": {
                 "gridpack": {
                     "path": "gridpacks/${{ matrix.process }}.tar.gz",
-                    "save": True,
+                    "publish": "${{ matrix.process }}.tar.gz",
                 },
             },
             "cache": True,
@@ -685,6 +694,12 @@ def test_pipeline_resolves_dynamic_artifact_path_and_cache(tmp_path):
         for step in latest["steps"]
     }
     assert {path.name for path in artifact_paths} == {
+        "one.tar.gz", "two.tar.gz",
+    }
+    published = (
+        result_dirs[-1] / "artifacts" / "build" / "v1" / "01"
+    )
+    assert {path.name for path in published.iterdir()} == {
         "one.tar.gz", "two.tar.gz",
     }
 
@@ -707,6 +722,53 @@ def test_pipeline_rejects_unsafe_resolved_artifact_path(tmp_path):
     with pytest.raises(ValueError, match="resolved to unsafe path"):
         MadBench(find_workspace(root)).run(path)
     assert not marker.exists()
+
+
+def test_published_artifact_collision_is_rejected(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "build.sh",
+        'printf "%s" "$1" > product.txt\n',
+    )
+    path = make_pipeline(root, {
+        "name": "collision",
+        "matrix": {"process": ["one", "two"]},
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "with": {"process": "${{ matrix.process }}"},
+            "artifacts": {
+                "product": {
+                    "path": "product.txt",
+                    "publish": "product.txt",
+                },
+            },
+        }],
+    })
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "automatically namespaces published artifacts by step, "
+            "mg_version, and repetition"
+        ),
+    ):
+        MadBench(find_workspace(root)).run(path)
+
+
+def test_legacy_artifact_save_field_is_rejected():
+    with pytest.raises(ValueError, match="optional 'publish'"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "build",
+                "script": "build.sh",
+                "artifacts": {
+                    "product": {"path": "product.txt", "save": True},
+                },
+            }],
+        }, source="test")
 
 
 def test_pipeline_skips_conditional_step_and_preserves_upstream_results(
