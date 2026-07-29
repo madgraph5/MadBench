@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
+from ._logging import MainLog
 from .utils import (
     detect_hardware,
     detect_software_versions,
@@ -1022,6 +1023,9 @@ class PipelineRunner:
         result_dir = (
             self.workspace.results_dir / pipeline.name / f"{hostname}_{timestamp}"
         )
+        log_dir = (
+            self.workspace.logs_dir / pipeline.name / f"{hostname}_{timestamp}"
+        )
         base = self._workdir_base(pipeline)
         run_dir = base / f"{pipeline.name}_{timestamp}"
         staged_dir = run_dir / STAGED_DIR_NAME
@@ -1050,11 +1054,59 @@ class PipelineRunner:
             "steps": [],
         }
 
+        with MainLog(log_dir / "main.log") as progress:
+            progress.log(f"[madbench] Pipeline: {pipeline.name}")
+            progress.log(f"[madbench] Workdir: {run_dir}")
+            progress.log(f"[madbench] Results: {result_dir}")
+            progress.log(f"[madbench] Logs: {log_dir}")
+            try:
+                result_index, all_results = self._run_steps(
+                    pipeline=pipeline,
+                    expanded=expanded,
+                    run_dir=run_dir,
+                    staged_dir=staged_dir,
+                    result_dir=result_dir,
+                    log_dir=log_dir,
+                    manifest=manifest,
+                    progress=progress,
+                )
+                self._write_manifest(result_dir, manifest, all_results)
+                self._write_flat_csv(pipeline, result_dir, result_index)
+                self._write_step_timings(pipeline, result_dir, all_results)
+                self._write_summary(pipeline, result_dir, result_index)
+            except Exception as exc:
+                progress.log(f"[madbench] Pipeline failed: {exc}")
+                raise
+            progress.log(f"[madbench] Pipeline complete: {result_dir}")
+
+    def _run_steps(
+        self,
+        *,
+        pipeline: PipelineDefinition,
+        expanded: dict[str, list[StepExecution]],
+        run_dir: Path,
+        staged_dir: Path,
+        result_dir: Path,
+        log_dir: Path,
+        manifest: dict[str, Any],
+        progress: MainLog,
+    ) -> tuple[dict[str, list[ExecutionResult]], list[ExecutionResult]]:
         result_index: dict[str, list[ExecutionResult]] = {}
         all_results: list[ExecutionResult] = []
-        for step in pipeline.steps:
+        step_count = len(pipeline.steps)
+        for step_number, step in enumerate(pipeline.steps, start=1):
             step_results: list[ExecutionResult] = []
-            for execution in expanded[step.id]:
+            executions = expanded[step.id]
+            progress.log(
+                f"[madbench] Step {step.id} ({step_number}/{step_count}): "
+                f"{step.script or step.action}; {len(executions)} execution(s)"
+            )
+            for execution_number, execution in enumerate(executions, start=1):
+                execution_label = (
+                    f"{step.id} execution {execution_number}/{len(executions)} "
+                    f"rep={execution.repetition} "
+                    f"dimensions={_canonical(execution.values)}"
+                )
                 should_run = (
                     step.condition is None
                     or _evaluate_condition(
@@ -1062,6 +1114,7 @@ class PipelineRunner:
                     )
                 )
                 if not should_run:
+                    progress.log(f"[madbench] Skipping {execution_label}")
                     result = ExecutionResult(
                         step_id=step.id,
                         identity=execution.identity,
@@ -1084,6 +1137,10 @@ class PipelineRunner:
                         execution, pipeline, result_index,
                     )
                     if blocked:
+                        progress.log(
+                            f"[madbench] Blocking {execution_label}; "
+                            f"failed upstream={blocked}"
+                        )
                         result = ExecutionResult(
                             step_id=step.id,
                             identity=execution.identity,
@@ -1103,6 +1160,19 @@ class PipelineRunner:
                             blocked_by=blocked,
                         )
                     else:
+                        execution_log_dir = (
+                            log_dir / step.id / execution.identity
+                            / f"{execution.repetition:02d}"
+                        )
+                        progress.log(f"[madbench] Running {execution_label}")
+                        progress.log(
+                            f"[madbench]   stdout: "
+                            f"{execution_log_dir / 'stdout.log'}"
+                        )
+                        progress.log(
+                            f"[madbench]   stderr: "
+                            f"{execution_log_dir / 'stderr.log'}"
+                        )
                         result = self._execute(
                             pipeline=pipeline,
                             execution=execution,
@@ -1110,17 +1180,17 @@ class PipelineRunner:
                             run_dir=run_dir,
                             staged_dir=staged_dir,
                             result_dir=result_dir,
+                            log_dir=log_dir,
                         )
+                progress.log(
+                    f"[madbench]   {result.status}; cache={result.cache}; "
+                    f"total={result.total_time:.4f}s"
+                )
                 step_results.append(result)
                 all_results.append(result)
                 self._write_manifest(result_dir, manifest, all_results)
             result_index[step.id] = step_results
-
-        self._write_manifest(result_dir, manifest, all_results)
-        self._write_flat_csv(pipeline, result_dir, result_index)
-        self._write_step_timings(pipeline, result_dir, all_results)
-        self._write_summary(pipeline, result_dir, result_index)
-        print(f"[madbench] Pipeline complete: {result_dir}")
+        return result_index, all_results
 
     def _resolve_matrix_sources(
         self, pipeline: PipelineDefinition,
@@ -1327,6 +1397,7 @@ class PipelineRunner:
         run_dir: Path,
         staged_dir: Path,
         result_dir: Path,
+        log_dir: Path,
     ) -> ExecutionResult:
         total_started = time.monotonic()
         step = execution.step
@@ -1363,12 +1434,10 @@ class PipelineRunner:
             "MG_VERSION": mg_version,
             "MG_BIN": str(mg_bin or ""),
         })
-        log_dir = (
-            result_dir / "logs" / step.id / execution.identity / rep
-        )
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stdout = log_dir / "stdout.log"
-        stderr = log_dir / "stderr.log"
+        execution_log_dir = log_dir / step.id / execution.identity / rep
+        execution_log_dir.mkdir(parents=True, exist_ok=True)
+        stdout = execution_log_dir / "stdout.log"
+        stderr = execution_log_dir / "stderr.log"
 
         cache_key = self._cache_key(
             pipeline, execution, arguments, upstream,

@@ -871,8 +871,13 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── results.csv
 ├── step_timings.csv
 ├── summary.csv
-├── logs/
 └── artifacts/
+
+logs/<pipeline>/<hostname>_<timestamp>/
+├── main.log
+└── <step>/<execution-id>/<repetition>/
+    ├── stdout.log
+    └── stderr.log
 ```
 
 `result.json` is canonical. It records:
@@ -887,6 +892,12 @@ results/<pipeline>/<hostname>_<timestamp>/
 - Outputs and artifact digests.
 - Per-execution stdout and stderr log paths.
 - Repetitions and blocked dependencies.
+
+During execution, `main.log` is mirrored to the terminal. It announces each
+step and execution with its matrix dimensions, repetition, cache result,
+timing, and exact stdout/stderr paths before the subprocess starts, making
+long-running logs immediately tail-able. Hashed execution directories remain
+stable internal identities; `main.log` is their human-readable index.
 
 `results.csv` is a flattened view of final-step observations. Upstream values
 are repeated where necessary and use qualified column names.

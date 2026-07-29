@@ -20,7 +20,7 @@ scripts/    # executable scripts used by pipeline steps
 inputs/     # repository resources staged for steps
 results/    # result.json, CSV views, and saved artifacts
 scratch/    # work directories and disposable step caches
-logs/       # legacy log bundles
+logs/       # orchestration plus per-execution stdout and stderr
 gridpacks/  # reusable, repository-managed gridpack inputs
 MadGraph/   # local MadGraph installations
 analysis/   # notebooks and post-processing
@@ -60,8 +60,13 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── results.csv
 ├── step_timings.csv  # one row per step execution
 ├── summary.csv       # when the final step repeats
-├── logs/             # stdout and stderr per step execution
 └── artifacts/        # artifacts declared with save: true
+
+logs/<pipeline>/<hostname>_<timestamp>/
+├── main.log           # live orchestration narrative
+└── <step>/<execution-id>/<repetition>/
+    ├── stdout.log
+    └── stderr.log
 ```
 
 `result.json` is the canonical result. See the MadBench project README for

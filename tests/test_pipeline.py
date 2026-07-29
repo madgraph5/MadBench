@@ -503,6 +503,42 @@ def test_dry_run_reports_inferred_execution_counts(tmp_path, capsys):
     assert "error" not in listed[0]
 
 
+def test_pipeline_reports_live_progress_and_writes_logs_outside_results(
+    tmp_path, capsys,
+):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", 'printf "hello\\n"\n')
+    path = make_pipeline(root, {
+        "name": "logged",
+        "matrix": {"process": ["dy"]},
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {"process": "${{ matrix.process }}"},
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+
+    console = capsys.readouterr().out
+    assert "[madbench] Pipeline: logged" in console
+    assert "[madbench] Step run (1/1): run.sh; 1 execution(s)" in console
+    assert 'dimensions={"process":"dy"}' in console
+    assert "[madbench]   stdout:" in console
+    assert "[madbench]   success; cache=disabled;" in console
+
+    log_dirs = list((root / "logs" / "logged").iterdir())
+    assert len(log_dirs) == 1
+    main_log = (log_dirs[0] / "main.log").read_text()
+    assert "Running run execution 1/1" in main_log
+    assert str(log_dirs[0] / "run") in main_log
+    assert list((log_dirs[0] / "run").rglob("stdout.log"))
+    result_dir = only_result_dir(root, "logged")
+    assert not (result_dir / "logs").exists()
+    result = json.loads((result_dir / "result.json").read_text())
+    assert result["steps"][0]["stdout"].startswith(str(log_dirs[0]))
+
+
 def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
     tmp_path,
 ):
