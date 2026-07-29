@@ -162,6 +162,7 @@ def _normalize_inputs(value: Any) -> tuple[list[str], dict[str, str]]:
     paths: list[str] = []
     labels: dict[str, str] = {}
     for index, item in enumerate(value):
+        labelled = False
         if isinstance(item, str):
             path = item
         elif (
@@ -172,6 +173,7 @@ def _normalize_inputs(value: Any) -> tuple[list[str], dict[str, str]]:
             and isinstance(item["path"], str)
             and item["path"]
         ):
+            labelled = True
             label = item["id"]
             path = item["path"]
             if label in labels:
@@ -186,6 +188,11 @@ def _normalize_inputs(value: Any) -> tuple[list[str], dict[str, str]]:
         if candidate.is_absolute() or ".." in candidate.parts:
             raise ValueError(
                 f"inputs[{index}] path must be safe and workspace-relative"
+            )
+        if labelled and any(character in path for character in "*?["):
+            raise ValueError(
+                f"labelled input {label!r} path must name a single file; "
+                "glob patterns are supported only for unlabelled inputs"
             )
         paths.append(path)
     return paths, labels
@@ -972,6 +979,7 @@ class PipelineRunner:
             stage_inputs(self.workspace.root, pipeline.inputs, staged_dir)
         else:
             staged_dir.mkdir(parents=True, exist_ok=True)
+        self._validate_labelled_inputs(pipeline, staged_dir)
         shutil.copyfile(test_yml, result_dir / "test.yml")
 
         manifest: dict[str, Any] = {
@@ -1113,6 +1121,18 @@ class PipelineRunner:
                     "sha256": _path_digest(path),
                 })
         return values
+
+    @staticmethod
+    def _validate_labelled_inputs(
+        pipeline: PipelineDefinition, staged_dir: Path,
+    ) -> None:
+        for label, logical_path in pipeline.input_labels.items():
+            path = (staged_dir / logical_path).resolve()
+            if not path.is_file():
+                raise ValueError(
+                    f"labelled input {label!r} must resolve to a single file; "
+                    f"got {logical_path!r}"
+                )
 
     def _select_upstream(
         self,

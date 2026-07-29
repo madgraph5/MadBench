@@ -559,7 +559,8 @@ Inputs may remain plain path strings, or use an `id` and `path` mapping when
 the path will be referenced more than once. `${{ inputs.processes_json }}`
 resolves to that input's staged path in step arguments and JSON argument
 sources; matrix JSON sources use the same label to load the workspace file
-before staging.
+before staging. A labelled input must name one file: glob patterns and
+directories are supported only by unlabelled inputs used for bulk staging.
 
 `json` is either a labelled input expression or a safe workspace-relative
 filename. `field` selects the non-empty array used for that dimension and

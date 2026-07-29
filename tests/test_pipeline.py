@@ -412,6 +412,42 @@ def test_labelled_inputs_reject_unknown_references():
         }, source="test")
 
 
+def test_labelled_input_rejects_globs():
+    with pytest.raises(
+        ValueError,
+        match="glob patterns are supported only for unlabelled inputs",
+    ):
+        parse_pipeline({
+            "name": "p",
+            "inputs": [{
+                "id": "cards",
+                "path": "inputs/cards/*.dat",
+            }],
+            "steps": [{"id": "run", "script": "run.sh"}],
+        }, source="test")
+
+
+def test_labelled_input_must_resolve_to_a_file(tmp_path):
+    root = make_workspace(tmp_path)
+    (root / "inputs").mkdir()
+    (root / "inputs" / "cards").mkdir()
+    make_script(root, "run.sh", "exit 0\n")
+    path = make_pipeline(root, {
+        "name": "labelled_directory",
+        "inputs": [{
+            "id": "cards",
+            "path": "inputs/cards",
+        }],
+        "steps": [{"id": "run", "script": "run.sh"}],
+    })
+
+    with pytest.raises(
+        ValueError,
+        match="labelled input 'cards' must resolve to a single file",
+    ):
+        MadBench(find_workspace(root)).run(path)
+
+
 def test_unknown_or_forward_step_references_are_rejected():
     with pytest.raises(ValueError, match="not earlier"):
         parse_pipeline({
