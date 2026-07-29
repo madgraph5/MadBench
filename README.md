@@ -102,6 +102,36 @@ steps:
 Steps execute strictly in declaration order. A step uses exactly one of
 `script` or `action`.
 
+## Scratch and cache placement
+
+Each test may select a scratch root independently of the workspace:
+
+```yaml
+name: compile_and_benchmark
+scratch_dir: /scratch/madbench
+```
+
+MadBench then keeps both execution work and the default step cache below that
+root:
+
+```text
+/scratch/madbench/
+├── compile_and_benchmark_<timestamp>/  # staged inputs and step workdirs
+└── .madbench-cache/
+    └── compile_and_benchmark/           # reusable step caches
+```
+
+Relative `scratch_dir` values are resolved from the workspace root. When it is
+omitted, the workspace-level `workspace.scratch_dir` setting in
+`madbench.yml` is used. The older top-level `workdir` spelling remains
+supported as an alias, but new tests should use `scratch_dir`; declaring both
+is an error.
+
+This setting does not move durable run records. Result JSON, CSV files, logs,
+and saved artifacts remain under the workspace's configured `results_dir`.
+A step-level `cache.path` still overrides the default cache location for that
+step.
+
 ## Matrix expansion
 
 List-valued matrix entries form a Cartesian product:

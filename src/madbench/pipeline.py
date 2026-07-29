@@ -111,6 +111,7 @@ class PipelineDefinition:
     inputs: list[str]
     input_labels: dict[str, str]
     steps: list[StepDefinition]
+    scratch_dir: Optional[str]
     workdir: Optional[str]
     raw: dict[str, Any]
 
@@ -572,6 +573,13 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
     workdir = raw.get("workdir")
     if workdir is not None and not isinstance(workdir, str):
         raise ValueError("'workdir' must be a string path")
+    scratch_dir = raw.get("scratch_dir")
+    if scratch_dir is not None and not isinstance(scratch_dir, str):
+        raise ValueError("'scratch_dir' must be a string path")
+    if scratch_dir is not None and workdir is not None:
+        raise ValueError(
+            "declare only 'scratch_dir'; 'workdir' is its legacy alias"
+        )
     matrix = raw.get("matrix", {}) or {}
     if not isinstance(matrix, dict) or not all(
         isinstance(k, str) for k in matrix
@@ -764,6 +772,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         inputs=inputs,
         input_labels=input_labels,
         steps=steps,
+        scratch_dir=scratch_dir,
         workdir=workdir,
         raw=raw,
     )
@@ -970,7 +979,7 @@ class PipelineRunner:
         result_dir = (
             self.workspace.results_dir / pipeline.name / f"{hostname}_{timestamp}"
         )
-        base = self._workdir_base(pipeline)
+        base = self._scratch_base(pipeline)
         run_dir = base / f"{pipeline.name}_{timestamp}"
         staged_dir = run_dir / STAGED_DIR_NAME
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -1104,10 +1113,11 @@ class PipelineRunner:
             matrix[name] = selected
         return replace(pipeline, matrix=matrix)
 
-    def _workdir_base(self, pipeline: PipelineDefinition) -> Path:
-        if pipeline.workdir is None:
+    def _scratch_base(self, pipeline: PipelineDefinition) -> Path:
+        configured = pipeline.scratch_dir or pipeline.workdir
+        if configured is None:
             return self.workspace.scratch_dir
-        value = Path(pipeline.workdir)
+        value = Path(configured)
         if not value.is_absolute():
             value = self.workspace.root / value
         return value.resolve()
@@ -1815,7 +1825,7 @@ class PipelineRunner:
             if not base.is_absolute():
                 base = self.workspace.root / base
         else:
-            base = self.workspace.scratch_dir / ".madbench-cache"
+            base = self._scratch_base(pipeline) / ".madbench-cache"
         return base.resolve() / pipeline.name / step.id / key
 
     @staticmethod

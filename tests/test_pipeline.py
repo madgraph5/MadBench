@@ -821,6 +821,48 @@ def test_step_cache_restores_outputs_and_artifacts(tmp_path):
     )
 
 
+def test_test_scratch_dir_contains_work_and_default_cache(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = make_workspace(workspace)
+    scratch = tmp_path / "external-scratch"
+    make_script(
+        root,
+        "build.sh",
+        'mkdir artifact\n'
+        'printf built > artifact/value\n',
+    )
+    path = make_pipeline(root, {
+        "name": "external",
+        "scratch_dir": str(scratch),
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "cache": True,
+            "artifacts": {"artifact": {"path": "artifact"}},
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+
+    run_dirs = list(scratch.glob("external_*"))
+    assert len(run_dirs) == 1
+    assert (run_dirs[0] / "steps" / "build").is_dir()
+    cache = scratch / ".madbench-cache" / "external" / "build"
+    assert len(list(cache.glob("*/artifacts.tar.gz"))) == 1
+    assert not (root / "scratch" / ".madbench-cache").exists()
+
+
+def test_pipeline_rejects_scratch_dir_with_legacy_workdir():
+    with pytest.raises(ValueError, match="legacy alias"):
+        parse_pipeline({
+            "name": "p",
+            "scratch_dir": "/scratch",
+            "workdir": "/old-scratch",
+            "steps": [{"id": "run", "script": "run.sh"}],
+        }, source="test")
+
+
 def test_madgraph_process_action(tmp_path):
     root = make_workspace(tmp_path)
     card_dir = root / "inputs"

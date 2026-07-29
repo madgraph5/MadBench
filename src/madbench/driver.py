@@ -87,6 +87,7 @@ class TestDefinition:
     # results CSV — gridpacks, reports, plots, log excerpts, etc. Each
     # pattern may use ``{arg}`` placeholders that get substituted with the
     # current invocation's arg values before matching.
+    scratch_dir: Optional[str] = None
     workdir: Optional[str] = None
     plot: Optional[str] = None
     raw: dict = field(default_factory=dict)
@@ -247,6 +248,16 @@ class MadBench:
             )
 
         outputs = _as_str_list(raw.get("outputs"), "outputs")
+        scratch_dir = raw.get("scratch_dir")
+        workdir = raw.get("workdir")
+        if scratch_dir is not None and not isinstance(scratch_dir, str):
+            raise ValueError("'scratch_dir' must be a string path")
+        if workdir is not None and not isinstance(workdir, str):
+            raise ValueError("'workdir' must be a string path")
+        if scratch_dir is not None and workdir is not None:
+            raise ValueError(
+                "declare only 'scratch_dir'; 'workdir' is its legacy alias"
+            )
         return TestDefinition(
             name=raw["name"],
             description=raw.get("description", ""),
@@ -255,7 +266,8 @@ class MadBench:
             inputs=_as_str_list(raw.get("inputs"), "inputs"),
             outputs=outputs,
             artifacts=_as_str_list(raw.get("artifacts"), "artifacts"),
-            workdir=raw.get("workdir"),
+            scratch_dir=scratch_dir,
+            workdir=workdir,
             plot=raw.get("plot"),
             raw=raw,
             zip_groups=_normalize_zip_groups(raw.get("zip")),
@@ -678,9 +690,10 @@ class MadBench:
                 )
 
     def _resolve_workdir(self, test: TestDefinition) -> Path:
-        if not test.workdir:
+        configured = test.scratch_dir or test.workdir
+        if not configured:
             return self.workspace.scratch_dir
-        p = Path(test.workdir)
+        p = Path(configured)
         if not p.is_absolute():
             p = self.workspace.root / p
         return p.resolve()
