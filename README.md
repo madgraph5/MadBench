@@ -488,6 +488,10 @@ paired proc card and launch card. Given `inputs/processes.json`:
 
 ```json
 {
+  "proc_card_preamble": [
+    "set group_subprocesses Auto",
+    "define lightq = u c d s u~ c~ d~ s~"
+  ],
   "launch": {
     "madspin": "OFF",
     "reweight": "OFF",
@@ -496,14 +500,19 @@ paired proc card and launch card. Given `inputs/processes.json`:
   "processes": [
     {
       "id": "pp_jets",
-      "model": "sm",
-      "process": ["generate p p > j j"],
+      "model": "",
+      "process": ["p p > j j"],
+      "output": "",
       "launch": {}
     },
     {
       "id": "fcc_ee_zh",
       "model": "sm",
-      "process": ["generate e+ e- > z h"],
+      "process": ["e+ e- > z h", "e+ e- > z h j"],
+      "proc_card_preamble": [
+        "set group_subprocesses False"
+      ],
+      "output": "standalone",
       "launch": {
         "beam.energy": 120,
         "generation.events": 20000
@@ -517,12 +526,13 @@ Load its `processes` field as a matrix dimension:
 
 ```yaml
 inputs:
-  - inputs/processes.json
+  - id: processes_json
+    path: inputs/processes.json
 
 matrix:
   process:
     from:
-      json: inputs/processes.json
+      json: ${{ inputs.processes_json }}
       field: processes
 
 steps:
@@ -530,9 +540,13 @@ steps:
     action: madgraph/cards
     with:
       process: ${{ matrix.process }}
+      proc_card_preamble:
+        from:
+          json: ${{ inputs.processes_json }}
+          field: proc_card_preamble
       default_launch:
         from:
-          json: inputs/processes.json
+          json: ${{ inputs.processes_json }}
           field: launch
 
   - id: generate
@@ -541,17 +555,49 @@ steps:
       proc_card: ${{ steps.cards.artifacts.proc_card }}
 ```
 
-`json` is a safe workspace-relative filename. `field` selects the non-empty
-array used for that dimension and supports dot-separated nested fields, such
-as `catalogue.madgraph.processes`. Matrix sources are loaded before MadBench
+Inputs may remain plain path strings, or use an `id` and `path` mapping when
+the path will be referenced more than once. `${{ inputs.processes_json }}`
+resolves to that input's staged path in step arguments and JSON argument
+sources; matrix JSON sources use the same label to load the workspace file
+before staging.
+
+`json` is either a labelled input expression or a safe workspace-relative
+filename. `field` selects the non-empty array used for that dimension and
+supports dot-separated nested fields, such as
+`catalogue.madgraph.processes`. Matrix sources are loaded before MadBench
 plans any executions, so dry runs and downstream dimension inference see one
 `matrix.process` value per JSON entry.
 
-The action requires each selected value to contain `id`, `model`, and a
-non-empty list of MadGraph commands under `process`; `launch` defaults to an
-empty mapping. Its optional `default_launch` argument is a mapping of settings
-applied to every process. Settings under the individual process's `launch`
-mapping override defaults with the same name.
+JSON array elements remain intact as matrix values. Members can therefore be
+used in step arguments and artifact paths, for example
+`${{ matrix.process.id }}` and
+`gridpacks/${{ matrix.process.output }}.tar.gz`. Member access may be nested
+further and fails clearly when a member is absent or an intermediate value is
+not an object.
+
+The action requires each selected value to contain `id` and a non-empty list
+of MadGraph process definitions under `process`. The first definition emits
+`generate <definition>` and every later definition emits
+`add process <definition>`. Definitions must not include the `generate` or
+`add process` command prefixes themselves.
+
+`model` may be omitted or empty to use MadGraph's default model without
+emitting an `import model` command. A non-empty model emits
+`import model <model>`.
+
+The optional `proc_card_preamble` argument is a list of commands placed after
+the model import, when present, and before the process commands. A process
+inherits this root preamble when its own `proc_card_preamble` field is absent.
+A per-process list replaces the root preamble completely; an empty list
+explicitly selects no preamble.
+
+The optional per-process `output` string selects the output mode: an empty or
+omitted value emits `output <id>`, while `standalone`, for example, emits
+`output standalone <id>`.
+
+`launch` defaults to an empty mapping. The optional `default_launch` argument
+is a mapping of settings applied to every process. Settings under the
+individual process's `launch` mapping override defaults with the same name.
 
 The action automatically declares two artifacts:
 
@@ -565,8 +611,10 @@ For example, the second matrix entry produces:
 ```text
 # proc_card.dat
 import model sm
+set group_subprocesses False
 generate e+ e- > z h
-output fcc_ee_zh
+add process e+ e- > z h j
+output standalone fcc_ee_zh
 
 # launch_card.dat
 launch fcc_ee_zh

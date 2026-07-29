@@ -225,7 +225,7 @@ def test_cards_action_requires_process_and_declares_default_artifacts():
             "process": [{
                 "id": "pp_jets",
                 "model": "sm",
-                "process": ["generate p p > j j"],
+                "process": ["p p > j j"],
                 "launch": {},
             }],
         },
@@ -274,6 +274,140 @@ def test_json_matrix_source_is_validated_before_expansion():
                 "id": "cards",
                 "action": "madgraph/cards",
                 "with": {"process": "${{ matrix.process }}"},
+            }],
+        }, source="test")
+
+
+def test_nested_matrix_members_are_inferred_and_resolved_in_artifact_paths(
+    tmp_path,
+):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "build.sh",
+        'identifier=$1\n'
+        'mkdir -p gridpacks\n'
+        'printf "%s" "$identifier" > "gridpacks/${identifier}.tar.gz"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "nested_matrix",
+        "matrix": {
+            "process": [
+                {"id": "dy_0j", "metadata": {"output": "dy"}},
+                {"id": "dy_1j", "metadata": {"output": "dyj"}},
+            ],
+        },
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "with": {
+                "identifier": "${{ matrix.process.id }}",
+                "output": "${{ matrix.process.metadata.output }}",
+            },
+            "artifacts": {
+                "gridpack": {
+                    "path": "gridpacks/${{ matrix.process.id }}.tar.gz",
+                    "save": True,
+                },
+            },
+        }],
+    })
+
+    pipeline = parse_pipeline(yaml.safe_load(path.read_text()), source=str(path))
+    assert pipeline.steps[0].dimensions == ["process"]
+    MadBench(find_workspace(root)).run(path)
+    manifest = json.loads(
+        (only_result_dir(root, "nested_matrix") / "result.json").read_text()
+    )
+    assert {
+        step["arguments"]["output"] for step in manifest["steps"]
+    } == {"dy", "dyj"}
+    assert all(
+        Path(step["artifacts"]["gridpack"]["path"]).name
+        in {"dy_0j.tar.gz", "dy_1j.tar.gz"}
+        for step in manifest["steps"]
+    )
+
+
+def test_nested_matrix_member_fails_clearly_when_missing(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "exit 0\n")
+    path = make_pipeline(root, {
+        "name": "missing_member",
+        "matrix": {"process": [{"id": "dy"}]},
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {"output": "${{ matrix.process.output }}"},
+        }],
+    })
+    with pytest.raises(ValueError, match="member 'output' is missing"):
+        MadBench(find_workspace(root)).run(path)
+
+
+def test_labelled_input_can_feed_matrix_and_json_arguments(tmp_path):
+    root = make_workspace(tmp_path)
+    inputs = root / "inputs"
+    inputs.mkdir()
+    (inputs / "processes.json").write_text(json.dumps({
+        "processes": [{"id": "dy_0j"}, {"id": "dy_1j"}],
+        "launch": {"events": 10},
+    }))
+    make_script(
+        root,
+        "record.sh",
+        'test "$1" = "dy_0j" || test "$1" = "dy_1j"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "labelled_inputs",
+        "inputs": [{
+            "id": "processes_json",
+            "path": "inputs/processes.json",
+        }],
+        "matrix": {
+            "process": {
+                "from": {
+                    "json": "${{ inputs.processes_json }}",
+                    "field": "processes",
+                },
+            },
+        },
+        "steps": [{
+            "id": "record",
+            "script": "record.sh",
+            "with": {
+                "id": "${{ matrix.process.id }}",
+                "launch": {
+                    "from": {
+                        "json": "${{ inputs.processes_json }}",
+                        "field": "launch",
+                    },
+                },
+            },
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+    manifest = json.loads(
+        (only_result_dir(root, "labelled_inputs") / "result.json").read_text()
+    )
+    assert len(manifest["steps"]) == 2
+    assert all(step["status"] == "success" for step in manifest["steps"])
+    assert all(
+        step["arguments"]["launch"] == {"events": 10}
+        for step in manifest["steps"]
+    )
+
+
+def test_labelled_inputs_reject_unknown_references():
+    with pytest.raises(ValueError, match="unknown labelled inputs"):
+        parse_pipeline({
+            "name": "p",
+            "inputs": [{"id": "known", "path": "inputs/known.json"}],
+            "steps": [{
+                "id": "run",
+                "script": "run.sh",
+                "with": {"path": "${{ inputs.missing }}"},
             }],
         }, source="test")
 
@@ -695,6 +829,7 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         "check_cards.sh",
         'grep -q "^import model sm$" "$1"\n'
         'grep -q "^generate e+ e- > z h$" "$1"\n'
+        '! grep -q "^define ignored" "$1"\n'
         'grep -q "^output fcc_ee_zh$" "$1"\n'
         'grep -q "^launch fcc_ee_zh$" "$2"\n'
         'grep -q "^set beam.energy 120$" "$2"\n',
@@ -705,7 +840,8 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
             "process": [{
                 "id": "fcc_ee_zh",
                 "model": "sm",
-                "process": ["generate e+ e- > z h"],
+                "process": ["e+ e- > z h"],
+                "proc_card_preamble": [],
                 "launch": {"beam.energy": 120},
             }],
         },
@@ -713,7 +849,10 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
             {
                 "id": "cards",
                 "action": "madgraph/cards",
-                "with": {"process": "${{ matrix.process }}"},
+                "with": {
+                    "process": "${{ matrix.process }}",
+                    "proc_card_preamble": ["define ignored = u u~"],
+                },
             },
             {
                 "id": "check",
@@ -735,6 +874,10 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
     inputs = root / "inputs"
     inputs.mkdir()
     (inputs / "processes.json").write_text(json.dumps({
+        "proc_card_preamble": [
+            "set group_subprocesses Auto",
+            "define lightq = u c d s u~ c~ d~ s~",
+        ],
         "launch": {
             "madspin": "OFF",
             "reweight": "OFF",
@@ -744,14 +887,19 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
             "processes": [
                 {
                     "id": "pp_jets",
-                    "model": "sm",
-                    "process": ["generate p p > j j"],
+                    "model": "",
+                    "process": ["p p > j j"],
+                    "output": "",
                     "launch": {},
                 },
                 {
                     "id": "fcc_ee_zh",
                     "model": "sm",
-                    "process": ["generate e+ e- > z h"],
+                    "process": ["e+ e- > z h", "e+ e- > z h j"],
+                    "proc_card_preamble": [
+                        "set group_subprocesses False",
+                    ],
+                    "output": "standalone",
                     "launch": {
                         "beam.energy": 120,
                         "generation.events": 20000,
@@ -763,7 +911,7 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
     make_script(
         root,
         "record_pair.sh",
-        'proc_id=$(sed -n "s/^output //p" "$1")\n'
+        'proc_id=$(awk \'/^output / {print $NF}\' "$1")\n'
         'launch_id=$(sed -n "s/^launch //p" "$2")\n'
         'test "$proc_id" = "$launch_id"\n'
         'grep -q "^set madspin OFF$" "$2"\n'
@@ -791,6 +939,12 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
                 "action": "madgraph/cards",
                 "with": {
                     "process": "${{ matrix.process }}",
+                    "proc_card_preamble": {
+                        "from": {
+                            "json": "inputs/processes.json",
+                            "field": "proc_card_preamble",
+                        },
+                    },
                     "default_launch": {
                         "from": {
                             "json": "inputs/processes.json",
@@ -822,6 +976,22 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
     ]
     assert len(cards) == 2
     assert len(consumers) == 4
+    proc_cards = {
+        step["dimensions"]["process"]["id"]:
+        Path(step["artifacts"]["proc_card"]["path"]).read_text()
+        for step in cards
+    }
+    assert "import model" not in proc_cards["pp_jets"]
+    assert "set group_subprocesses Auto\n" in proc_cards["pp_jets"]
+    assert proc_cards["pp_jets"].endswith("output pp_jets\n")
+    assert proc_cards["fcc_ee_zh"].startswith("import model sm\n")
+    assert "set group_subprocesses Auto" not in proc_cards["fcc_ee_zh"]
+    assert "set group_subprocesses False\n" in proc_cards["fcc_ee_zh"]
+    assert "generate e+ e- > z h\n" in proc_cards["fcc_ee_zh"]
+    assert "add process e+ e- > z h j\n" in proc_cards["fcc_ee_zh"]
+    assert proc_cards["fcc_ee_zh"].endswith(
+        "output standalone fcc_ee_zh\n"
+    )
     assert {
         (step["outputs"]["id"], step["outputs"]["backend"])
         for step in consumers

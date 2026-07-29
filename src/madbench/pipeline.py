@@ -30,13 +30,17 @@ ARGS_FILE_NAME = ".madbench_args.json"
 STAGED_DIR_NAME = "staged"
 MG_VERSION_NONE = "none"
 EXPR_RE = re.compile(r"^\s*\$\{\{\s*([^}]+?)\s*\}\}\s*$")
-MATRIX_REF_RE = re.compile(r"^matrix\.([A-Za-z_][A-Za-z0-9_]*)$")
+MATRIX_REF_RE = re.compile(
+    r"^matrix\.([A-Za-z_][A-Za-z0-9_]*)"
+    r"((?:\.[A-Za-z_][A-Za-z0-9_]*)*)$"
+)
 STEP_REF_RE = re.compile(
     r"^steps\.([A-Za-z_][A-Za-z0-9_-]*)\.(outputs|artifacts)"
     r"\.([A-Za-z_][A-Za-z0-9_-]*)$"
 )
 ARTIFACT_MATRIX_REF_RE = re.compile(
-    r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+    r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_]*)"
+    r"((?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\}\}"
 )
 INPUT_REF_RE = re.compile(r"^inputs\.([A-Za-z_][A-Za-z0-9_-]*)$")
 BUILTIN_ACTIONS = ("madgraph/cards", "madgraph/process")
@@ -105,6 +109,7 @@ class PipelineDefinition:
     matrix: dict[str, Any]
     zip_groups: list[list[str]]
     inputs: list[str]
+    input_labels: dict[str, str]
     steps: list[StepDefinition]
     workdir: Optional[str]
     raw: dict[str, Any]
@@ -147,6 +152,62 @@ def _string_list(value: Any, field_name: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
         raise ValueError(f"{field_name!r} must be a list of strings")
     return list(value)
+
+
+def _normalize_inputs(value: Any) -> tuple[list[str], dict[str, str]]:
+    if value is None:
+        return [], {}
+    if not isinstance(value, list):
+        raise ValueError("'inputs' must be a list")
+    paths: list[str] = []
+    labels: dict[str, str] = {}
+    for index, item in enumerate(value):
+        if isinstance(item, str):
+            path = item
+        elif (
+            isinstance(item, dict)
+            and set(item) == {"id", "path"}
+            and isinstance(item["id"], str)
+            and re.match(r"^[A-Za-z_][A-Za-z0-9_-]*$", item["id"])
+            and isinstance(item["path"], str)
+            and item["path"]
+        ):
+            label = item["id"]
+            path = item["path"]
+            if label in labels:
+                raise ValueError(f"duplicate input id {label!r}")
+            labels[label] = path
+        else:
+            raise ValueError(
+                f"inputs[{index}] must be a path string or a mapping containing "
+                "exactly valid string 'id' and non-empty string 'path' values"
+            )
+        candidate = Path(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(
+                f"inputs[{index}] path must be safe and workspace-relative"
+            )
+        paths.append(path)
+    return paths, labels
+
+
+def _matrix_members(match: re.Match[str]) -> list[str]:
+    return [part for part in match.group(2).split(".") if part]
+
+
+def _resolve_members(value: Any, members: list[str], expression: str) -> Any:
+    for member in members:
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"cannot resolve {expression!r}: value before {member!r} "
+                "is not a mapping"
+            )
+        if member not in value:
+            raise ValueError(
+                f"cannot resolve {expression!r}: member {member!r} is missing"
+            )
+        value = value[member]
+    return value
 
 
 def _positive_int(value: Any, field_name: str) -> int:
@@ -200,7 +261,9 @@ def _normalize_outputs(value: Any, step_id: str) -> dict[str, Optional[str]]:
 
 
 def _artifact_path_dimensions(path: str, step_id: str, name: str) -> list[str]:
-    dimensions = ARTIFACT_MATRIX_REF_RE.findall(path)
+    dimensions = [
+        match.group(1) for match in ARTIFACT_MATRIX_REF_RE.finditer(path)
+    ]
     remainder = ARTIFACT_MATRIX_REF_RE.sub("value", path)
     if "${{" in remainder or "}}" in remainder:
         raise ValueError(
@@ -307,12 +370,19 @@ def _normalize_json_source(
             f"{context} JSON source must contain exactly "
             "non-empty string 'json' and 'field' values"
         )
-    path = Path(source["json"])
-    if path.is_absolute() or ".." in path.parts:
-        raise ValueError(
-            f"{context} JSON path must be safe and "
-            "workspace-relative"
-        )
+    input_reference = EXPR_RE.match(source["json"])
+    if input_reference:
+        if not INPUT_REF_RE.match(input_reference.group(1).strip()):
+            raise ValueError(
+                f"{context} JSON path expression must reference a labelled input"
+            )
+    else:
+        path = Path(source["json"])
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(
+                f"{context} JSON path must be safe and "
+                "workspace-relative"
+            )
     fields = source["field"].split(".")
     if any(not part for part in fields):
         raise ValueError(
@@ -449,6 +519,8 @@ def _extract_references(value: Any) -> tuple[list[str], list[str], list[str]]:
         if isinstance(item, (InputArgument, JsonArgumentSource)):
             if isinstance(item, InputArgument):
                 visit(item.value)
+            else:
+                visit(item.path)
             return
         if isinstance(item, str):
             match = EXPR_RE.match(item)
@@ -522,6 +594,20 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         if len(lengths) != 1:
             raise ValueError(f"zip group {group!r} has mismatched lengths")
 
+    inputs, input_labels = _normalize_inputs(raw.get("inputs"))
+    for dimension, value in matrix.items():
+        if isinstance(value, JsonMatrixSource):
+            match = EXPR_RE.match(value.path)
+            if match:
+                input_match = INPUT_REF_RE.match(match.group(1).strip())
+                if (
+                    input_match is None
+                    or input_match.group(1) not in input_labels
+                ):
+                    raise ValueError(
+                        f"matrix dimension {dimension!r} references an unknown "
+                        "labelled input"
+                    )
     raw_steps = raw.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ValueError("'steps' must be a non-empty list")
@@ -597,10 +683,11 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 f"step {step_id!r} references unknown matrix dimensions "
                 f"{sorted(unknown_dimensions)}"
             )
-        if referenced_inputs:
+        unknown_inputs = set(referenced_inputs) - set(input_labels)
+        if unknown_inputs:
             raise ValueError(
-                "'inputs.<name>' expressions are not part of the staging model; "
-                "declare staged paths under 'inputs' and use an 'input:' argument"
+                f"step {step_id!r} references unknown labelled inputs "
+                f"{sorted(unknown_inputs)}"
             )
         unknown_steps = set(referenced_steps) - ids
         if unknown_steps:
@@ -667,7 +754,8 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         description=description,
         matrix=dict(matrix),
         zip_groups=zip_groups,
-        inputs=_string_list(raw.get("inputs"), "inputs"),
+        inputs=inputs,
+        input_labels=input_labels,
         steps=steps,
         workdir=workdir,
         raw=raw,
@@ -982,7 +1070,10 @@ class PipelineRunner:
             if not isinstance(value, JsonMatrixSource):
                 matrix[name] = value
                 continue
-            source = (self.workspace.root / value.path).resolve()
+            logical_path = self._resolve_input_label(
+                value.path, pipeline.input_labels,
+            )
+            source = (self.workspace.root / logical_path).resolve()
             try:
                 source.relative_to(self.workspace.root.resolve())
             except ValueError as exc:
@@ -1059,9 +1150,12 @@ class PipelineRunner:
         execution: StepExecution,
         upstream: dict[str, ExecutionResult],
         staged_dir: Path,
+        input_labels: Optional[dict[str, str]] = None,
     ) -> Any:
+        input_labels = input_labels or {}
         if isinstance(value, JsonArgumentSource):
-            source = (staged_dir / value.path).resolve()
+            logical_path = self._resolve_input_label(value.path, input_labels)
+            source = (staged_dir / logical_path).resolve()
             try:
                 source.relative_to(staged_dir.resolve())
             except ValueError as exc:
@@ -1077,7 +1171,7 @@ class PipelineRunner:
             return _read_json_field(source, value.field, "step argument source")
         if isinstance(value, InputArgument):
             logical = self._resolve_value(
-                value.value, execution, upstream, staged_dir,
+                value.value, execution, upstream, staged_dir, input_labels,
             )
             if not isinstance(logical, str):
                 raise ValueError(
@@ -1107,7 +1201,15 @@ class PipelineRunner:
             expression = match.group(1).strip()
             matrix_match = MATRIX_REF_RE.match(expression)
             if matrix_match:
-                return execution.values[matrix_match.group(1)]
+                return _resolve_members(
+                    execution.values[matrix_match.group(1)],
+                    _matrix_members(matrix_match),
+                    expression,
+                )
+            input_match = INPUT_REF_RE.match(expression)
+            if input_match:
+                logical = input_labels[input_match.group(1)]
+                return str((staged_dir / logical).resolve())
             step_match = STEP_REF_RE.match(expression)
             if step_match:
                 step_id, kind, name = step_match.groups()
@@ -1117,15 +1219,32 @@ class PipelineRunner:
             raise ValueError(f"unsupported expression {value!r}")
         if isinstance(value, list):
             return [
-                self._resolve_value(x, execution, upstream, staged_dir)
+                self._resolve_value(
+                    x, execution, upstream, staged_dir, input_labels,
+                )
                 for x in value
             ]
         if isinstance(value, dict):
             return {
-                key: self._resolve_value(child, execution, upstream, staged_dir)
+                key: self._resolve_value(
+                    child, execution, upstream, staged_dir, input_labels,
+                )
                 for key, child in value.items()
             }
         return value
+
+    @staticmethod
+    def _resolve_input_label(value: str, labels: dict[str, str]) -> str:
+        match = EXPR_RE.match(value)
+        if not match:
+            return value
+        reference = INPUT_REF_RE.match(match.group(1).strip())
+        if not reference:
+            raise ValueError(f"unsupported input path expression {value!r}")
+        label = reference.group(1)
+        if label not in labels:
+            raise ValueError(f"unknown labelled input {label!r}")
+        return labels[label]
 
     def _execute(
         self,
@@ -1151,7 +1270,9 @@ class PipelineRunner:
             self._artifact_path(execution, name, spec)
         output_file = workdir / OUTPUT_FILE_NAME
         arguments = {
-            name: self._resolve_value(value, execution, upstream, staged_dir)
+            name: self._resolve_value(
+                value, execution, upstream, staged_dir, pipeline.input_labels,
+            )
             for name, value in step.arguments.items()
         }
         args_file = workdir / ARGS_FILE_NAME
@@ -1345,9 +1466,14 @@ class PipelineRunner:
             )
 
         process_id = process.get("id")
-        model = process.get("model")
-        commands = process.get("process")
+        model = process.get("model", "")
+        definitions = process.get("process")
         launch = process.get("launch", {})
+        output_mode = process.get("output", "")
+        default_preamble = arguments.get("proc_card_preamble", [])
+        proc_card_preamble = process.get(
+            "proc_card_preamble", default_preamble,
+        )
         default_launch = arguments.get("default_launch", {})
         if (
             not isinstance(process_id, str)
@@ -1357,25 +1483,65 @@ class PipelineRunner:
                 "action 'madgraph/cards' process.id must be a safe, "
                 "non-empty identifier"
             )
-        if not isinstance(model, str) or not model.strip():
+        if not isinstance(model, str):
             raise ValueError(
-                "action 'madgraph/cards' process.model must be a non-empty string"
+                "action 'madgraph/cards' process.model must be a string"
             )
         if (
-            not isinstance(commands, list)
-            or not commands
-            or not all(isinstance(command, str) and command.strip()
-                       for command in commands)
+            not isinstance(definitions, list)
+            or not definitions
+            or not all(isinstance(definition, str) and definition.strip()
+                       for definition in definitions)
         ):
             raise ValueError(
                 "action 'madgraph/cards' process.process must be a non-empty "
-                "list of command strings"
+                "list of process-definition strings"
+            )
+        prefixed = [
+            definition for definition in definitions
+            if re.match(
+                r"^\s*(?:generate|add\s+process)\b",
+                definition,
+                flags=re.IGNORECASE,
+            )
+        ]
+        if prefixed:
+            raise ValueError(
+                "action 'madgraph/cards' process.process entries are "
+                "definitions only and must not start with 'generate' or "
+                "'add process'"
             )
         if not isinstance(launch, dict) or not all(
             isinstance(name, str) and name for name in launch
         ):
             raise ValueError(
                 "action 'madgraph/cards' process.launch must be a mapping"
+            )
+        if not isinstance(output_mode, str):
+            raise ValueError(
+                "action 'madgraph/cards' process.output must be a string"
+            )
+        if (
+            not isinstance(default_preamble, list)
+            or not all(
+                isinstance(command, str) and command.strip()
+                for command in default_preamble
+            )
+        ):
+            raise ValueError(
+                "action 'madgraph/cards' with.proc_card_preamble must be "
+                "a list of non-empty command strings"
+            )
+        if (
+            not isinstance(proc_card_preamble, list)
+            or not all(
+                isinstance(command, str) and command.strip()
+                for command in proc_card_preamble
+            )
+        ):
+            raise ValueError(
+                "action 'madgraph/cards' process.proc_card_preamble must be "
+                "a list of non-empty command strings"
             )
         if not isinstance(default_launch, dict) or not all(
             isinstance(name, str) and name for name in default_launch
@@ -1384,9 +1550,23 @@ class PipelineRunner:
                 "action 'madgraph/cards' with.default_launch must be a mapping"
             )
 
-        proc_lines = [f"import model {model.strip()}"]
-        proc_lines.extend(command.strip() for command in commands)
-        proc_lines.append(f"output {process_id}")
+        proc_lines: list[str] = []
+        if model.strip():
+            proc_lines.append(f"import model {model.strip()}")
+        proc_lines.extend(command.strip() for command in proc_card_preamble)
+        proc_lines.extend(
+            (
+                f"generate {definition.strip()}"
+                if index == 0
+                else f"add process {definition.strip()}"
+            )
+            for index, definition in enumerate(definitions)
+        )
+        output_parts = ["output"]
+        if output_mode.strip():
+            output_parts.append(output_mode.strip())
+        output_parts.append(process_id)
+        proc_lines.append(" ".join(output_parts))
         (workdir / "proc_card.dat").write_text(
             "\n".join(proc_lines) + "\n", encoding="utf-8",
         )
@@ -1473,7 +1653,11 @@ class PipelineRunner:
                     f"step {execution.step.id!r} artifact {name!r} references "
                     f"unavailable matrix dimension {dimension!r}"
                 )
-            return str(execution.values[dimension])
+            return str(_resolve_members(
+                execution.values[dimension],
+                _matrix_members(match),
+                match.group(0),
+            ))
 
         resolved = ARTIFACT_MATRIX_REF_RE.sub(replace, spec.path)
         path = Path(resolved)
