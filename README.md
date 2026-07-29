@@ -61,10 +61,6 @@ steps:
     with:
       proc_card:
         input: ${{ matrix.proc_card }}
-    artifacts:
-      process_dir:
-        path: generated
-        save: false
 
   - id: compile
     script: compile.sh
@@ -673,9 +669,32 @@ with:
     input: ${{ matrix.proc_card }}
 ```
 
-The global matrix must contain `mg_version`. MadGraph runs with the step work
-directory as its current directory. Any generated process directory can be
-declared as a normal artifact.
+The global matrix must contain `mg_version`. The action automatically declares
+one artifact:
+
+```yaml
+artifacts:
+  process_workspace:
+    path: process_workspace
+    save: false
+```
+
+MadGraph runs inside this workspace, which contains the process directory
+named by the proc card's `output` command. Downstream steps can reference it
+directly:
+
+```yaml
+with:
+  process_workspace: ${{ steps.generate_process.artifacts.process_workspace }}
+```
+
+As with the two automatic artifacts from `madgraph/cards`, an explicit
+artifact declaration with the same name overrides these defaults.
+
+Generated MadGraph workspaces commonly contain relative symbolic links.
+MadBench accepts and caches links whose targets remain inside the artifact,
+preserving them when the cache is restored. Absolute links and relative links
+that escape the artifact remain forbidden.
 
 ## Outputs
 

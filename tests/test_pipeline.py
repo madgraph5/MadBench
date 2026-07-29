@@ -211,6 +211,20 @@ def test_action_requires_mg_version_and_proc_card():
             "steps": [{"id": "generate", "action": "madgraph/process"}],
         }, source="test")
 
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {"mg_version": ["v1"]},
+        "steps": [{
+            "id": "generate",
+            "action": "madgraph/process",
+            "with": {"proc_card": "card.dat"},
+        }],
+    }, source="test")
+    assert (
+        pipeline.steps[0].artifacts["process_workspace"].path
+        == "process_workspace"
+    )
+
 
 def test_cards_action_requires_process_and_declares_default_artifacts():
     with pytest.raises(ValueError, match="with.process"):
@@ -863,6 +877,7 @@ def test_madgraph_process_action(tmp_path):
         "test -f \"$1\"\n"
         "mkdir generated\n"
         "printf process > generated/value\n"
+        "ln -s value generated/value-link\n"
     )
     mg_bin.chmod(mg_bin.stat().st_mode | stat.S_IEXEC)
     path = make_pipeline(root, {
@@ -878,14 +893,40 @@ def test_madgraph_process_action(tmp_path):
             "with": {
                 "proc_card": {"input": "${{ matrix.proc_card }}"},
             },
-            "artifacts": {
-                "process": {"path": "generated", "save": True},
-            },
+            "cache": True,
         }],
     })
-    MadBench(find_workspace(root)).run(path)
-    result_dir = only_result_dir(root, "action")
-    assert list((result_dir / "artifacts").rglob("value"))
+    runner = MadBench(find_workspace(root))
+    runner.run(path)
+    runner.run(path)
+    result_dir = sorted((root / "results" / "action").iterdir())[-1]
+    result = json.loads((result_dir / "result.json").read_text())
+    step = result["steps"][0]
+    assert step["cache"] == "hit"
+    workspace = Path(step["artifacts"]["process_workspace"]["path"])
+    assert (workspace / "generated" / "value").read_text() == "process"
+    assert (workspace / "generated" / "value-link").is_symlink()
+
+
+def test_artifact_rejects_symlink_escaping_its_root(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "build.sh",
+        'mkdir artifact\n'
+        'ln -s /etc/passwd artifact/external\n',
+    )
+    path = make_pipeline(root, {
+        "name": "unsafe_link",
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "artifacts": {"artifact": {"path": "artifact"}},
+        }],
+    })
+
+    with pytest.raises(ValueError, match="absolute symbolic link"):
+        MadBench(find_workspace(root)).run(path)
 
 
 def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):

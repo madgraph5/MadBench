@@ -660,6 +660,10 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 raise ValueError(
                     "action 'madgraph/process' requires 'with.proc_card'"
                 )
+            artifacts.setdefault(
+                "process_workspace",
+                ArtifactDefinition(path="process_workspace"),
+            )
         elif action == "madgraph/cards":
             if "process" not in arguments:
                 raise ValueError(
@@ -888,10 +892,41 @@ def _path_digest(path: Path) -> str:
         digest.update(path.read_bytes())
         return digest.hexdigest()
     for child in sorted(path.rglob("*")):
-        if child.is_file():
-            digest.update(str(child.relative_to(path)).encode())
+        relative = str(child.relative_to(path)).encode()
+        if child.is_symlink():
+            digest.update(b"link\0")
+            digest.update(relative)
+            digest.update(os.readlink(child).encode())
+        elif child.is_file():
+            digest.update(relative)
             digest.update(child.read_bytes())
     return digest.hexdigest()
+
+
+def _validate_portable_symlinks(path: Path, context: str) -> None:
+    """Allow only relative links whose resolved targets stay inside ``path``."""
+    if path.is_symlink():
+        raise ValueError(f"{context} is a symbolic link")
+    if not path.is_dir():
+        return
+    root = path.resolve()
+    for child in path.rglob("*"):
+        if not child.is_symlink():
+            continue
+        target = Path(os.readlink(child))
+        if target.is_absolute():
+            raise ValueError(
+                f"{context} contains absolute symbolic link "
+                f"{child.relative_to(path)!s} -> {target!s}"
+            )
+        resolved = (child.parent / target).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"{context} contains symbolic link escaping the artifact: "
+                f"{child.relative_to(path)!s} -> {target!s}"
+            ) from exc
 
 
 def _read_json_field(source: Path, field_name: str, context: str) -> Any:
@@ -925,9 +960,26 @@ def _safe_extract(archive: Path, destination: Path) -> None:
                 raise ValueError(
                     f"unsafe path in cache archive: {member.name!r}"
                 ) from exc
-            if member.issym() or member.islnk():
-                raise ValueError(f"links are forbidden in cache: {member.name!r}")
-            if member.isdir():
+            if member.issym():
+                link = Path(member.linkname)
+                if link.is_absolute():
+                    raise ValueError(
+                        f"absolute link is forbidden in cache: {member.name!r}"
+                    )
+                link_target = (target.parent / link).resolve()
+                try:
+                    link_target.relative_to(destination.resolve())
+                except ValueError as exc:
+                    raise ValueError(
+                        f"link escapes cache destination: {member.name!r}"
+                    ) from exc
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(member.linkname)
+            elif member.islnk():
+                raise ValueError(
+                    f"hard links are forbidden in cache: {member.name!r}"
+                )
+            elif member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -1455,9 +1507,11 @@ class PipelineRunner:
         mg_bin = Path(mg_bin_value)
         if not mg_bin.is_file():
             raise FileNotFoundError(f"MadGraph binary not found: {mg_bin}")
+        process_workspace = workdir / "process_workspace"
+        process_workspace.mkdir()
         completed = subprocess.run(
             [str(mg_bin), proc_card],
-            cwd=workdir,
+            cwd=process_workspace,
             env=env,
             stdout=stdout,
             stderr=stderr,
@@ -1713,14 +1767,10 @@ class PipelineRunner:
                     f"step {execution.step.id!r} artifact {name!r} resolves "
                     "outside its work directory"
                 ) from exc
-            if source.is_symlink() or (
-                source.is_dir()
-                and any(child.is_symlink() for child in source.rglob("*"))
-            ):
-                raise ValueError(
-                    f"step {execution.step.id!r} artifact {name!r} contains "
-                    "symbolic links, which are not portable artifacts"
-                )
+            _validate_portable_symlinks(
+                source,
+                f"step {execution.step.id!r} artifact {name!r}",
+            )
             artifacts[name] = str(source.resolve())
             digests[name] = _path_digest(source)
             if spec.save:
@@ -1730,7 +1780,9 @@ class PipelineRunner:
                 )
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if source.is_dir():
-                    shutil.copytree(source, destination, dirs_exist_ok=True)
+                    shutil.copytree(
+                        source, destination, dirs_exist_ok=True, symlinks=True,
+                    )
                 else:
                     shutil.copy2(source, destination)
                 saved[name] = str(destination.resolve())
