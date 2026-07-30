@@ -73,10 +73,11 @@ Every run creates:
 ```text
 results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
-├── report.json       # atomically updated deep execution record
-├── results.csv       # live final-step repetition rows
-├── step_timings.csv  # live row for every step execution
-├── summary.csv       # live aggregate statistics and completion counts
+├── metadata.yml             # standalone hardware and software
+├── report.json              # atomically updated deep execution record
+├── results_<step-id>.csv    # one live observation view per step
+├── summary_<step-id>.csv    # live aggregate for each repeated step
+├── step_timings.csv         # live row for every step execution
 ├── attempts/
 │   └── try_0/        # attempt-scoped report/results/timings
 └── artifacts/        # <step>/<mg_version>/<rep>/<published path>

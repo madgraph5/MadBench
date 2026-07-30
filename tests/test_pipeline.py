@@ -567,9 +567,10 @@ def test_pipeline_updates_partial_csv_views_after_each_final_result(tmp_path):
         "run.sh",
         'process=$1\n'
         'if [ "$MADBENCH_REPETITION" = "02" ] && [ "$process" = "a" ]; then\n'
-        f'  result_csv=$(find "{results_root}" -name results.csv '
+        f'  result_csv=$(find "{results_root}" -name results_run.csv '
         '-not -path "*/attempts/*")\n'
-        f'  summary_csv=$(find "{results_root}" -name summary.csv)\n'
+        f'  summary_csv=$(find "{results_root}" -name summary_run.csv '
+        '-not -path "*/attempts/*")\n'
         f'  timings_csv=$(find "{results_root}" -name step_timings.csv '
         '-not -path "*/attempts/*")\n'
         '  test "$(tail -n +2 "$result_csv" | wc -l)" -eq 2\n'
@@ -594,27 +595,32 @@ def test_pipeline_updates_partial_csv_views_after_each_final_result(tmp_path):
     MadBench(find_workspace(root)).run(path)
 
     result_dir = only_result_dir(root, "live")
-    with open(result_dir / "results.csv", newline="") as file:
+    with open(result_dir / "results_run.csv", newline="") as file:
         rows = list(csv.DictReader(file))
     assert [
         (row["repetition"], row["process"]) for row in rows
     ] == [("1", "a"), ("1", "b"), ("2", "a"), ("2", "b")]
-    with open(result_dir / "summary.csv", newline="") as file:
+    with open(result_dir / "summary_run.csv", newline="") as file:
         summaries = list(csv.DictReader(file))
     assert all(row["n_expected"] == "2" for row in summaries)
     assert all(row["n_completed"] == "2" for row in summaries)
     assert all(row["complete"] == "True" for row in summaries)
     attempt_dir = result_dir / "attempts" / "try_0"
     assert (attempt_dir / "report.json").is_file()
-    assert (attempt_dir / "results.csv").read_text() == (
-        result_dir / "results.csv"
+    assert (attempt_dir / "results_run.csv").read_text() == (
+        result_dir / "results_run.csv"
+    ).read_text()
+    assert (attempt_dir / "summary_run.csv").read_text() == (
+        result_dir / "summary_run.csv"
     ).read_text()
     assert (attempt_dir / "step_timings.csv").read_text() == (
         result_dir / "step_timings.csv"
     ).read_text()
+    assert not (result_dir / "results.csv").exists()
+    assert not (result_dir / "summary.csv").exists()
 
 
-def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
+def test_pipeline_writes_native_results_for_every_step(
     tmp_path,
 ):
     root = make_workspace(tmp_path)
@@ -684,6 +690,10 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
 
     result_dir = only_result_dir(root, "pipe")
     manifest = json.loads((result_dir / "report.json").read_text())
+    metadata = yaml.safe_load((result_dir / "metadata.yml").read_text())
+    assert set(metadata) == {"hardware", "software"}
+    assert metadata["hardware"] == manifest["hardware"]
+    assert metadata["software"] == manifest["software"]
     assert len(manifest["steps"]) == 2 + 8
     assert all(entry["total_time"] >= 0 for entry in manifest["steps"])
     assert all(
@@ -709,12 +719,21 @@ def test_pipeline_resolves_inputs_transfers_artifacts_and_flattens_outputs(
         or Path(entry["artifacts"]["executable"]["published_path"]).is_dir()
         for entry in compile_entries
     )
-    with open(result_dir / "results.csv", newline="") as file:
-        rows = list(csv.DictReader(file))
-    assert len(rows) == 8
-    assert {row["compile.compile_seconds"] for row in rows} == {"2"}
-    assert {row["benchmark.runtime"] for row in rows} == {"1", "2"}
-    assert (result_dir / "summary.csv").is_file()
+    with open(result_dir / "results_compile.csv", newline="") as file:
+        compile_rows = list(csv.DictReader(file))
+    assert len(compile_rows) == 2
+    assert {row["compile_seconds"] for row in compile_rows} == {"2"}
+    assert {row["process"] for row in compile_rows} == {"a", "b"}
+    assert "blocks" not in compile_rows[0]
+    with open(result_dir / "results_benchmark.csv", newline="") as file:
+        benchmark_rows = list(csv.DictReader(file))
+    assert len(benchmark_rows) == 8
+    assert {row["runtime"] for row in benchmark_rows} == {"1", "2"}
+    assert {row["repetition"] for row in benchmark_rows} == {"1", "2"}
+    assert (result_dir / "summary_benchmark.csv").is_file()
+    assert not (result_dir / "summary_compile.csv").exists()
+    assert not (result_dir / "results.csv").exists()
+    assert not (result_dir / "summary.csv").exists()
     with open(result_dir / "step_timings.csv", newline="") as file:
         timing_rows = list(csv.DictReader(file))
     assert len(timing_rows) == 10
@@ -891,13 +910,17 @@ def test_pipeline_skips_conditional_step_and_preserves_upstream_results(
         if entry["step_id"] == "profile"
     }
     assert profile_statuses == {"cuda": "success", "cpp": "skipped"}
-    with open(result_dir / "results.csv", newline="") as file:
-        rows = {row["backend"]: row for row in csv.DictReader(file)}
-    assert rows["cuda"]["prepare.prepared"] == "True"
-    assert rows["cuda"]["profile.profiled"] == "True"
-    assert rows["cpp"]["prepare.prepared"] == "True"
-    assert rows["cpp"]["profile.profiled"] == ""
-    assert rows["cpp"]["status"] == "skipped"
+    with open(result_dir / "results_prepare.csv", newline="") as file:
+        prepare_rows = list(csv.DictReader(file))
+    assert len(prepare_rows) == 1
+    assert prepare_rows[0]["prepared"] == "True"
+    with open(result_dir / "results_profile.csv", newline="") as file:
+        profile_rows = {
+            row["backend"]: row for row in csv.DictReader(file)
+        }
+    assert profile_rows["cuda"]["profiled"] == "True"
+    assert profile_rows["cpp"]["profiled"] == ""
+    assert profile_rows["cpp"]["status"] == "skipped"
 
 
 def test_input_wrapper_requires_staged_file(tmp_path):
