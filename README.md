@@ -587,8 +587,9 @@ directories are supported only by unlabelled inputs used for bulk staging.
 `json` is either a labelled input expression or a safe workspace-relative
 filename. `field` selects the non-empty array used for that dimension and
 supports dot-separated nested fields, such as
-`catalogue.madgraph.processes`. Matrix sources are loaded before MadBench
-plans any executions, so dry runs and downstream dimension inference see one
+`catalogue.madgraph.processes`. Every selected entry must be a JSON object
+with a unique, non-empty string `id`; MadBench validates this before planning
+any executions. Dry runs and downstream dimension inference then see one
 `matrix.process` value per JSON entry.
 
 JSON array elements remain intact as matrix values. Members can therefore be
@@ -596,7 +597,13 @@ used in step arguments and artifact paths, for example
 `${{ matrix.process.id }}` and
 `gridpacks/${{ matrix.process.output }}.tar.gz`. Member access may be nested
 further and fails clearly when a member is absent or an intermediate value is
-not an object.
+not an object. CSV result, summary, and timing views use the entry's `id` as
+the compact value of that matrix dimension instead of serializing the full
+object. The full object remains available during execution and is retained in
+`report.json`. MadBench also copies the exact source file below
+`matrix_inputs/` in the run's result directory, preserving its
+workspace-relative path. For this example the retained definition is
+`matrix_inputs/inputs/processes.json`.
 
 The action requires each selected value to contain `id` and a non-empty list
 of MadGraph process definitions under `process`. The first definition emits
@@ -959,6 +966,7 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
 ├── metadata.yml                  # standalone hardware and software
 ├── report.json                    # live merged deep execution state
+├── matrix_inputs/                 # retained JSON matrix source files
 ├── results_<step-id>.csv          # one live observation view per step
 ├── summary_<step-id>.csv          # one per repeated step
 ├── step_timings.csv               # live timings for every step
@@ -990,6 +998,7 @@ information do not have to ship or parse the full report.
 `report.json` is the canonical deep-tracking record. It records:
 
 - Pipeline metadata and original matrix.
+- JSON matrix source fields, digests, and retained paths.
 - Hardware, software, and Git revision.
 - Expanded matrix points.
 - Staged input paths and digests.

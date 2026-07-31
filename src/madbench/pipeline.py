@@ -62,6 +62,7 @@ class JsonMatrixSource:
 
     path: str
     field: str
+    content: Optional[bytes] = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,7 @@ class PipelineDefinition:
     name: str
     description: str
     matrix: dict[str, Any]
+    json_matrix_sources: dict[str, JsonMatrixSource]
     zip_groups: list[list[str]]
     inputs: list[str]
     input_labels: dict[str, str]
@@ -781,6 +783,10 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
         name=name,
         description=description,
         matrix=dict(matrix),
+        json_matrix_sources={
+            key: value for key, value in matrix.items()
+            if isinstance(value, JsonMatrixSource)
+        },
         zip_groups=zip_groups,
         inputs=inputs,
         input_labels=input_labels,
@@ -879,6 +885,15 @@ def _short_identity(step_id: str, values: dict[str, Any]) -> str:
     return f"{step_id}-{digest}"
 
 
+def _csv_dimension_value(
+    pipeline: PipelineDefinition, name: str, value: Any,
+) -> Any:
+    """Return the compact CSV label for one matrix dimension value."""
+    if name in pipeline.json_matrix_sources and isinstance(value, dict):
+        return value["id"]
+    return value
+
+
 def build_step_executions(
     pipeline: PipelineDefinition,
 ) -> dict[str, list[StepExecution]]:
@@ -946,9 +961,11 @@ def _validate_portable_symlinks(path: Path, context: str) -> None:
             ) from exc
 
 
-def _read_json_field(source: Path, field_name: str, context: str) -> Any:
+def _read_json_field_text(
+    content: str, source: Path, field_name: str, context: str,
+) -> Any:
     try:
-        selected: Any = json.loads(source.read_text(encoding="utf-8"))
+        selected: Any = json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"{context} contains invalid JSON: {source}: {exc}"
@@ -964,6 +981,12 @@ def _read_json_field(source: Path, field_name: str, context: str) -> Any:
             )
         selected = selected[part]
     return selected
+
+
+def _read_json_field(source: Path, field_name: str, context: str) -> Any:
+    return _read_json_field_text(
+        source.read_text(encoding="utf-8"), source, field_name, context,
+    )
 
 
 def _safe_extract(archive: Path, destination: Path) -> None:
@@ -1059,6 +1082,9 @@ class PipelineRunner:
         result_dir.mkdir(parents=True, exist_ok=True)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         run_dir.mkdir(parents=True, exist_ok=True)
+        retained_matrix_sources = self._retain_matrix_sources(
+            pipeline, result_dir,
+        )
         self._write_metadata(
             result_dir / "metadata.yml", hardware, software,
         )
@@ -1079,6 +1105,7 @@ class PipelineRunner:
             "hardware": hardware,
             "software": software,
             "matrix": pipeline.matrix,
+            "matrix_sources": retained_matrix_sources,
             "zip": pipeline.zip_groups,
             "matrix_points": matrix_points,
             "staged_inputs": self._staged_input_manifest(staged_dir),
@@ -1243,6 +1270,8 @@ class PipelineRunner:
         self, pipeline: PipelineDefinition,
     ) -> PipelineDefinition:
         matrix: dict[str, Any] = {}
+        source_contents: dict[str, bytes] = {}
+        resolved_sources: dict[str, JsonMatrixSource] = {}
         for name, value in pipeline.matrix.items():
             if not isinstance(value, JsonMatrixSource):
                 matrix[name] = value
@@ -1262,16 +1291,89 @@ class PipelineRunner:
                 raise FileNotFoundError(
                     f"matrix dimension {name!r} JSON source not found: {source}"
                 )
-            selected = _read_json_field(
-                source, value.field, f"matrix dimension {name!r} source",
+            if logical_path not in source_contents:
+                source_contents[logical_path] = source.read_bytes()
+            content = source_contents[logical_path]
+            selected = _read_json_field_text(
+                content.decode("utf-8"),
+                source,
+                value.field,
+                f"matrix dimension {name!r} source",
             )
             if not isinstance(selected, list) or not selected:
                 raise ValueError(
                     f"matrix dimension {name!r} field {value.field!r} in "
                     f"{source} must contain a non-empty array"
                 )
+            identifiers: set[str] = set()
+            for index, item in enumerate(selected):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"matrix dimension {name!r} field {value.field!r} in "
+                        f"{source} entry {index} must be a JSON object with "
+                        "a non-empty string 'id'"
+                    )
+                identifier = item.get("id")
+                if not isinstance(identifier, str) or not identifier.strip():
+                    raise ValueError(
+                        f"matrix dimension {name!r} field {value.field!r} in "
+                        f"{source} entry {index} must contain a non-empty "
+                        "string 'id'"
+                    )
+                if identifier in identifiers:
+                    raise ValueError(
+                        f"matrix dimension {name!r} field {value.field!r} in "
+                        f"{source} contains duplicate id {identifier!r}"
+                    )
+                identifiers.add(identifier)
             matrix[name] = selected
-        return replace(pipeline, matrix=matrix)
+            resolved_sources[name] = replace(
+                value, path=logical_path, content=content,
+            )
+        return replace(
+            pipeline,
+            matrix=matrix,
+            json_matrix_sources=resolved_sources,
+        )
+
+    @staticmethod
+    def _retain_matrix_sources(
+        pipeline: PipelineDefinition, result_dir: Path,
+    ) -> dict[str, dict[str, str]]:
+        """Retain the exact JSON matrix inputs used to plan the run."""
+        retained: dict[str, dict[str, str]] = {}
+        written: set[Path] = set()
+        for dimension, source in pipeline.json_matrix_sources.items():
+            if source.content is None:
+                raise RuntimeError(
+                    f"matrix dimension {dimension!r} source was not resolved"
+                )
+            logical_path = Path(source.path)
+            if logical_path.is_absolute() or ".." in logical_path.parts:
+                raise ValueError(
+                    f"matrix dimension {dimension!r} has unsafe retained "
+                    f"source path {source.path!r}"
+                )
+            relative = Path("matrix_inputs") / logical_path
+            destination = (result_dir / relative).resolve()
+            try:
+                destination.relative_to(result_dir.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"matrix dimension {dimension!r} retained source escapes "
+                    f"the result directory: {source.path!r}"
+                ) from exc
+            if destination not in written:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(source.content)
+                written.add(destination)
+            retained[dimension] = {
+                "source": source.path,
+                "field": source.field,
+                "retained_path": relative.as_posix(),
+                "sha256": hashlib.sha256(source.content).hexdigest(),
+            }
+        return retained
 
     def _workdir_base(self, pipeline: PipelineDefinition) -> Path:
         if pipeline.workdir is None:
@@ -2180,6 +2282,7 @@ class PipelineRunner:
     ) -> None:
         for step in pipeline.steps:
             self._write_step_results_csv(
+                pipeline,
                 step,
                 result_dir / f"results_{step.id}.csv",
                 result_index.get(step.id, []),
@@ -2187,6 +2290,7 @@ class PipelineRunner:
 
     @staticmethod
     def _write_step_results_csv(
+        pipeline: PipelineDefinition,
         step: StepDefinition,
         path: Path,
         results: list[ExecutionResult],
@@ -2212,7 +2316,10 @@ class PipelineRunner:
             writer.writeheader()
             for result in results:
                 row: dict[str, Any] = {
-                    key: result.dimensions.get(key, "") for key in step.dimensions
+                    key: _csv_dimension_value(
+                        pipeline, key, result.dimensions.get(key, ""),
+                    )
+                    for key in step.dimensions
                 }
                 row["repetition"] = result.repetition
                 for name in step.outputs:
@@ -2267,7 +2374,9 @@ class PipelineRunner:
                     "total_time": result.total_time,
                 }
                 row.update({
-                    name: result.dimensions.get(name, "")
+                    name: _csv_dimension_value(
+                        pipeline, name, result.dimensions.get(name, ""),
+                    )
                     for name in pipeline.matrix
                 })
                 writer.writerow(row)
@@ -2283,6 +2392,7 @@ class PipelineRunner:
             if step.repeat <= 1:
                 continue
             self._write_step_summary_csv(
+                pipeline,
                 step,
                 result_dir / f"summary_{step.id}.csv",
                 result_index.get(step.id, []),
@@ -2290,6 +2400,7 @@ class PipelineRunner:
 
     @staticmethod
     def _write_step_summary_csv(
+        pipeline: PipelineDefinition,
         step: StepDefinition,
         path: Path,
         results: list[ExecutionResult],
@@ -2334,7 +2445,12 @@ class PipelineRunner:
                     result for result in results if result.status == "skipped"
                 ]
                 row: dict[str, Any] = {
-                    **results[0].dimensions,
+                    **{
+                        name: _csv_dimension_value(
+                            pipeline, name, results[0].dimensions[name],
+                        )
+                        for name in step.dimensions
+                    },
                     "n_successful": len(successful),
                     "n_failed": len(failed),
                     "n_blocked": len(blocked),

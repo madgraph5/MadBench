@@ -312,6 +312,42 @@ def test_json_matrix_source_is_validated_before_expansion():
         }, source="test")
 
 
+@pytest.mark.parametrize(("entries", "message"), [
+    ([{"process": ["p p > j j"]}], "entry 0.*non-empty string 'id'"),
+    (["dy_0j"], "entry 0.*JSON object"),
+    ([{"id": "   "}], "entry 0.*non-empty string 'id'"),
+    ([{"id": "dy_0j"}, {"id": "dy_0j"}], "duplicate id 'dy_0j'"),
+])
+def test_json_matrix_entries_require_unique_non_empty_string_ids(
+    tmp_path, entries, message,
+):
+    root = make_workspace(tmp_path)
+    inputs = root / "inputs"
+    inputs.mkdir()
+    (inputs / "processes.json").write_text(json.dumps({
+        "processes": entries,
+    }))
+    path = make_pipeline(root, {
+        "name": "invalid_json_matrix",
+        "matrix": {
+            "process": {
+                "from": {
+                    "json": "inputs/processes.json",
+                    "field": "processes",
+                },
+            },
+        },
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {"process": "${{ matrix.process }}"},
+        }],
+    })
+
+    with pytest.raises(ValueError, match=message):
+        MadBench(find_workspace(root)).run(path, dry_run=True)
+
+
 def test_nested_matrix_members_are_inferred_and_resolved_in_artifact_paths(
     tmp_path,
 ):
@@ -431,6 +467,89 @@ def test_labelled_input_can_feed_matrix_and_json_arguments(tmp_path):
         step["arguments"]["launch"] == {"events": 10}
         for step in manifest["steps"]
     )
+
+
+def test_json_matrix_ids_are_used_in_every_csv_view(tmp_path):
+    root = make_workspace(tmp_path)
+    inputs = root / "inputs"
+    inputs.mkdir()
+    definitions = [
+        {
+            "id": "dy_legacy",
+            "process": ["p p > l+ l-"],
+            "output": "",
+            "launch": {},
+        },
+        {
+            "id": "dy_avx2",
+            "process": ["p p > l+ l-"],
+            "output": "madevent_simd",
+            "launch": {"cudacpp_backend": "cppavx2"},
+        },
+    ]
+    (inputs / "processes.json").write_text(json.dumps({
+        "processes": definitions,
+    }))
+    make_script(
+        root,
+        "run.sh",
+        "printf '{\"runtime\": 1}' > \"$MADBENCH_OUTPUT_FILE\"\n",
+    )
+    path = make_pipeline(root, {
+        "name": "json_matrix_csv",
+        "inputs": ["inputs/processes.json"],
+        "matrix": {
+            "process": {
+                "from": {
+                    "json": "inputs/processes.json",
+                    "field": "processes",
+                },
+            },
+        },
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {"process": "${{ matrix.process }}"},
+            "outputs": {"runtime": "number"},
+            "repeat": 2,
+            "stats": ["runtime"],
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+    result_dir = only_result_dir(root, "json_matrix_csv")
+    with open(result_dir / "results_run.csv", newline="") as file:
+        result_rows = list(csv.DictReader(file))
+    with open(result_dir / "summary_run.csv", newline="") as file:
+        summary_rows = list(csv.DictReader(file))
+    with open(result_dir / "step_timings.csv", newline="") as file:
+        timing_rows = list(csv.DictReader(file))
+
+    expected_ids = {"dy_legacy", "dy_avx2"}
+    assert {row["process"] for row in result_rows} == expected_ids
+    assert {row["process"] for row in summary_rows} == expected_ids
+    assert {row["process"] for row in timing_rows} == expected_ids
+    assert all(row["n_successful"] == "2" for row in summary_rows)
+
+    retained_source = (
+        result_dir / "matrix_inputs" / "inputs" / "processes.json"
+    )
+    assert retained_source.read_bytes() == (
+        inputs / "processes.json"
+    ).read_bytes()
+    report = json.loads((result_dir / "report.json").read_text())
+    assert report["matrix"]["process"] == definitions
+    assert report["matrix_sources"]["process"]["source"] == (
+        "inputs/processes.json"
+    )
+    assert report["matrix_sources"]["process"]["field"] == "processes"
+    assert report["matrix_sources"]["process"]["retained_path"] == (
+        "matrix_inputs/inputs/processes.json"
+    )
+    assert all(isinstance(step["dimensions"]["process"], dict)
+               for step in report["steps"])
+    assert all(isinstance(step["arguments"]["process"], dict)
+               for step in report["steps"])
 
 
 def test_labelled_inputs_reject_unknown_references():

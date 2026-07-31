@@ -75,6 +75,7 @@ results/<pipeline>/<hostname>_<timestamp>/
 ├── test.yml
 ├── metadata.yml             # standalone hardware and software
 ├── report.json              # atomically updated deep execution record
+├── matrix_inputs/            # retained JSON matrix source files, when used
 ├── results_<step-id>.csv    # one live observation view per step
 ├── summary_<step-id>.csv    # live aggregate for each repeated step
 ├── step_timings.csv         # live row for every step execution
