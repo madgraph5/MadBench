@@ -1904,14 +1904,14 @@ class PipelineRunner:
                 "action 'madgraph/cards' launch values must be JSON scalars"
             )
 
-        launch_lines = [f"launch {process_id}"]
         launch_values = {**default_launch, **launch}
-        launch_lines.extend(
+        launch_lines = [
             f"set {name} {launch_value(value)}"
             for name, value in launch_values.items()
-        )
+        ]
         (workdir / "launch_card.dat").write_text(
-            "\n".join(launch_lines) + "\n", encoding="utf-8",
+            "\n".join(launch_lines) + ("\n" if launch_lines else ""),
+            encoding="utf-8",
         )
         return 0
 

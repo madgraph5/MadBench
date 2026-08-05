@@ -628,6 +628,9 @@ omitted value emits `output <id>`, while `standalone`, for example, emits
 `launch` defaults to an empty mapping. The optional `default_launch` argument
 is a mapping of settings applied to every process. Settings under the
 individual process's `launch` mapping override defaults with the same name.
+The generated launch card contains only these `set` commands. The launching
+script must prepend `launch <process-path>` because the path depends on where
+that script materializes or receives the generated process.
 
 The action automatically declares two artifacts:
 
@@ -647,7 +650,6 @@ add process e+ e- > z h j
 output standalone fcc_ee_zh
 
 # launch_card.dat
-launch fcc_ee_zh
 set madspin OFF
 set reweight OFF
 set generation.events 20000

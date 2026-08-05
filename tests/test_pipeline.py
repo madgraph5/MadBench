@@ -1331,7 +1331,7 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         'grep -q "^generate e+ e- > z h$" "$1"\n'
         '! grep -q "^define ignored" "$1"\n'
         'grep -q "^output fcc_ee_zh$" "$1"\n'
-        'grep -q "^launch fcc_ee_zh$" "$2"\n'
+        '! grep -q "^launch " "$2"\n'
         'grep -q "^set beam.energy 120$" "$2"\n',
     )
     path = make_pipeline(root, {
@@ -1414,8 +1414,7 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
         root,
         "record_pair.sh",
         'proc_id=$(awk \'/^output / {print $NF}\' "$1")\n'
-        'launch_id=$(sed -n "s/^launch //p" "$2")\n'
-        'test "$proc_id" = "$launch_id"\n'
+        '! grep -q "^launch " "$2"\n'
         'grep -q "^set madspin OFF$" "$2"\n'
         'if test "$proc_id" = fcc_ee_zh; then events=20000; '
         'else events=10000; fi\n'
