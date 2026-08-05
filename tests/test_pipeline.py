@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -971,7 +972,7 @@ def test_published_artifact_collision_is_rejected(tmp_path):
 
 
 def test_legacy_artifact_save_field_is_rejected():
-    with pytest.raises(ValueError, match="optional 'publish'"):
+    with pytest.raises(ValueError, match="optional 'publish' string"):
         parse_pipeline({
             "name": "p",
             "steps": [{
@@ -1242,6 +1243,83 @@ def test_artifact_rejects_symlink_escaping_its_root(tmp_path):
 
     with pytest.raises(ValueError, match="absolute symbolic link"):
         MadBench(find_workspace(root)).run(path)
+
+
+def test_artifact_rejects_relative_symlink_escaping_its_root(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "build.sh",
+        "mkdir artifact\n"
+        "ln -s ../external-library.a artifact/library.a\n",
+    )
+    path = make_pipeline(root, {
+        "name": "unsafe_relative_link",
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "artifacts": {"artifact": {"path": "artifact"}},
+        }],
+    })
+
+    with pytest.raises(ValueError, match="symbolic link escaping the artifact"):
+        MadBench(find_workspace(root)).run(path)
+
+
+def test_artifact_can_allow_external_symlinks_and_restore_them_from_cache(
+    tmp_path,
+):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "build.sh",
+        "mkdir artifact\n"
+        "ln -s ../external-library.a artifact/library.a\n",
+    )
+    path = make_pipeline(root, {
+        "name": "allowed_external_link",
+        "steps": [{
+            "id": "build",
+            "script": "build.sh",
+            "cache": True,
+            "artifacts": {
+                "artifact": {
+                    "path": "artifact",
+                    "allow_external_symlinks": True,
+                },
+            },
+        }],
+    })
+    runner = MadBench(find_workspace(root))
+
+    runner.run(path)
+    runner.run(path)
+
+    result_dir = sorted((root / "results" / "allowed_external_link").iterdir())[-1]
+    result = json.loads((result_dir / "report.json").read_text())
+    step = result["steps"][0]
+    link = Path(step["artifacts"]["artifact"]["path"]) / "library.a"
+    assert step["cache"] == "hit"
+    assert link.is_symlink()
+    assert os.readlink(link) == "../external-library.a"
+
+
+@pytest.mark.parametrize("value", [None, 1, "true", []])
+def test_artifact_allow_external_symlinks_must_be_boolean(value):
+    with pytest.raises(ValueError, match="allow_external_symlinks.*boolean"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "build",
+                "script": "build.sh",
+                "artifacts": {
+                    "artifact": {
+                        "path": "artifact",
+                        "allow_external_symlinks": value,
+                    },
+                },
+            }],
+        }, source="test")
 
 
 def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):

@@ -762,6 +762,24 @@ Artifact-path expressions are also inferred as step dimensions. After
 resolution, paths must remain relative to the step work directory and cannot
 contain parent traversal.
 
+By default, a directory artifact may contain only relative symbolic links
+whose targets remain inside that artifact. For a precompiled artifact whose
+external links are known and intentional, the check can be disabled for that
+artifact only:
+
+```yaml
+artifacts:
+  gridpack:
+    path: gridpack
+    allow_external_symlinks: true
+```
+
+This permits both absolute links and relative links that escape `gridpack`,
+including when the artifact is published or restored from MadBench's cache.
+The artifact itself must still be a real file or directory rather than a
+symbolic link. Because external targets are not copied into the artifact,
+enable this only when dangling or host-specific links are acceptable.
+
 Every artifact is available to later steps:
 
 ```yaml

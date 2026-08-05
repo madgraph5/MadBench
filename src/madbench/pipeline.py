@@ -77,6 +77,7 @@ class JsonArgumentSource:
 class ArtifactDefinition:
     path: str
     publish: Optional[str] = None
+    allow_external_symlinks: bool = False
 
 
 @dataclass
@@ -303,12 +304,15 @@ def _normalize_artifacts(value: Any, step_id: str) -> dict[str, ArtifactDefiniti
             spec = {"path": spec}
         if (
             not isinstance(spec, dict)
-            or not set(spec) <= {"path", "publish"}
+            or not set(spec) <= {
+                "path", "publish", "allow_external_symlinks",
+            }
             or not isinstance(spec.get("path"), str)
         ):
             raise ValueError(
                 f"step {step_id!r} artifact {name!r} must contain 'path' and "
-                "optional 'publish' string values"
+                "optional 'publish' string and "
+                "'allow_external_symlinks' boolean values"
             )
         publish = spec.get("publish")
         if publish is not None and (
@@ -318,11 +322,19 @@ def _normalize_artifacts(value: Any, step_id: str) -> dict[str, ArtifactDefiniti
                 f"step {step_id!r} artifact {name!r} 'publish' must be a "
                 "non-empty string"
             )
+        allow_external_symlinks = spec.get("allow_external_symlinks", False)
+        if not isinstance(allow_external_symlinks, bool):
+            raise ValueError(
+                f"step {step_id!r} artifact {name!r} "
+                "'allow_external_symlinks' must be boolean"
+            )
         _artifact_path_dimensions(spec["path"], step_id, name)
         if publish is not None:
             _artifact_path_dimensions(publish, step_id, name)
         result[name] = ArtifactDefinition(
-            path=spec["path"], publish=publish,
+            path=spec["path"],
+            publish=publish,
+            allow_external_symlinks=allow_external_symlinks,
         )
     return result
 
@@ -935,7 +947,11 @@ def _path_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_portable_symlinks(path: Path, context: str) -> None:
+def _validate_portable_symlinks(
+    path: Path,
+    context: str,
+    allow_external_symlinks: bool = False,
+) -> None:
     """Allow only relative links whose resolved targets stay inside ``path``."""
     if path.is_symlink():
         raise ValueError(f"{context} is a symbolic link")
@@ -947,18 +963,21 @@ def _validate_portable_symlinks(path: Path, context: str) -> None:
             continue
         target = Path(os.readlink(child))
         if target.is_absolute():
-            raise ValueError(
-                f"{context} contains absolute symbolic link "
-                f"{child.relative_to(path)!s} -> {target!s}"
-            )
+            if not allow_external_symlinks:
+                raise ValueError(
+                    f"{context} contains absolute symbolic link "
+                    f"{child.relative_to(path)!s} -> {target!s}"
+                )
+            continue
         resolved = (child.parent / target).resolve()
         try:
             resolved.relative_to(root)
         except ValueError as exc:
-            raise ValueError(
-                f"{context} contains symbolic link escaping the artifact: "
-                f"{child.relative_to(path)!s} -> {target!s}"
-            ) from exc
+            if not allow_external_symlinks:
+                raise ValueError(
+                    f"{context} contains symbolic link escaping the artifact: "
+                    f"{child.relative_to(path)!s} -> {target!s}"
+                ) from exc
 
 
 def _read_json_field_text(
@@ -989,30 +1008,41 @@ def _read_json_field(source: Path, field_name: str, context: str) -> Any:
     )
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
+def _safe_extract(
+    archive: Path,
+    destination: Path,
+    external_symlink_roots: tuple[Path, ...] = (),
+) -> None:
     destination.mkdir(parents=True, exist_ok=True)
+    destination_root = destination.resolve()
     with tarfile.open(archive, "r:gz") as tf:
         for member in tf.getmembers():
             target = (destination / member.name).resolve()
             try:
-                target.relative_to(destination.resolve())
+                relative_target = target.relative_to(destination_root)
             except ValueError as exc:
                 raise ValueError(
                     f"unsafe path in cache archive: {member.name!r}"
                 ) from exc
             if member.issym():
                 link = Path(member.linkname)
-                if link.is_absolute():
+                allow_external = any(
+                    relative_target == root or root in relative_target.parents
+                    for root in external_symlink_roots
+                )
+                if link.is_absolute() and not allow_external:
                     raise ValueError(
                         f"absolute link is forbidden in cache: {member.name!r}"
                     )
-                link_target = (target.parent / link).resolve()
-                try:
-                    link_target.relative_to(destination.resolve())
-                except ValueError as exc:
-                    raise ValueError(
-                        f"link escapes cache destination: {member.name!r}"
-                    ) from exc
+                if not allow_external:
+                    link_target = (target.parent / link).resolve()
+                    try:
+                        link_target.relative_to(destination_root)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "link escapes cache destination: "
+                            f"{member.name!r}"
+                        ) from exc
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.symlink_to(member.linkname)
             elif member.islnk():
@@ -2011,6 +2041,7 @@ class PipelineRunner:
             _validate_portable_symlinks(
                 source,
                 f"step {execution.step.id!r} artifact {name!r}",
+                allow_external_symlinks=spec.allow_external_symlinks,
             )
             artifacts[name] = str(source.resolve())
             digests[name] = _path_digest(source)
@@ -2159,7 +2190,16 @@ class PipelineRunner:
             json.loads(manifest.read_text())
         except (OSError, tarfile.TarError, json.JSONDecodeError):
             return False
-        _safe_extract(archive, workdir)
+        external_symlink_roots = tuple(
+            PipelineRunner._artifact_path(execution, name, artifact)
+            for name, artifact in step.artifacts.items()
+            if artifact.allow_external_symlinks
+        )
+        _safe_extract(
+            archive,
+            workdir,
+            external_symlink_roots=external_symlink_roots,
+        )
         for name, artifact in step.artifacts.items():
             path = PipelineRunner._artifact_path(execution, name, artifact)
             if not (workdir / path).exists():
@@ -2519,4 +2559,6 @@ class PipelineRunner:
                     detail = f"path={artifact.path}"
                     if artifact.publish is not None:
                         detail += f", publish={artifact.publish}"
+                    if artifact.allow_external_symlinks:
+                        detail += ", allow_external_symlinks=true"
                     print(f"    {name}: {detail}")
