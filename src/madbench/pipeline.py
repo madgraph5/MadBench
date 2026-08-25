@@ -5,6 +5,7 @@ import csv
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -73,6 +74,14 @@ class JsonArgumentSource:
     field: str
 
 
+@dataclass(frozen=True)
+class PerRepeatArgument:
+    """A step argument resolved from a numeric start/step schedule."""
+
+    start: Any
+    step: Any = 1
+
+
 @dataclass
 class ArtifactDefinition:
     path: str
@@ -105,6 +114,13 @@ class StepDefinition:
     direct_dimensions: list[str] = field(default_factory=list)
     dimensions: list[str] = field(default_factory=list)
     upstream_steps: list[str] = field(default_factory=list)
+
+    def per_repeat_arguments(self) -> dict[str, PerRepeatArgument]:
+        return {
+            name: value
+            for name, value in self.arguments.items()
+            if isinstance(value, PerRepeatArgument)
+        }
 
 
 @dataclass
@@ -150,6 +166,7 @@ class ExecutionResult:
     stderr: Optional[str] = None
     blocked_by: list[str] = field(default_factory=list)
     published_artifacts: dict[str, str] = field(default_factory=dict)
+    argument_schedules: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _string_list(value: Any, field_name: str) -> list[str]:
@@ -375,6 +392,64 @@ def _normalize_argument_value(value: Any) -> Any:
     return value
 
 
+def _normalize_step_argument(value: Any, step_id: str, name: str) -> Any:
+    """Normalize one top-level ``with`` argument, including schedules."""
+    if not (isinstance(value, dict) and "per_repeat" in value):
+        return _normalize_argument_value(value)
+
+    unknown_wrapper = set(value) - {"per_repeat"}
+    if unknown_wrapper:
+        raise ValueError(
+            f"steps.{step_id}.with.{name} per-repeat wrapper has unknown "
+            f"field(s): {sorted(unknown_wrapper)}; only 'per_repeat' is allowed"
+        )
+    schedule = value["per_repeat"]
+    if not isinstance(schedule, dict):
+        raise ValueError(
+            f"steps.{step_id}.with.{name}.per_repeat must be a mapping"
+        )
+    unknown_schedule = set(schedule) - {"start", "step"}
+    if unknown_schedule:
+        raise ValueError(
+            f"steps.{step_id}.with.{name}.per_repeat has unknown field(s): "
+            f"{sorted(unknown_schedule)}; allowed fields are 'start' and 'step'"
+        )
+    if "start" not in schedule:
+        raise ValueError(
+            f"steps.{step_id}.with.{name}.per_repeat requires 'start'"
+        )
+
+    normalized: dict[str, Any] = {
+        "start": _normalize_argument_value(schedule["start"]),
+        "step": _normalize_argument_value(schedule.get("step", 1)),
+    }
+    for field_name, field_value in normalized.items():
+        is_literal_number = (
+            not isinstance(field_value, bool)
+            and isinstance(field_value, (int, float))
+            and not (
+                isinstance(field_value, float)
+                and not math.isfinite(field_value)
+            )
+        )
+        is_dynamic_number = (
+            isinstance(field_value, JsonArgumentSource)
+            or (
+                isinstance(field_value, str)
+                and EXPR_RE.match(field_value) is not None
+            )
+        )
+        if not (is_literal_number or is_dynamic_number):
+            raise ValueError(
+                f"steps.{step_id}.with.{name}.per_repeat.{field_name} must "
+                "be a finite number or an expression resolving to one"
+            )
+    return PerRepeatArgument(
+        start=normalized["start"],
+        step=normalized["step"],
+    )
+
+
 def _normalize_arguments(value: Any, step_id: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -388,7 +463,10 @@ def _normalize_arguments(value: Any, step_id: str) -> dict[str, Any]:
         isinstance(k, str) for k in value
     ):
         raise ValueError(f"step {step_id!r} 'with' must be a list or mapping")
-    return {k: _normalize_argument_value(v) for k, v in value.items()}
+    return {
+        name: _normalize_step_argument(argument, step_id, name)
+        for name, argument in value.items()
+    }
 
 
 def _normalize_json_source(
@@ -552,6 +630,10 @@ def _extract_references(value: Any) -> tuple[list[str], list[str], list[str]]:
     inputs: list[str] = []
 
     def visit(item: Any) -> None:
+        if isinstance(item, PerRepeatArgument):
+            visit(item.start)
+            visit(item.step)
+            return
         if isinstance(item, (InputArgument, JsonArgumentSource)):
             if isinstance(item, InputArgument):
                 visit(item.value)
@@ -745,6 +827,15 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 f"{sorted(unknown_needs)}"
             )
         repeat = _positive_int(step_raw.get("repeat"), f"steps.{step_id}.repeat")
+        per_repeat_names = [
+            name for name, value in arguments.items()
+            if isinstance(value, PerRepeatArgument)
+        ]
+        if per_repeat_names and repeat <= 1:
+            raise ValueError(
+                f"step {step_id!r} declares per-repeat argument(s) "
+                f"{per_repeat_names} but repeat is {repeat}; set repeat > 1"
+            )
         outputs = _normalize_outputs(step_raw.get("outputs"), step_id)
         stats = _string_list(step_raw.get("stats"), f"steps.{step_id}.stats")
         missing_stats = set(stats) - set(outputs)
@@ -790,6 +881,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             name for name in matrix if name in set(dimensions)
         ]
         _validate_step_references(step, by_id)
+        _validate_per_repeat_view_columns(step)
 
     return PipelineDefinition(
         name=name,
@@ -812,6 +904,10 @@ def _validate_step_references(
     step: StepDefinition, by_id: dict[str, StepDefinition],
 ) -> None:
     def visit(value: Any) -> None:
+        if isinstance(value, PerRepeatArgument):
+            visit(value.start)
+            visit(value.step)
+            return
         if isinstance(value, (InputArgument, JsonArgumentSource)):
             if isinstance(value, InputArgument):
                 visit(value.value)
@@ -840,6 +936,61 @@ def _validate_step_references(
                 visit(child)
 
     visit(step.arguments)
+
+
+def _validate_per_repeat_view_columns(step: StepDefinition) -> None:
+    """Reject generated CSV columns that would be ambiguous or duplicated."""
+    per_repeat = step.per_repeat_arguments()
+    if not per_repeat:
+        return
+
+    result_reserved = {
+        "repetition",
+        "status",
+        "exit_code",
+        "cache",
+        "execution_time",
+        "materialization_time",
+        "total_time",
+        "execution_id",
+    }
+    result_existing = set(step.dimensions) | set(step.outputs) | result_reserved
+    summary_reserved = {
+        "n_successful",
+        "n_failed",
+        "n_blocked",
+        "n_skipped",
+        "n_completed",
+        "n_expected",
+        "complete",
+        "execution_id",
+    }
+    summary_existing = set(step.dimensions) | summary_reserved
+    summary_stats = step.stats or [
+        name
+        for name, kind in step.outputs.items()
+        if kind in {None, "number", "integer"}
+    ]
+    for name in summary_stats:
+        summary_existing.update({f"{name}_mean", f"{name}_std"})
+
+    generated_results = {f"{name}_effective" for name in per_repeat}
+    generated_summary = {
+        generated
+        for name in per_repeat
+        for generated in (f"{name}_start", f"{name}_step", f"{name}_count")
+    }
+    collisions = (
+        generated_results & result_existing
+    ) | (
+        generated_summary & summary_existing
+    )
+    if collisions:
+        raise ValueError(
+            f"step {step.id!r} per-repeat result columns collide with declared "
+            f"matrix dimensions, outputs, or reserved columns: "
+            f"{sorted(collisions)}; rename the conflicting dimension or output"
+        )
 
 
 def build_matrix_points(pipeline: PipelineDefinition) -> list[dict[str, Any]]:
@@ -1555,6 +1706,71 @@ class PipelineRunner:
         return value
 
     @staticmethod
+    def _schedule_number(value: Any, context: str) -> Any:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+        ):
+            raise ValueError(
+                f"{context} resolved to {value!r}; expected a finite number"
+            )
+        return value
+
+    def _resolve_arguments(
+        self,
+        pipeline: PipelineDefinition,
+        execution: StepExecution,
+        upstream: dict[str, ExecutionResult],
+        staged_dir: Path,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """Resolve exact arguments and concrete per-repeat schedules."""
+        arguments: dict[str, Any] = {}
+        schedules: dict[str, dict[str, Any]] = {}
+        for name, value in execution.step.arguments.items():
+            if not isinstance(value, PerRepeatArgument):
+                arguments[name] = self._resolve_value(
+                    value,
+                    execution,
+                    upstream,
+                    staged_dir,
+                    pipeline.input_labels,
+                )
+                continue
+
+            start = self._schedule_number(
+                self._resolve_value(
+                    value.start,
+                    execution,
+                    upstream,
+                    staged_dir,
+                    pipeline.input_labels,
+                ),
+                f"steps.{execution.step.id}.with.{name}.per_repeat.start",
+            )
+            step_value = self._schedule_number(
+                self._resolve_value(
+                    value.step,
+                    execution,
+                    upstream,
+                    staged_dir,
+                    pipeline.input_labels,
+                ),
+                f"steps.{execution.step.id}.with.{name}.per_repeat.step",
+            )
+            effective = self._schedule_number(
+                start + (execution.repetition - 1) * step_value,
+                f"steps.{execution.step.id}.with.{name} effective value",
+            )
+            arguments[name] = effective
+            schedules[name] = {
+                "start": start,
+                "step": step_value,
+                "count": execution.step.repeat,
+            }
+        return arguments, schedules
+
+    @staticmethod
     def _resolve_input_label(value: str, labels: dict[str, str]) -> str:
         match = EXPR_RE.match(value)
         if not match:
@@ -1591,12 +1807,9 @@ class PipelineRunner:
         for name, spec in execution.step.artifacts.items():
             self._artifact_path(execution, name, spec)
         output_file = workdir / OUTPUT_FILE_NAME
-        arguments = {
-            name: self._resolve_value(
-                value, execution, upstream, staged_dir, pipeline.input_labels,
-            )
-            for name, value in step.arguments.items()
-        }
+        arguments, argument_schedules = self._resolve_arguments(
+            pipeline, execution, upstream, staged_dir,
+        )
         args_file = workdir / ARGS_FILE_NAME
         args_file.write_text(json.dumps(arguments, indent=2, default=str))
         mg_version = str(execution.values.get("mg_version", MG_VERSION_NONE))
@@ -1650,6 +1863,7 @@ class PipelineRunner:
                 artifact_digests=digests,
                 workdir=str(workdir),
                 published_artifacts=published,
+                argument_schedules=argument_schedules,
             )
 
         execution_started = time.monotonic()
@@ -1697,6 +1911,7 @@ class PipelineRunner:
                 workdir=str(workdir),
                 stdout=str(stdout),
                 stderr=str(stderr),
+                argument_schedules=argument_schedules,
             )
 
         outputs = self._read_outputs(step, output_file)
@@ -1724,6 +1939,7 @@ class PipelineRunner:
             stdout=str(stdout),
             stderr=str(stderr),
             published_artifacts=published,
+            argument_schedules=argument_schedules,
         )
 
     def _mg_bin(self, mg_version: str) -> Optional[Path]:
@@ -2294,6 +2510,7 @@ class PipelineRunner:
                 "total_time": result.total_time,
                 "cache": result.cache,
                 "arguments": result.arguments,
+                "argument_schedules": result.argument_schedules,
                 "outputs": result.outputs,
                 "artifacts": {
                     name: {
@@ -2336,9 +2553,11 @@ class PipelineRunner:
         results: list[ExecutionResult],
     ) -> None:
         """Write one native observation row per execution of one step."""
+        per_repeat_arguments = step.per_repeat_arguments()
         fieldnames = (
             list(step.dimensions)
             + ["repetition"]
+            + [f"{name}_effective" for name in per_repeat_arguments]
             + list(step.outputs)
             + [
                 "status",
@@ -2362,6 +2581,8 @@ class PipelineRunner:
                     for key in step.dimensions
                 }
                 row["repetition"] = result.repetition
+                for name in per_repeat_arguments:
+                    row[f"{name}_effective"] = result.arguments.get(name, "")
                 for name in step.outputs:
                     row[name] = result.outputs.get(name, "")
                 row.update({
@@ -2451,7 +2672,14 @@ class PipelineRunner:
             for name, kind in step.outputs.items()
             if kind in {None, "number", "integer"}
         ]
+        per_repeat_arguments = step.per_repeat_arguments()
         fieldnames = list(step.dimensions)
+        for name in per_repeat_arguments:
+            fieldnames.extend([
+                f"{name}_start",
+                f"{name}_step",
+                f"{name}_count",
+            ])
         for name in stats:
             fieldnames.extend([f"{name}_mean", f"{name}_std"])
         fieldnames.extend([
@@ -2500,6 +2728,24 @@ class PipelineRunner:
                     "complete": len(results) == step.repeat,
                     "execution_id": identity,
                 }
+                for name in per_repeat_arguments:
+                    resolved_schedule = next(
+                        (
+                            result.argument_schedules[name]
+                            for result in results
+                            if name in result.argument_schedules
+                        ),
+                        None,
+                    )
+                    row[f"{name}_start"] = (
+                        resolved_schedule["start"]
+                        if resolved_schedule is not None else ""
+                    )
+                    row[f"{name}_step"] = (
+                        resolved_schedule["step"]
+                        if resolved_schedule is not None else ""
+                    )
+                    row[f"{name}_count"] = step.repeat
                 for name in stats:
                     values: list[float] = []
                     for result in successful:
@@ -2547,6 +2793,13 @@ class PipelineRunner:
             print(f"  executions: {n_identities}")
             print(f"  repetitions: {step.repeat}")
             print(f"  total runs: {len(expanded[step.id])}")
+            if step.per_repeat_arguments():
+                print("  per-repeat arguments:")
+                for name, schedule in step.per_repeat_arguments().items():
+                    print(
+                        f"    {name}: start={schedule.start!r}, "
+                        f"step={schedule.step!r}"
+                    )
             if step.condition is not None:
                 print(f"  if: {step.condition}")
                 print(f"  eligible runs: {len(eligible)}")

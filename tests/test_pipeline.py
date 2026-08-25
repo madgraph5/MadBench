@@ -113,6 +113,101 @@ def test_repetitions_are_scheduled_outermost():
     ] == [(1, "a"), (1, "b"), (2, "a"), (2, "b")]
 
 
+def test_per_repeat_argument_infers_references_and_requires_repetition():
+    pipeline = parse_pipeline({
+        "name": "p",
+        "matrix": {"seed_base": [101, 201]},
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {
+                "seed": {
+                    "per_repeat": {
+                        "start": "${{ matrix.seed_base }}",
+                        "step": 2,
+                    },
+                },
+            },
+            "repeat": 3,
+        }],
+    }, source="test")
+
+    step = pipeline.steps[0]
+    schedule = step.per_repeat_arguments()["seed"]
+    assert schedule.start == "${{ matrix.seed_base }}"
+    assert schedule.step == 2
+    assert step.dimensions == ["seed_base"]
+    assert len(build_step_executions(pipeline)["run"]) == 6
+
+    with pytest.raises(ValueError, match="set repeat > 1"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "run",
+                "script": "run.sh",
+                "with": {
+                    "seed": {"per_repeat": {"start": 101}},
+                },
+            }],
+        }, source="test")
+
+
+@pytest.mark.parametrize(
+    ("argument", "message"),
+    [
+        ({"per_repeat": {}}, "requires 'start'"),
+        ({"per_repeat": []}, "must be a mapping"),
+        (
+            {"per_repeat": {"start": "101"}},
+            "finite number or an expression",
+        ),
+        (
+            {"per_repeat": {"start": 101, "step": True}},
+            "finite number or an expression",
+        ),
+        (
+            {"per_repeat": {"start": 101, "offset": 1}},
+            "unknown field",
+        ),
+        (
+            {"per_repeat": {"start": 101}, "value": 101},
+            "unknown field",
+        ),
+    ],
+)
+def test_per_repeat_argument_rejects_invalid_schedules(argument, message):
+    with pytest.raises(ValueError, match=message):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{
+                "id": "run",
+                "script": "run.sh",
+                "with": {"seed": argument},
+                "repeat": 2,
+            }],
+        }, source="test")
+
+
+def test_per_repeat_argument_rejects_generated_csv_column_collision():
+    with pytest.raises(ValueError, match="seed_start"):
+        parse_pipeline({
+            "name": "p",
+            "matrix": {"seed_start": [101]},
+            "steps": [{
+                "id": "run",
+                "script": "run.sh",
+                "with": {
+                    "seed": {
+                        "per_repeat": {
+                            "start": "${{ matrix.seed_start }}",
+                        },
+                    },
+                },
+                "repeat": 2,
+            }],
+        }, source="test")
+
+
 def test_artifact_path_expression_infers_dimension():
     pipeline = parse_pipeline({
         "name": "p",
@@ -738,6 +833,125 @@ def test_pipeline_updates_partial_csv_views_after_each_final_result(tmp_path):
     ).read_text()
     assert not (result_dir / "results.csv").exists()
     assert not (result_dir / "summary.csv").exists()
+
+
+def test_pipeline_per_repeat_argument_is_effective_and_summarized(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(
+        root,
+        "prepare.sh",
+        'printf \'{"seed_start": 41}\' > "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    make_script(
+        root,
+        "run.sh",
+        'seed=$1\n'
+        'python -c \'import json, os, sys; '
+        'assert json.load(open(os.environ["MADBENCH_ARGS_FILE"]))["seed"] '
+        '== int(sys.argv[1])\' "$seed"\n'
+        'printf \'{"observed_seed": %s}\' "$seed" '
+        '> "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    path = make_pipeline(root, {
+        "name": "per_repeat_seed",
+        "steps": [
+            {
+                "id": "prepare",
+                "script": "prepare.sh",
+                "outputs": {"seed_start": "integer"},
+            },
+            {
+                "id": "run",
+                "script": "run.sh",
+                "with": {
+                    "seed": {
+                        "per_repeat": {
+                            "start": "${{ steps.prepare.outputs.seed_start }}",
+                            "step": 2,
+                        },
+                    },
+                },
+                "repeat": 3,
+                "outputs": {"observed_seed": "integer"},
+                "stats": ["observed_seed"],
+                "cache": True,
+            },
+        ],
+    })
+
+    definition = MadBench(find_workspace(root)).load_test(path)
+    assert isinstance(definition, PipelineDefinition)
+    assert definition.steps[1].upstream_steps == ["prepare"]
+    MadBench(find_workspace(root)).run(path)
+
+    result_dir = only_result_dir(root, "per_repeat_seed")
+    with open(result_dir / "results_run.csv", newline="") as file:
+        result_rows = list(csv.DictReader(file))
+    assert [row["repetition"] for row in result_rows] == ["1", "2", "3"]
+    assert [row["seed_effective"] for row in result_rows] == ["41", "43", "45"]
+    assert [row["observed_seed"] for row in result_rows] == ["41", "43", "45"]
+    assert len({row["execution_id"] for row in result_rows}) == 1
+
+    with open(result_dir / "summary_run.csv", newline="") as file:
+        summary_rows = list(csv.DictReader(file))
+    assert len(summary_rows) == 1
+    summary = summary_rows[0]
+    assert "seed" not in summary
+    assert summary["seed_start"] == "41"
+    assert summary["seed_step"] == "2"
+    assert summary["seed_count"] == "3"
+    assert float(summary["observed_seed_mean"]) == 43.0
+    assert float(summary["observed_seed_std"]) == 2.0
+    assert summary["n_successful"] == "3"
+
+    report = json.loads((result_dir / "report.json").read_text())
+    run_entries = [
+        entry for entry in report["steps"] if entry["step_id"] == "run"
+    ]
+    assert [entry["arguments"]["seed"] for entry in run_entries] == [41, 43, 45]
+    assert all(
+        entry["argument_schedules"]["seed"]
+        == {"start": 41, "step": 2, "count": 3}
+        for entry in run_entries
+    )
+
+    MadBench(find_workspace(root)).run(path)
+    latest_dir = sorted((root / "results" / "per_repeat_seed").iterdir())[-1]
+    latest_report = json.loads((latest_dir / "report.json").read_text())
+    cached_entries = [
+        entry for entry in latest_report["steps"] if entry["step_id"] == "run"
+    ]
+    assert [entry["arguments"]["seed"] for entry in cached_entries] == [41, 43, 45]
+    assert {entry["cache"] for entry in cached_entries} == {"hit"}
+    assert all(
+        entry["argument_schedules"]["seed"]
+        == {"start": 41, "step": 2, "count": 3}
+        for entry in cached_entries
+    )
+
+
+def test_pipeline_per_repeat_argument_validates_resolved_number(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "exit 0\n")
+    path = make_pipeline(root, {
+        "name": "bad_dynamic_seed",
+        "matrix": {"seed_base": ["not-a-number"]},
+        "steps": [{
+            "id": "run",
+            "script": "run.sh",
+            "with": {
+                "seed": {
+                    "per_repeat": {
+                        "start": "${{ matrix.seed_base }}",
+                    },
+                },
+            },
+            "repeat": 2,
+        }],
+    })
+
+    with pytest.raises(ValueError, match="expected a finite number"):
+        MadBench(find_workspace(root)).run(path)
 
 
 def test_pipeline_writes_native_results_for_every_step(

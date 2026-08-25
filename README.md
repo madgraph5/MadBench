@@ -280,6 +280,41 @@ $3 = absolute path to the selected executable artifact
 MadBench also writes the resolved name-to-value mapping to
 `$MADBENCH_ARGS_FILE` as JSON.
 
+### Per-repeat arguments
+
+A numeric `with` argument on a repeated step can declare a start/step
+schedule:
+
+```yaml
+- id: benchmark
+  script: benchmark.sh
+  with:
+    executable: ${{ steps.compile.artifacts.executable }}
+    seed:
+      per_repeat:
+        start: 1001
+        step: 1
+  repeat: 5
+```
+
+The effective value is `start + (repetition - 1) * step`, so this example
+passes seeds `1001` through `1005`. `step` defaults to `1`. Both values may be
+finite numeric literals or references that resolve to finite numbers, for
+example:
+
+```yaml
+seed:
+  per_repeat:
+    start: ${{ matrix.seed_base }}
+    step: ${{ steps.prepare.outputs.seed_step }}
+```
+
+MadBench calculates the effective value before invoking the step. The script's
+positional argument and `$MADBENCH_ARGS_FILE` therefore contain the exact value
+used for that repetition; scripts must not add `MADBENCH_REPETITION` again.
+Per-repeat arguments require `repeat > 1` and, like repetition itself, are
+currently available only on the final step.
+
 Supported references are:
 
 ```yaml
@@ -969,6 +1004,11 @@ Each repetition receives its own work directory, output file, logs, and
 `MADBENCH_REPETITION` value. Repetition is the outer scheduling loop: rep 1
 runs for every final-step matrix point before rep 2 begins.
 
+For each scheduled argument, `results_<step-id>.csv` records the exact value
+in `<name>_effective`. The corresponding summary describes the schedule with
+`<name>_start`, `<name>_step`, and `<name>_count`; the effective value is not a
+grouping dimension, so measurements remain aggregated across seeds.
+
 The live `summary_<step-id>.csv` reports mean, standard deviation, completion
 state, and successful/failed/blocked/skipped counts for declared `stats`. When
 `stats` is omitted, numeric outputs from the repeated step are selected.
@@ -1055,7 +1095,8 @@ stable internal identities; `main.log` is their human-readable index.
 Each step receives a `results_<step-id>.csv` readily plottable observation
 view. It contains one row for every execution and repetition of that step
 recorded so far. Columns contain the step's own matrix dimensions, repetition,
-declared outputs, status, exit code, cache state, timings, and execution ID.
+effective values of any per-repeat arguments, declared outputs, status, exit
+code, cache state, timings, and execution ID.
 Output names are unqualified because the filename identifies their step.
 Upstream values are not copied or duplicated into downstream rows.
 
@@ -1078,9 +1119,10 @@ they are recorded without being scheduled.
 
 Every step with `repeat > 1` receives a `summary_<step-id>.csv` live aggregate
 view. For each matrix identity it contains the requested `stats` means and
-standard deviations plus `n_successful`, `n_failed`, `n_blocked`, `n_skipped`,
-`n_completed`, `n_expected`, and `complete`. Only successful repetitions
-contribute to statistics. Non-repeated steps do not receive a summary file.
+standard deviations, per-repeat argument schedule descriptors, plus
+`n_successful`, `n_failed`, `n_blocked`, `n_skipped`, `n_completed`,
+`n_expected`, and `complete`. Only successful repetitions contribute to
+statistics. Non-repeated steps do not receive a summary file.
 
 Final-step repetitions are scheduled outermost:
 
