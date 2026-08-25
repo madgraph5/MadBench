@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -65,8 +66,26 @@ class _ExecUnit:
     invocation_id: str
     rep_id: str
     mg_version: str
-    combo: dict[str, Any]
+    base_combo: dict[str, Any]
+    effective_combo: dict[str, Any]
     cmd: list[str]
+
+
+@dataclass(frozen=True)
+class PerRepeatArgument:
+    """A numeric argument whose effective value changes by repetition.
+
+    ``start`` is the value passed to repetition 1. Each later repetition
+    advances by ``step``. Keeping this schedule separate from the effective
+    argument map lets summaries aggregate across the generated values without
+    pretending that the argument was fixed.
+    """
+
+    start: Union[int, float]
+    step: Union[int, float]
+
+    def value_for(self, repetition: int) -> Union[int, float]:
+        return self.start + (repetition - 1) * self.step
 
 
 @dataclass
@@ -114,6 +133,11 @@ class TestDefinition:
     # set it explicitly. An empty list is a valid explicit opt-out: no
     # output is aggregated (only ``wall_time`` still is). Every entry must
     # be present in ``outputs``.
+    per_repeat_args: dict[str, PerRepeatArgument] = field(default_factory=dict)
+    # Numeric argument schedules declared as
+    # ``{per_repeat: {start: ..., step: ...}}``. ``args`` stores each
+    # schedule's start value so sweep construction and argument ordering stay
+    # backward compatible; execution resolves the effective value per rep.
 
     def resolved_stats(self) -> list[str]:
         """Effective stats list — falls back to all outputs when unset."""
@@ -175,6 +199,69 @@ def _normalize_stats(raw: Any, outputs: list[str]) -> Optional[list[str]]:
             f"Declared outputs: {outputs}"
         )
     return list(raw)
+
+
+def _normalize_arguments(
+    raw: Any,
+) -> tuple[dict[str, Any], dict[str, PerRepeatArgument]]:
+    """Normalize legacy positional arguments and per-repetition schedules.
+
+    Ordinary scalar/list values pass through unchanged. A per-repeat argument
+    uses this deliberately narrow, expression-free form::
+
+        seed:
+          per_repeat:
+            start: 1001
+            step: 1
+
+    ``step`` defaults to 1. Both fields must be finite JSON/YAML numbers;
+    booleans are rejected even though Python considers them integers.
+    """
+    if raw is None:
+        return {}, {}
+    if not isinstance(raw, dict):
+        raise ValueError("'args' must be a mapping of argument names to values")
+
+    args: dict[str, Any] = {}
+    schedules: dict[str, PerRepeatArgument] = {}
+    for name, value in raw.items():
+        if not (isinstance(value, dict) and "per_repeat" in value):
+            args[name] = value
+            continue
+
+        unknown_wrapper = set(value) - {"per_repeat"}
+        if unknown_wrapper:
+            raise ValueError(
+                f"args.{name!s} per-repeat wrapper has unknown field(s): "
+                f"{sorted(unknown_wrapper)}; only 'per_repeat' is allowed"
+            )
+        schedule = value["per_repeat"]
+        if not isinstance(schedule, dict):
+            raise ValueError(f"args.{name!s}.per_repeat must be a mapping")
+        unknown_schedule = set(schedule) - {"start", "step"}
+        if unknown_schedule:
+            raise ValueError(
+                f"args.{name!s}.per_repeat has unknown field(s): "
+                f"{sorted(unknown_schedule)}; allowed fields are 'start' and 'step'"
+            )
+        if "start" not in schedule:
+            raise ValueError(f"args.{name!s}.per_repeat requires 'start'")
+
+        start = schedule["start"]
+        step = schedule.get("step", 1)
+        for field_name, number in (("start", start), ("step", step)):
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or (isinstance(number, float) and not math.isfinite(number))
+            ):
+                raise ValueError(
+                    f"args.{name!s}.per_repeat.{field_name} must be a "
+                    f"finite number, got {number!r}"
+                )
+        args[name] = start
+        schedules[name] = PerRepeatArgument(start=start, step=step)
+    return args, schedules
 
 
 def _normalize_mg_version(raw: Any) -> list[str]:
@@ -247,6 +334,7 @@ class MadBench:
             )
 
         outputs = _as_str_list(raw.get("outputs"), "outputs")
+        arguments, per_repeat_args = _normalize_arguments(raw.get("args"))
         workdir = raw.get("workdir")
         if workdir is not None and not isinstance(workdir, str):
             raise ValueError("'workdir' must be a string path")
@@ -254,7 +342,8 @@ class MadBench:
             name=raw["name"],
             description=raw.get("description", ""),
             script=raw["script"],
-            args=raw["args"] or {},
+            args=arguments,
+            per_repeat_args=per_repeat_args,
             inputs=_as_str_list(raw.get("inputs"), "inputs"),
             outputs=outputs,
             artifacts=_as_str_list(raw.get("artifacts"), "artifacts"),
@@ -271,15 +360,31 @@ class MadBench:
     def build_commands(self, test: TestDefinition) -> list[list[str]]:
         """Build the list of commands to execute (positional args only).
 
-        Returns one command per sweep point. ``mg_version`` does not appear
-        in the script arguments — it is exposed to the script via env vars
-        — so commands repeat across mg_versions when more than one is set.
+        Returns one command per sweep point using repetition 1 values for any
+        per-repeat arguments. ``mg_version`` does not appear in the script
+        arguments — it is exposed to the script via env vars — so commands
+        repeat across mg_versions when more than one is set.
         """
         script_path = resolve_script(self.workspace, test.script)
-        return [
-            [str(script_path)] + [str(combo[k]) for k in test.args]
-            for combo, _ in self._build_sweep_points(test)
-        ]
+        commands: list[list[str]] = []
+        for combo, _ in self._build_sweep_points(test):
+            effective = self._resolve_effective_combo(test, combo, 1)
+            commands.append(
+                [str(script_path), *(str(effective[k]) for k in test.args)],
+            )
+        return commands
+
+    @staticmethod
+    def _resolve_effective_combo(
+        test: TestDefinition,
+        base_combo: dict[str, Any],
+        repetition: int,
+    ) -> dict[str, Any]:
+        """Return the exact argument values passed to one repetition."""
+        effective = dict(base_combo)
+        for name, schedule in test.per_repeat_args.items():
+            effective[name] = schedule.value_for(repetition)
+        return effective
 
     def run(
         self,
@@ -304,10 +409,6 @@ class MadBench:
         # Resolve to an absolute path so the verbatim copy into the
         # result dir is unambiguous even if cwd changes later.
         sweep_points = self._build_sweep_points(test)
-        commands = [
-            [str(script_path)] + [str(combo[k]) for k in test.args]
-            for combo, _ in sweep_points
-        ]
 
         # Build the execution unit list. ``repeat`` is the outermost loop:
         # rep N of every sweep point runs before any rep N+1, so partial
@@ -321,17 +422,25 @@ class MadBench:
         n_per_version = len(sweep_points) // len(test.mg_version)
         for rep_i in range(1, test.repeat + 1):
             rep_id = f"{rep_i:02d}"
-            for vi_global, (combo, mgv) in enumerate(sweep_points):
+            for vi_global, (base_combo, mgv) in enumerate(sweep_points):
                 version_i = (vi_global % n_per_version) + 1
                 invocation_id = f"invocation_{version_i:03d}"
-                cmd = [str(script_path)] + [str(combo[k]) for k in test.args]
+                effective_combo = self._resolve_effective_combo(
+                    test, base_combo, rep_i,
+                )
+                cmd = [
+                    str(script_path),
+                    *(str(effective_combo[k]) for k in test.args),
+                ]
                 units.append(_ExecUnit(
                     invocation_id=invocation_id,
                     rep_id=rep_id,
                     mg_version=mgv,
-                    combo=combo,
+                    base_combo=base_combo,
+                    effective_combo=effective_combo,
                     cmd=cmd,
                 ))
+        commands = [unit.cmd for unit in units]
 
         timestamp = get_timestamp()
         workdir_base = self._resolve_workdir(test)
@@ -456,13 +565,22 @@ class MadBench:
         script_path = resolve_script(self.workspace, test.script)
         units: list[_ExecUnit] = []
         for f in failures:
-            combo = {k: f["args"][k] for k in test.args}
-            cmd = [str(script_path)] + [str(combo[k]) for k in test.args]
+            persisted_base = f.get("base_args", f["args"])
+            base_combo = {k: persisted_base[k] for k in test.args}
+            rep_i = int(f["repetition"])
+            effective_combo = self._resolve_effective_combo(
+                test, base_combo, rep_i,
+            )
+            cmd = [
+                str(script_path),
+                *(str(effective_combo[k]) for k in test.args),
+            ]
             units.append(_ExecUnit(
                 invocation_id=f["invocation_id"],
                 rep_id=f["repetition"],
                 mg_version=f["mg_version"],
-                combo=combo,
+                base_combo=base_combo,
+                effective_combo=effective_combo,
                 cmd=cmd,
             ))
 
@@ -802,13 +920,17 @@ class MadBench:
         )
 
     def _summary_header(self, test: TestDefinition) -> list[str]:
-        """Header for summary.csv: per-(mg_version, arg-combo) stats. Each
-        column listed in ``stats`` (plus ``wall_time``, which MadBench
-        measures itself and is always numeric) becomes a ``_mean``/``_std``
-        pair; ``n_successful`` records the count actually averaged.
-        Hostname is not in this CSV — it lives once in the sibling
-        try.yml since every row belongs to the same run."""
-        cols = ["timestamp", "mg_version"] + list(test.args.keys())
+        """Header for summary.csv: per-(mg_version, base config) stats.
+
+        Fixed arguments retain their names. A per-repeat argument is described
+        by ``<name>_start``, ``<name>_step``, and ``<name>_count`` instead of
+        being shown misleadingly as one fixed effective value. Each selected
+        stats column (plus MadBench's ``wall_time``) becomes a mean/std pair.
+        """
+        fixed_args = [k for k in test.args if k not in test.per_repeat_args]
+        cols = ["timestamp", "mg_version"] + fixed_args
+        for name in test.per_repeat_args:
+            cols.extend([f"{name}_start", f"{name}_step", f"{name}_count"])
         for k in test.resolved_stats() + ["wall_time"]:
             cols.extend([f"{k}_mean", f"{k}_std"])
         cols.extend(["n_successful", "invocation_id"])
@@ -1223,6 +1345,13 @@ class MadBench:
                 "mg_version": r["mg_version"],
                 "exit_code": r["exit_code"],
                 "args": {k: csv_row.get(k, "") for k in test.args},
+                # Retrying must start from the schedule's base values. Using
+                # the effective CSV value here would apply a per-repeat step
+                # for a second time.
+                "base_args": {
+                    k: r.get("base_args", {}).get(k, csv_row.get(k, ""))
+                    for k in test.args
+                },
             })
         if not failures:
             return None
@@ -1282,6 +1411,19 @@ class MadBench:
                     f"{sorted(missing)}; the test YAML's args must match the "
                     "args of the original run."
                 )
+            base_args = f.get("base_args")
+            if base_args is not None:
+                if not isinstance(base_args, dict):
+                    raise ValueError(
+                        f"Failure entry in {failed_yml_path} has a non-mapping "
+                        f"'base_args': {base_args!r}"
+                    )
+                missing_base = expected - set(base_args)
+                if missing_base:
+                    raise ValueError(
+                        f"Failure entry in {failed_yml_path} missing base args "
+                        f"{sorted(missing_base)}; the failure record is incomplete."
+                    )
         return failures
 
     def _execute_units(
@@ -1425,7 +1567,8 @@ class MadBench:
                     mgv = unit.mg_version
                     invocation_id = unit.invocation_id
                     rep_id = unit.rep_id
-                    combo = unit.combo
+                    base_combo = unit.base_combo
+                    combo = unit.effective_combo
                     cmd = unit.cmd
 
                     run_dir = run_dirs[mgv]
@@ -1459,6 +1602,8 @@ class MadBench:
                         csv_rows.append(row)
                         results.append({
                             "command": " ".join(cmd),
+                            "args": dict(combo),
+                            "base_args": dict(base_combo),
                             "invocation_id": invocation_id,
                             "repetition": rep_id,
                             "mg_version": mgv,
@@ -1526,6 +1671,8 @@ class MadBench:
                         csv_rows.append(row)
                         results.append({
                             "command": " ".join(cmd),
+                            "args": dict(combo),
+                            "base_args": dict(base_combo),
                             "invocation_id": invocation_id,
                             "repetition": rep_id,
                             "mg_version": mgv,
@@ -1551,6 +1698,8 @@ class MadBench:
                     csv_rows.append(row)
                     results.append({
                         "command": " ".join(cmd),
+                        "args": dict(combo),
+                        "base_args": dict(base_combo),
                         "invocation_id": invocation_id,
                         "repetition": rep_id,
                         "mg_version": mgv,
@@ -1641,7 +1790,7 @@ class MadBench:
         result_dir: Path,
         csv_rows: list[dict[str, Any]],
     ) -> Path:
-        """Aggregate per-rep rows into one summary row per (mg_version, args).
+        """Aggregate rows into one summary row per stable configuration.
 
         Each column listed in ``test.resolved_stats()`` (plus ``wall_time``)
         is averaged over **successful** reps only (exit_code == 0). If a
@@ -1655,7 +1804,7 @@ class MadBench:
         from collections import OrderedDict
 
         summary_header = self._summary_header(test)
-        arg_keys = list(test.args.keys())
+        arg_keys = [k for k in test.args if k not in test.per_repeat_args]
         stats_cols = test.resolved_stats()
 
         # Coerce per-arg values to strings when keying so rows produced
@@ -1688,6 +1837,10 @@ class MadBench:
             }
             for i, k in enumerate(arg_keys):
                 summary_row[k] = key[i + 1]
+            for name, schedule in test.per_repeat_args.items():
+                summary_row[f"{name}_start"] = schedule.start
+                summary_row[f"{name}_step"] = schedule.step
+                summary_row[f"{name}_count"] = test.repeat
 
             for col in stats_cols + ["wall_time"]:
                 mean_col = f"{col}_mean"
@@ -1851,11 +2004,21 @@ class MadBench:
                 )
             else:
                 print(f"[madbench] Stats (summary.csv): {test.resolved_stats()}")
+        if test.per_repeat_args:
+            schedules = {
+                name: {
+                    "start": schedule.start,
+                    "step": schedule.step,
+                    "count": test.repeat,
+                }
+                for name, schedule in test.per_repeat_args.items()
+            }
+            print(f"[madbench] Per-repeat arguments: {schedules}")
         if test.artifacts:
             print(f"[madbench] Artifacts (per rep): {test.artifacts}")
         print(
-            f"[madbench] Commands ({len(commands)}, each ×{test.repeat} rep"
-            f"{'s' if test.repeat != 1 else ''}):"
+            f"[madbench] Commands ({len(commands)} execution"
+            f"{'s' if len(commands) != 1 else ''}):"
         )
         for cmd in commands:
             print(f"  {' '.join(cmd)}")

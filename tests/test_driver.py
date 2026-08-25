@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import stat
 import tarfile
 from pathlib import Path
@@ -1351,6 +1352,84 @@ def test_load_test_repeat_invalid_raises(tmp_path):
             mb.load_test(test_file)
 
 
+def test_load_test_per_repeat_argument(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "seeded",
+            "script": "hello.sh",
+            "args": {
+                "ncores": 4,
+                "seed": {"per_repeat": {"start": 1001, "step": 3}},
+            },
+            "repeat": 4,
+        },
+    )
+
+    td = mb.load_test(test_file)
+
+    assert td.args == {"ncores": 4, "seed": 1001}
+    assert td.per_repeat_args["seed"].start == 1001
+    assert td.per_repeat_args["seed"].step == 3
+
+
+def test_load_test_per_repeat_argument_step_defaults_to_one(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "seeded",
+            "script": "hello.sh",
+            "args": {"seed": {"per_repeat": {"start": 17}}},
+        },
+    )
+
+    td = mb.load_test(test_file)
+
+    assert td.per_repeat_args["seed"].step == 1
+
+
+@pytest.mark.parametrize(
+    ("argument", "message"),
+    [
+        ({"per_repeat": {}}, "requires 'start'"),
+        ({"per_repeat": []}, "must be a mapping"),
+        ({"per_repeat": {"start": "1001"}}, "start must be a finite number"),
+        (
+            {"per_repeat": {"start": 1001, "step": True}},
+            "step must be a finite number",
+        ),
+        (
+            {"per_repeat": {"start": 1001, "offset": 1}},
+            "unknown field",
+        ),
+        (
+            {"per_repeat": {"start": 1001}, "value": 1001},
+            "unknown field",
+        ),
+    ],
+)
+def test_load_test_per_repeat_argument_invalid_raises(
+    tmp_path, argument, message,
+):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "seeded",
+            "script": "hello.sh",
+            "args": {"seed": argument},
+        },
+    )
+
+    with pytest.raises(ValueError, match=message):
+        mb.load_test(test_file)
+
+
 def test_run_creates_rep_subdirs(tmp_path):
     """Each repetition gets its own zero-padded subdir under invocation_NNN/."""
     ws_root = make_workspace(tmp_path)
@@ -1428,6 +1507,90 @@ def test_run_csv_has_repetition_column_with_row_per_rep(tmp_path):
         by_inv.setdefault(cells[inv_idx], []).append(cells[rep_idx])
     assert by_inv["invocation_001"] == ["01", "02", "03"]
     assert by_inv["invocation_002"] == ["01", "02", "03"]
+
+
+def test_per_repeat_argument_is_passed_recorded_and_aggregated(tmp_path):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "seed=$1\n"
+            "mkdir -p \"seed_${seed}\"\n"
+            "echo \"$seed\" > \"seed_${seed}/used.txt\"\n"
+            "echo \"{\\\"observed_seed\\\": $seed}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "scheduled_seed",
+            "script": "hello.sh",
+            "args": {
+                "seed": {"per_repeat": {"start": 1001, "step": 2}},
+            },
+            "outputs": ["observed_seed"],
+            "stats": ["observed_seed"],
+            "artifacts": ["seed_{seed}/used.txt"],
+            "repeat": 3,
+        },
+    )
+
+    mb.run(test_file)
+
+    rd = run_dir(ws_root, "scheduled_seed")
+    with open(rd / "try_0" / "results.csv", newline="") as f:
+        result_rows = list(csv.DictReader(f))
+    assert [row["repetition"] for row in result_rows] == ["01", "02", "03"]
+    assert [row["seed"] for row in result_rows] == ["1001", "1003", "1005"]
+    assert [row["observed_seed"] for row in result_rows] == [
+        "1001", "1003", "1005",
+    ]
+
+    for repetition, seed in (("01", 1001), ("02", 1003), ("03", 1005)):
+        artifact = (
+            rd / "invocation_001" / repetition
+            / f"seed_{seed}" / "used.txt"
+        )
+        assert artifact.read_text().strip() == str(seed)
+
+    with open(rd / "summary.csv", newline="") as f:
+        summary_rows = list(csv.DictReader(f))
+    assert len(summary_rows) == 1
+    summary = summary_rows[0]
+    assert "seed" not in summary
+    assert summary["seed_start"] == "1001"
+    assert summary["seed_step"] == "2"
+    assert summary["seed_count"] == "3"
+    assert float(summary["observed_seed_mean"]) == 1003.0
+    assert float(summary["observed_seed_std"]) == 2.0
+    assert summary["n_successful"] == "3"
+
+
+def test_per_repeat_argument_dry_run_lists_effective_commands(
+    tmp_path, capsys,
+):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "seed_dry",
+            "script": "hello.sh",
+            "args": {"seed": {"per_repeat": {"start": 41, "step": 10}}},
+            "repeat": 3,
+        },
+    )
+
+    mb.run(test_file, dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "Per-repeat arguments" in output
+    assert "hello.sh 41" in output
+    assert "hello.sh 51" in output
+    assert "hello.sh 61" in output
 
 
 def test_run_artifacts_scoped_per_rep(tmp_path):
@@ -1975,6 +2138,63 @@ def test_retry_reruns_only_failed_combos_with_preserved_ids(tmp_path):
     assert cells[rep_idx] == "01"
     assert cells[exit_idx] == "0"
     assert cells[x_idx] == "2"
+
+
+def test_retry_preserves_effective_per_repeat_argument_without_double_step(
+    tmp_path,
+):
+    ws_root = make_workspace(tmp_path)
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "seed=$1\n"
+            "if [ \"$seed\" = \"205\" ]; then exit 1; fi\n"
+            "echo \"{\\\"observed_seed\\\": $seed}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(
+        ws_root,
+        {
+            "name": "seed_retry",
+            "script": "hello.sh",
+            "args": {"seed": {"per_repeat": {"start": 200, "step": 5}}},
+            "outputs": ["observed_seed"],
+            "stats": ["observed_seed"],
+            "repeat": 3,
+        },
+    )
+    mb.run(test_file)
+    rd = run_dir(ws_root, "seed_retry")
+
+    failed = yaml.safe_load((rd / "try_0" / "failed.yml").read_text())
+    assert failed["failures"][0]["repetition"] == "02"
+    assert failed["failures"][0]["args"]["seed"] == 205
+    assert failed["failures"][0]["base_args"]["seed"] == 200
+
+    make_script(
+        ws_root,
+        body=(
+            "#!/bin/bash\n"
+            "seed=$1\n"
+            "echo \"{\\\"observed_seed\\\": $seed}\" > \"$MADBENCH_OUTPUT_FILE\"\n"
+        ),
+    )
+    mb.retry(rd)
+
+    with open(rd / "try_1" / "results.csv", newline="") as f:
+        retry_rows = list(csv.DictReader(f))
+    assert len(retry_rows) == 1
+    assert retry_rows[0]["repetition"] == "02"
+    assert retry_rows[0]["seed"] == "205"
+    assert retry_rows[0]["observed_seed"] == "205"
+
+    with open(rd / "summary.csv", newline="") as f:
+        summary_rows = list(csv.DictReader(f))
+    assert len(summary_rows) == 1
+    assert float(summary_rows[0]["observed_seed_mean"]) == 205.0
+    assert summary_rows[0]["n_successful"] == "3"
 
 
 def test_retry_writes_retry_of_pointer_in_metadata(tmp_path):
