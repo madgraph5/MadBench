@@ -219,6 +219,22 @@ Use `madbench run TEST.yml --dry-run` to inspect the global matrix size,
 inferred dimensions, execution count, repetitions, dependencies, and cache
 configuration before running anything.
 
+## CPU affinity
+
+On Linux, a run can be pinned to selected logical CPUs with either CLI form:
+
+```bash
+madbench run --cpu-affinity=70,77 tests/test.yml
+madbench run -c 70,77 tests/test.yml
+```
+
+CPU ranges and strides use the same list notation as `taskset -c`, such as
+`0,2,4-7` or `0-10:2`. MadBench applies the affinity to its own process before
+starting the run, so every benchmark script, action, and MadGraph subprocess
+inherits it. The effective CPU IDs are recorded as `hardware.cpu_affinity` in
+the run metadata, alongside `hardware.cpu_count_available`. Affinity applied
+externally with `taskset` is detected and recorded in the same way.
+
 ## Conditional steps
 
 A step can use `if` to run only for selected matrix points:

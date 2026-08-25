@@ -17,6 +17,8 @@ from madbench.utils import (
     format_software_summary,
     get_git_sha,
     get_timestamp,
+    parse_cpu_affinity,
+    set_cpu_affinity,
 )
 
 
@@ -70,9 +72,53 @@ def test_detect_hardware_cpu_details_on_linux():
     assert hw["cpu_count_physical"] >= 1
     assert hw["cpu_count_physical"] <= hw["cpu_count_logical"]
     # sched_getaffinity is Linux-only; on Linux we should always have it.
+    assert hw["cpu_affinity"] == sorted(os.sched_getaffinity(0))
     assert "cpu_count_available" in hw
     assert hw["cpu_count_available"] >= 1
     assert hw["cpu_count_available"] <= hw["cpu_count_logical"]
+
+
+# -----------------------------------------------------------------------
+# CPU affinity
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("70,77", {70, 77}),
+    ("0,2,4-7", {0, 2, 4, 5, 6, 7}),
+    ("0-10:2", {0, 2, 4, 6, 8, 10}),
+    ("2,2,1-3", {1, 2, 3}),
+])
+def test_parse_cpu_affinity(value, expected):
+    assert parse_cpu_affinity(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "", " ", "1,", "a", "3-1", "0-4:0", "1:2", "-1",
+])
+def test_parse_cpu_affinity_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="CPU affinity|CPU list|range"):
+        parse_cpu_affinity(value)
+
+
+def test_set_cpu_affinity_applies_and_returns_kernel_effective_set(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        utils.os,
+        "sched_setaffinity",
+        lambda pid, cpus: calls.append((pid, cpus)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        utils.os,
+        "sched_getaffinity",
+        lambda pid: {2, 4},
+        raising=False,
+    )
+
+    assert set_cpu_affinity("2,4,99") == [2, 4]
+    assert calls == [(0, {2, 4, 99})]
 
 
 # -----------------------------------------------------------------------

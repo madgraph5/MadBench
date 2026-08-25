@@ -37,6 +37,16 @@ def main() -> None:
         default=None,
         help="Free-form note recorded in metadata.yml for this run",
     )
+    run_parser.add_argument(
+        "-c",
+        "--cpu-affinity",
+        metavar="CPU_LIST",
+        default=None,
+        help=(
+            "Constrain the run to a Linux CPU list (for example 0,2,4-7); "
+            "inherited by every benchmark subprocess"
+        ),
+    )
 
     # madbench retry <run_dir>
     retry_parser = subparsers.add_parser(
@@ -89,6 +99,18 @@ def _cmd_init(args: argparse.Namespace) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
+    from .utils import set_cpu_affinity
+
+    if getattr(args, "cpu_affinity", None) is not None:
+        try:
+            set_cpu_affinity(args.cpu_affinity)
+        except (PermissionError, ValueError) as e:
+            print(f"[madbench] Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Import and initialize the runner only after applying the affinity. This
+    # mirrors ``taskset -c ... madbench run`` as closely as possible: any
+    # workers started during runner imports or initialization inherit it too.
     from .driver import MadBench
 
     try:

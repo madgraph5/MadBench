@@ -12,6 +12,74 @@ from datetime import datetime
 from pathlib import Path
 
 
+_CPU_LIST_ITEM_RE = re.compile(
+    r"^(?P<start>\d+)(?:-(?P<end>\d+)(?::(?P<stride>\d+))?)?$"
+)
+
+
+def parse_cpu_affinity(value: str) -> set[int]:
+    """Parse a Linux CPU-list expression such as ``"0,2,4-7"``.
+
+    The optional range stride accepted by ``taskset -c`` is supported too,
+    for example ``"0-10:2"``. CPU IDs are de-duplicated in the result.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("CPU affinity must be a non-empty CPU list")
+
+    cpus: set[int] = set()
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        match = _CPU_LIST_ITEM_RE.fullmatch(item)
+        if match is None:
+            raise ValueError(
+                f"Invalid CPU affinity item {item!r}; expected CPU IDs and "
+                "ranges such as '0,2,4-7'"
+            )
+        start = int(match.group("start"))
+        end_text = match.group("end")
+        if end_text is None:
+            cpus.add(start)
+            continue
+        end = int(end_text)
+        if end < start:
+            raise ValueError(
+                f"Invalid CPU affinity range {item!r}; range end must be "
+                "greater than or equal to its start"
+            )
+        stride = int(match.group("stride") or 1)
+        if stride < 1:
+            raise ValueError(
+                f"Invalid CPU affinity range {item!r}; stride must be at "
+                "least 1"
+            )
+        cpus.update(range(start, end + 1, stride))
+
+    return cpus
+
+
+def set_cpu_affinity(value: str) -> list[int]:
+    """Apply a CPU-list expression to this process and return the effective set.
+
+    Child processes inherit this affinity on Linux, so applying it to the
+    MadBench CLI process constrains benchmark scripts and MadGraph subprocesses
+    without having to modify every individual subprocess invocation.
+    """
+    cpus = parse_cpu_affinity(value)
+    if not hasattr(os, "sched_setaffinity") or not hasattr(os, "sched_getaffinity"):
+        raise ValueError(
+            "CPU affinity is not supported on this platform; "
+            "--cpu-affinity currently requires Linux"
+        )
+    try:
+        os.sched_setaffinity(0, cpus)
+        return sorted(os.sched_getaffinity(0))
+    except (OSError, OverflowError) as exc:
+        detail = getattr(exc, "strerror", None) or str(exc)
+        raise ValueError(
+            f"Could not set CPU affinity to {value!r}: {detail}"
+        ) from exc
+
+
 def get_git_sha(path: Path) -> str | None:
     """Return the short git SHA for the repo at `path`, or None."""
     try:
@@ -177,8 +245,9 @@ def _detect_cpu_info() -> dict:
     - ``cpu_count_physical`` — distinct physical cores, derived from unique
       ``(physical id, core id)`` pairs in ``/proc/cpuinfo``. Linux-only;
       omitted elsewhere.
-    - ``cpu_count_available`` — cores the *process* is allowed to schedule
-      on, from ``os.sched_getaffinity(0)``. Diverges from
+    - ``cpu_affinity`` — sorted logical CPU IDs the *process* is allowed to
+      schedule on, from ``os.sched_getaffinity(0)``.
+    - ``cpu_count_available`` — number of CPUs in ``cpu_affinity``. Diverges from
       ``cpu_count_logical`` inside VMs, containers, cgroup cpusets, and
       ``taskset`` slices — this is the right number for normalizing
       benchmark throughput. Linux-only; omitted elsewhere.
@@ -198,7 +267,9 @@ def _detect_cpu_info() -> dict:
     # the kernel hands the process, not with the iron underneath.
     if hasattr(os, "sched_getaffinity"):
         try:
-            info["cpu_count_available"] = len(os.sched_getaffinity(0))
+            affinity = sorted(os.sched_getaffinity(0))
+            info["cpu_affinity"] = affinity
+            info["cpu_count_available"] = len(affinity)
         except OSError:
             pass
 
@@ -369,9 +440,11 @@ def detect_hardware() -> dict:
     - ``cpu_arch`` — ``platform.machine()`` (e.g. ``"x86_64"``).
     - ``cpu_count_logical`` — total host threads (SMT included).
     - ``cpu_count_physical`` — distinct physical cores. Linux-only.
-    - ``cpu_count_available`` — what this process can schedule on
-      (``sched_getaffinity``). Linux-only. < ``logical`` inside
-      VMs/containers/cgroups.
+    - ``cpu_affinity`` — sorted logical CPU IDs this process can schedule on
+      (``sched_getaffinity``). Linux-only.
+    - ``cpu_count_available`` — length of ``cpu_affinity``. Linux-only;
+      smaller than ``logical`` inside VMs/containers/cgroups or after
+      applying ``taskset`` / ``madbench run --cpu-affinity``.
     - ``platform`` — ``platform.platform()`` string.
     - ``gpus`` — list of ``{vendor, index, name, memory_mb}``, plus
       ``driver_version`` when available and ``compute_cap`` for NVIDIA.
