@@ -312,8 +312,9 @@ seed:
 MadBench calculates the effective value before invoking the step. The script's
 positional argument and `$MADBENCH_ARGS_FILE` therefore contain the exact value
 used for that repetition; scripts must not add `MADBENCH_REPETITION` again.
-Per-repeat arguments require `repeat > 1` and, like repetition itself, are
-currently available only on the final step.
+Per-repeat arguments accept any positive repetition count and are currently
+available only on the final step. With `repeat: 1` (including the default), the
+single effective value is exactly `start`; `step` does not modify it.
 
 Supported references are:
 

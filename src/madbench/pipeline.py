@@ -827,15 +827,6 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 f"{sorted(unknown_needs)}"
             )
         repeat = _positive_int(step_raw.get("repeat"), f"steps.{step_id}.repeat")
-        per_repeat_names = [
-            name for name, value in arguments.items()
-            if isinstance(value, PerRepeatArgument)
-        ]
-        if per_repeat_names and repeat <= 1:
-            raise ValueError(
-                f"step {step_id!r} declares per-repeat argument(s) "
-                f"{per_repeat_names} but repeat is {repeat}; set repeat > 1"
-            )
         outputs = _normalize_outputs(step_raw.get("outputs"), step_id)
         stats = _string_list(step_raw.get("stats"), f"steps.{step_id}.stats")
         missing_stats = set(stats) - set(outputs)
@@ -866,6 +857,12 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             raise ValueError(
                 f"only the last step may repeat; step {step.id!r} has "
                 f"repeat={step.repeat}"
+            )
+        if step.per_repeat_arguments():
+            raise ValueError(
+                f"only the last step may declare per-repeat arguments; "
+                f"step {step.id!r} declares "
+                f"{list(step.per_repeat_arguments())}"
             )
 
     by_id = {step.id: step for step in steps}
