@@ -574,16 +574,15 @@ paired proc card and launch card. Given `inputs/processes.json`:
   "processes": [
     {
       "id": "pp_jets",
-      "model": "",
       "process": ["p p > j j"],
       "output": "",
       "launch": {}
     },
     {
       "id": "fcc_ee_zh",
-      "model": "sm",
       "process": ["e+ e- > z h", "e+ e- > z h j"],
       "proc_card_preamble": [
+        "import model sm",
         "set group_subprocesses False"
       ],
       "output": "standalone",
@@ -663,15 +662,16 @@ of MadGraph process definitions under `process`. The first definition emits
 `add process <definition>`. Definitions must not include the `generate` or
 `add process` command prefixes themselves.
 
-`model` may be omitted or empty to use MadGraph's default model without
-emitting an `import model` command. A non-empty model emits
-`import model <model>`.
+`model` is not a supported process field. To select a non-default model, add
+an explicit `import model <model>` command to the process's
+`proc_card_preamble`.
 
-The optional `proc_card_preamble` argument is a list of commands placed after
-the model import, when present, and before the process commands. A process
-inherits this root preamble when its own `proc_card_preamble` field is absent.
-A per-process list replaces the root preamble completely; an empty list
-explicitly selects no preamble.
+The optional root `proc_card_preamble` argument is a list of commands placed
+before the process commands. An optional per-process `proc_card_preamble` list
+is appended to the root preamble. Root commands therefore run first and
+process-specific commands run second, so a process command can override a root
+setting. An empty or omitted per-process list adds no commands and leaves the
+root preamble intact.
 
 The optional per-process `output` string selects the output mode: an empty or
 omitted value emits `output <id>`, while `standalone`, for example, emits
@@ -695,6 +695,8 @@ For example, the second matrix entry produces:
 
 ```text
 # proc_card.dat
+set group_subprocesses Auto
+define lightq = u c d s u~ c~ d~ s~
 import model sm
 set group_subprocesses False
 generate e+ e- > z h

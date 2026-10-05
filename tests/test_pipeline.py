@@ -12,6 +12,7 @@ import yaml
 from madbench.driver import MadBench
 from madbench.pipeline import (
     PipelineDefinition,
+    PipelineRunner,
     build_matrix_points,
     build_step_executions,
     parse_pipeline,
@@ -357,7 +358,6 @@ def test_cards_action_requires_process_and_declares_default_artifacts():
         "matrix": {
             "process": [{
                 "id": "pp_jets",
-                "model": "sm",
                 "process": ["p p > j j"],
                 "launch": {},
             }],
@@ -1596,7 +1596,7 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         "check_cards.sh",
         'grep -q "^import model sm$" "$1"\n'
         'grep -q "^generate e+ e- > z h$" "$1"\n'
-        '! grep -q "^define ignored" "$1"\n'
+        'grep -q "^define inherited = u u~$" "$1"\n'
         'grep -q "^output fcc_ee_zh$" "$1"\n'
         '! grep -q "^launch " "$2"\n'
         'grep -q "^set beam.energy 120$" "$2"\n',
@@ -1606,9 +1606,8 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         "matrix": {
             "process": [{
                 "id": "fcc_ee_zh",
-                "model": "sm",
                 "process": ["e+ e- > z h"],
-                "proc_card_preamble": [],
+                "proc_card_preamble": ["import model sm"],
                 "launch": {"beam.energy": 120},
             }],
         },
@@ -1618,7 +1617,7 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
                 "action": "madgraph/cards",
                 "with": {
                     "process": "${{ matrix.process }}",
-                    "proc_card_preamble": ["define ignored = u u~"],
+                    "proc_card_preamble": ["define inherited = u u~"],
                 },
             },
             {
@@ -1636,6 +1635,17 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         (only_result_dir(root, "cards") / "report.json").read_text()
     )
     assert [step["status"] for step in result["steps"]] == ["success", "success"]
+
+
+def test_madgraph_cards_action_rejects_model_field(tmp_path):
+    with pytest.raises(ValueError, match="does not support process.model"):
+        PipelineRunner._write_madgraph_cards({
+            "process": {
+                "id": "custom_model",
+                "model": "sm",
+                "process": ["p p > t t~"],
+            },
+        }, tmp_path)
 
 
 def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
@@ -1656,16 +1666,15 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
             "processes": [
                 {
                     "id": "pp_jets",
-                    "model": "",
                     "process": ["p p > j j"],
                     "output": "",
                     "launch": {},
                 },
                 {
                     "id": "fcc_ee_zh",
-                    "model": "sm",
                     "process": ["e+ e- > z h", "e+ e- > z h j"],
                     "proc_card_preamble": [
+                        "import model sm",
                         "set group_subprocesses False",
                     ],
                     "output": "standalone",
@@ -1752,9 +1761,12 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
     assert "import model" not in proc_cards["pp_jets"]
     assert "set group_subprocesses Auto\n" in proc_cards["pp_jets"]
     assert proc_cards["pp_jets"].endswith("output pp_jets\n")
-    assert proc_cards["fcc_ee_zh"].startswith("import model sm\n")
-    assert "set group_subprocesses Auto" not in proc_cards["fcc_ee_zh"]
-    assert "set group_subprocesses False\n" in proc_cards["fcc_ee_zh"]
+    assert proc_cards["fcc_ee_zh"].startswith(
+        "set group_subprocesses Auto\n"
+        "define lightq = u c d s u~ c~ d~ s~\n"
+        "import model sm\n"
+        "set group_subprocesses False\n"
+    )
     assert "generate e+ e- > z h\n" in proc_cards["fcc_ee_zh"]
     assert "add process e+ e- > z h j\n" in proc_cards["fcc_ee_zh"]
     assert proc_cards["fcc_ee_zh"].endswith(

@@ -2001,14 +2001,11 @@ class PipelineRunner:
             )
 
         process_id = process.get("id")
-        model = process.get("model", "")
         definitions = process.get("process")
         launch = process.get("launch", {})
         output_mode = process.get("output", "")
         default_preamble = arguments.get("proc_card_preamble", [])
-        proc_card_preamble = process.get(
-            "proc_card_preamble", default_preamble,
-        )
+        process_preamble = process.get("proc_card_preamble", [])
         default_launch = arguments.get("default_launch", {})
         if (
             not isinstance(process_id, str)
@@ -2018,9 +2015,11 @@ class PipelineRunner:
                 "action 'madgraph/cards' process.id must be a safe, "
                 "non-empty identifier"
             )
-        if not isinstance(model, str):
+        if "model" in process:
             raise ValueError(
-                "action 'madgraph/cards' process.model must be a string"
+                "action 'madgraph/cards' does not support process.model; "
+                "add an 'import model ...' command to "
+                "process.proc_card_preamble"
             )
         if (
             not isinstance(definitions, list)
@@ -2068,10 +2067,10 @@ class PipelineRunner:
                 "a list of non-empty command strings"
             )
         if (
-            not isinstance(proc_card_preamble, list)
+            not isinstance(process_preamble, list)
             or not all(
                 isinstance(command, str) and command.strip()
-                for command in proc_card_preamble
+                for command in process_preamble
             )
         ):
             raise ValueError(
@@ -2086,9 +2085,8 @@ class PipelineRunner:
             )
 
         proc_lines: list[str] = []
-        if model.strip():
-            proc_lines.append(f"import model {model.strip()}")
-        proc_lines.extend(command.strip() for command in proc_card_preamble)
+        proc_lines.extend(command.strip() for command in default_preamble)
+        proc_lines.extend(command.strip() for command in process_preamble)
         proc_lines.extend(
             (
                 f"generate {definition.strip()}"
