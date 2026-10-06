@@ -1448,21 +1448,29 @@ def test_test_workdir_contains_work_and_default_cache(tmp_path):
     cache = scratch / ".madbench-cache" / "external" / "build"
     assert len(list(cache.glob("*/artifacts.tar.gz"))) == 1
     assert not (root / "scratch" / ".madbench-cache").exists()
-def test_madgraph_process_action(tmp_path):
+
+
+@pytest.mark.parametrize(
+    "binaries", [("madgraph",), ("mg5_aMC",), ("madgraph", "mg5_aMC")],
+)
+def test_madgraph_process_action(tmp_path, binaries, capsys):
     root = make_workspace(tmp_path)
     card_dir = root / "inputs"
     card_dir.mkdir()
     (card_dir / "proc.dat").write_text("proc")
-    mg_bin = root / "MadGraph" / "v1" / "bin" / "mg5_aMC"
-    mg_bin.parent.mkdir(parents=True)
-    mg_bin.write_text(
-        "#!/bin/bash\nset -e\n"
-        "test -f \"$1\"\n"
-        "mkdir generated\n"
-        "printf process > generated/value\n"
-        "ln -s value generated/value-link\n"
-    )
-    mg_bin.chmod(mg_bin.stat().st_mode | stat.S_IEXEC)
+    for binary in binaries:
+        mg_bin = root / "MadGraph" / "v1" / "bin" / binary
+        mg_bin.parent.mkdir(parents=True, exist_ok=True)
+        mg_bin.write_text(
+            "#!/bin/bash\nset -e\n"
+            "test -f \"$1\"\n"
+            "mkdir generated\n"
+            "printf process > generated/value\n"
+            "ln -s value generated/value-link\n"
+            f"printf '%s' '{binary}' > generated/binary\n"
+            "printf '%s' \"$MG_BIN\" > generated/mg_bin\n"
+        )
+        mg_bin.chmod(mg_bin.stat().st_mode | stat.S_IEXEC)
     path = make_pipeline(root, {
         "name": "action",
         "matrix": {
@@ -1489,6 +1497,71 @@ def test_madgraph_process_action(tmp_path):
     workspace = Path(step["artifacts"]["process_workspace"]["path"])
     assert (workspace / "generated" / "value").read_text() == "process"
     assert (workspace / "generated" / "value-link").is_symlink()
+    expected_name = "madgraph" if "madgraph" in binaries else "mg5_aMC"
+    expected = root / "MadGraph" / "v1" / "bin" / expected_name
+    assert (workspace / "generated" / "binary").read_text() == expected_name
+    assert (workspace / "generated" / "mg_bin").read_text() == str(expected)
+    assert f"MG_BIN: {expected}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("nonexecutable", [False, True])
+def test_madgraph_process_action_reports_unavailable_binaries(
+    tmp_path, nonexecutable,
+):
+    root = make_workspace(tmp_path)
+    bin_dir = root / "MadGraph" / "v1" / "bin"
+    if nonexecutable:
+        bin_dir.mkdir(parents=True)
+        binary = bin_dir / "madgraph"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o644)
+    path = make_pipeline(root, {
+        "name": "missing_mg",
+        "matrix": {"mg_version": ["v1"]},
+        "steps": [{
+            "id": "generate",
+            "action": "madgraph/process",
+            "with": {"proc_card": "card.dat"},
+        }],
+    })
+
+    error = PermissionError if nonexecutable else FileNotFoundError
+    with pytest.raises(error) as exc:
+        MadBench(find_workspace(root)).run(path)
+    for name in ("madgraph", "mg5_aMC"):
+        assert str(bin_dir / name) in str(exc.value)
+
+
+def test_madgraph_process_action_does_not_fallback_after_failure(tmp_path):
+    root = make_workspace(tmp_path)
+    bin_dir = root / "MadGraph" / "v1" / "bin"
+    bin_dir.mkdir(parents=True)
+    marker = root / "fallback_ran.txt"
+    for name, body in (
+        ("madgraph", "exit 7\n"),
+        ("mg5_aMC", f"echo ran > '{marker}'\n"),
+    ):
+        binary = bin_dir / name
+        binary.write_text("#!/bin/sh\n" + body)
+        binary.chmod(0o755)
+    path = make_pipeline(root, {
+        "name": "mg_failure",
+        "matrix": {"mg_version": ["v1"]},
+        "steps": [{
+            "id": "generate",
+            "action": "madgraph/process",
+            "with": {"proc_card": "card.dat"},
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+
+    assert not marker.exists()
+    report = json.loads(
+        (only_result_dir(root, "mg_failure") / "report.json").read_text(),
+    )
+    assert report["steps"][0]["status"] == "failed"
+    assert report["steps"][0]["exit_code"] == 7
 
 
 def test_artifact_rejects_symlink_escaping_its_root(tmp_path):

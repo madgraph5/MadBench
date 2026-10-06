@@ -26,7 +26,7 @@ from .utils import (
     get_git_sha,
     get_timestamp,
 )
-from .workspace import WorkspaceConfig, resolve_script, stage_inputs
+from .workspace import WorkspaceConfig, resolve_mg_bin, resolve_script, stage_inputs
 
 
 OUTPUT_FILE_NAME = ".madbench_output.json"
@@ -1429,6 +1429,7 @@ class PipelineRunner:
                             staged_dir=staged_dir,
                             result_dir=result_dir,
                             log_dir=log_dir,
+                            progress=progress,
                         )
                 progress.log(
                     f"[madbench]   {result.status}; cache={result.cache}; "
@@ -1790,6 +1791,7 @@ class PipelineRunner:
         staged_dir: Path,
         result_dir: Path,
         log_dir: Path,
+        progress: MainLog,
     ) -> ExecutionResult:
         total_started = time.monotonic()
         step = execution.step
@@ -1863,6 +1865,11 @@ class PipelineRunner:
                 argument_schedules=argument_schedules,
             )
 
+        if step.action == "madgraph/process":
+            mg_bin = self._mg_bin(mg_version, required=True)
+            env["MG_BIN"] = str(mg_bin or "")
+        if mg_bin is not None:
+            progress.log(f"[madbench]   MG_BIN: {mg_bin}")
         execution_started = time.monotonic()
         with open(stdout, "w") as stdout_file, open(stderr, "w") as stderr_file:
             if step.script is not None:
@@ -1939,10 +1946,10 @@ class PipelineRunner:
             argument_schedules=argument_schedules,
         )
 
-    def _mg_bin(self, mg_version: str) -> Optional[Path]:
-        if mg_version == MG_VERSION_NONE:
-            return None
-        return self.workspace.root / "MadGraph" / mg_version / "bin" / "mg5_aMC"
+    def _mg_bin(
+        self, mg_version: str, *, required: bool = False,
+    ) -> Optional[Path]:
+        return resolve_mg_bin(self.workspace, mg_version, required=required)
 
     def _run_action(
         self,

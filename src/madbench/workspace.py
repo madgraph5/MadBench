@@ -97,6 +97,36 @@ def resolve_plot_module(ws: WorkspaceConfig, plot_name: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+def resolve_mg_bin(
+    ws: WorkspaceConfig, mg_version: str, *, required: bool = False,
+) -> Optional[Path]:
+    """Prefer bin/madgraph, then bin/mg5_aMC, for a selected installation.
+
+    When required, raise with both candidate paths if neither is executable.
+    Otherwise retain the legacy mg5_aMC path for script-only runs without an
+    installed binary. The version sentinel "none" always returns None.
+    """
+    if mg_version == "none":
+        return None
+    bin_dir = ws.root / "MadGraph" / mg_version / "bin"
+    candidates = [bin_dir / "madgraph", bin_dir / "mg5_aMC"]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    if required:
+        checked = ", ".join(str(path) for path in candidates)
+        if any(path.is_file() for path in candidates):
+            raise PermissionError(
+                f"MadGraph binary is not executable for mg_version={mg_version!r}. "
+                f"Checked: {checked}"
+            )
+        raise FileNotFoundError(
+            f"MadGraph binary not found for mg_version={mg_version!r}. "
+            f"Checked: {checked}"
+        )
+    return candidates[-1]
+
+
 def stage_inputs(
     workspace_root: Path,
     patterns: list[str],

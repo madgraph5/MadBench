@@ -8,6 +8,7 @@ import yaml
 
 from madbench.workspace import (
     find_workspace,
+    resolve_mg_bin,
     resolve_script,
     stage_inputs,
 )
@@ -89,6 +90,65 @@ def test_resolve_script_not_executable(tmp_path):
 
     with pytest.raises(PermissionError):
         resolve_script(ws, "noexec.sh")
+
+
+@pytest.mark.parametrize(
+    "preferred", ["executable", "missing", "nonexecutable", "directory", "broken_link"],
+)
+def test_resolve_mg_bin_selects_first_executable(tmp_path, preferred):
+    ws = find_workspace(make_workspace(tmp_path))
+    bin_dir = tmp_path / "MadGraph" / "v1" / "bin"
+    bin_dir.mkdir(parents=True)
+    legacy = bin_dir / "mg5_aMC"
+    legacy.write_text("#!/bin/sh\nexit 0\n")
+    legacy.chmod(0o755)
+    modern = bin_dir / "madgraph"
+    if preferred in {"executable", "nonexecutable"}:
+        modern.write_text("#!/bin/sh\nexit 0\n")
+        modern.chmod(0o755 if preferred == "executable" else 0o644)
+    elif preferred == "directory":
+        modern.mkdir()
+    elif preferred == "broken_link":
+        modern.symlink_to("missing")
+
+    expected = modern if preferred == "executable" else legacy
+    assert resolve_mg_bin(ws, "v1", required=True) == expected
+
+
+def test_resolve_mg_bin_accepts_executable_symlink(tmp_path):
+    ws = find_workspace(make_workspace(tmp_path))
+    bin_dir = tmp_path / "MadGraph" / "v1" / "bin"
+    bin_dir.mkdir(parents=True)
+    target = bin_dir / "launcher"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    modern = bin_dir / "madgraph"
+    modern.symlink_to("launcher")
+
+    assert resolve_mg_bin(ws, "v1", required=True) == modern
+
+
+@pytest.mark.parametrize("binary", [None, "madgraph", "mg5_aMC"])
+def test_resolve_mg_bin_reports_unavailable_candidates(tmp_path, binary):
+    ws = find_workspace(make_workspace(tmp_path))
+    bin_dir = tmp_path / "MadGraph" / "v1" / "bin"
+    if binary is not None:
+        bin_dir.mkdir(parents=True)
+        path = bin_dir / binary
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o644)
+    error = FileNotFoundError if binary is None else PermissionError
+
+    with pytest.raises(error) as exc:
+        resolve_mg_bin(ws, "v1", required=True)
+    assert str(bin_dir / "madgraph") in str(exc.value)
+    assert str(bin_dir / "mg5_aMC") in str(exc.value)
+
+
+def test_resolve_mg_bin_allows_uninstalled_version_for_scripts(tmp_path):
+    ws = find_workspace(make_workspace(tmp_path))
+    assert resolve_mg_bin(ws, "v1") == tmp_path / "MadGraph/v1/bin/mg5_aMC"
+    assert resolve_mg_bin(ws, "none", required=True) is None
 
 
 # -----------------------------------------------------------------------

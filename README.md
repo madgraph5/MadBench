@@ -214,6 +214,12 @@ onto the compile step's dimensions.
 
 `mg_version` is reserved. When present in the global matrix, it is an implicit
 dimension of every step and is exposed through `MG_VERSION` and `MG_BIN`.
+MadBench selects the first executable file from
+`MadGraph/<mg_version>/bin/madgraph` and
+`MadGraph/<mg_version>/bin/mg5_aMC`, in that order. The selected path is
+logged and exposed as `MG_BIN`. Script-only runs without an installed
+executable retain the legacy `bin/mg5_aMC` path; `mg_version: none` exposes
+an empty `MG_BIN`.
 
 Use `madbench run TEST.yml --dry-run` to inspect the global matrix size,
 inferred dimensions, execution count, repetitions, dependencies, and cache
@@ -716,11 +722,16 @@ while any additional downstream dimensions form the normal Cartesian product.
 
 ### `madgraph/process`
 
-The initial built-in action invokes:
+The built-in action invokes the selected executable:
 
 ```text
-MadGraph/<mg_version>/bin/mg5_aMC PROC_CARD
+MG_BIN PROC_CARD
 ```
+
+It prefers `bin/madgraph` and falls back to `bin/mg5_aMC` during discovery.
+If neither is an executable file, the error lists both paths. A failure after
+launching MadGraph is propagated without trying the other executable. The
+legacy runner's `proc_cards` uses the same discovery behavior.
 
 Its required argument is:
 

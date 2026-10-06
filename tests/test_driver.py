@@ -822,8 +822,13 @@ def test_run_no_version_segment_when_none(tmp_path):
     assert not (ws_root / "scratch" / "none").exists()
 
 
-def test_run_exposes_mg_env_vars(tmp_path):
+@pytest.mark.parametrize(
+    "binaries", [(), ("madgraph",), ("mg5_aMC",), ("madgraph", "mg5_aMC")],
+)
+def test_run_exposes_mg_env_vars(tmp_path, binaries, capsys):
     ws_root = make_workspace(tmp_path)
+    for binary in binaries:
+        _install_mock_mg(ws_root, "v3.5.4", binary=binary)
     make_script(
         ws_root,
         body=(
@@ -850,7 +855,10 @@ def test_run_exposes_mg_env_vars(tmp_path):
         ).read().decode()
     assert "MG_VERSION=v3.5.4" in log
     assert "MG_BIN=" in log
-    assert "MadGraph/v3.5.4/bin/mg5_aMC" in log
+    expected_name = "madgraph" if "madgraph" in binaries else "mg5_aMC"
+    expected = ws_root / "MadGraph" / "v3.5.4" / "bin" / expected_name
+    assert f"MG_BIN={expected}" in log
+    assert f"MG_BIN: {expected}" in capsys.readouterr().out
 
 
 def test_run_mg_bin_empty_when_version_is_none(tmp_path):
@@ -1053,16 +1061,19 @@ def test_two_runs_create_separate_subdirs(tmp_path):
     assert m1["timestamp"] != m2["timestamp"]
 
 
-def _install_mock_mg(ws_root: Path, version: str, body: str | None = None) -> Path:
-    """Create a fake MadGraph install at MadGraph/<version>/bin/mg5_aMC.
+def _install_mock_mg(
+    ws_root: Path, version: str, body: str | None = None,
+    *, binary: str = "mg5_aMC",
+) -> Path:
+    """Create a fake MadGraph install at MadGraph/<version>/bin/<binary>.
 
     The default body parses the proc_card and emits one folder per ``output``
     directive, mimicking the parts of MG behaviour MadBench actually cares
     about.
     """
     bin_dir = ws_root / "MadGraph" / version / "bin"
-    bin_dir.mkdir(parents=True)
-    mg = bin_dir / "mg5_aMC"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    mg = bin_dir / binary
     mg.write_text(
         body
         or (
@@ -1104,7 +1115,8 @@ def test_load_test_proc_cards_parsed(tmp_path):
     assert td.proc_cards == ["inputs/proc_a.dat", "inputs/proc_b.dat"]
 
 
-def test_run_generates_process_dirs(tmp_path):
+@pytest.mark.parametrize("binary", ["madgraph", "mg5_aMC"])
+def test_run_generates_process_dirs(tmp_path, binary, capsys):
     ws_root = make_workspace(tmp_path)
     make_script(
         ws_root,
@@ -1113,7 +1125,7 @@ def test_run_generates_process_dirs(tmp_path):
             "ls \"$MADBENCH_PROCESSES\" > listing.txt\n"
         ),
     )
-    _install_mock_mg(ws_root, "v1")
+    mg_bin = _install_mock_mg(ws_root, "v1", binary=binary)
     (ws_root / "inputs").mkdir(exist_ok=True)
     (ws_root / "inputs" / "card1.dat").write_text("output proc_a\n")
     (ws_root / "inputs" / "card2.dat").write_text("output proc_b\n")
@@ -1135,6 +1147,7 @@ def test_run_generates_process_dirs(tmp_path):
     # Script saw both via $MADBENCH_PROCESSES
     listing = (run_dir / "invocation_001" / "01" / "listing.txt").read_text()
     assert "proc_a" in listing and "proc_b" in listing
+    assert f"MadGraph binary (mg_version=v1): {mg_bin}" in capsys.readouterr().out
 
 
 def test_run_generates_once_per_version_not_per_invocation(tmp_path):
@@ -1203,7 +1216,7 @@ def test_run_proc_cards_requires_mg_version(tmp_path):
     assert rows[1].split(",")[ec_idx] == "-3"
 
 
-def test_run_proc_cards_missing_mg_binary(tmp_path):
+def test_run_proc_cards_missing_mg_binary(tmp_path, capsys):
     """When the MadGraph binary doesn't exist for the requested version,
     invocations are recorded with the proc-gen-failed sentinel."""
     ws_root = make_workspace(tmp_path)
@@ -1227,6 +1240,9 @@ def test_run_proc_cards_missing_mg_binary(tmp_path):
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")
     assert rows[1].split(",")[ec_idx] == "-3"
+    log = capsys.readouterr().out
+    for binary in ("madgraph", "mg5_aMC"):
+        assert str(ws_root / "MadGraph" / "ghost" / "bin" / binary) in log
 
 
 def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
@@ -1241,6 +1257,11 @@ def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
         ws_root,
         "v1",
         body="#!/bin/bash\necho 'pretend MG failure' >&2\nexit 7\n",
+        binary="madgraph",
+    )
+    fallback_marker = ws_root / "fallback_ran.txt"
+    _install_mock_mg(
+        ws_root, "v1", body=f"#!/bin/bash\necho ran > {fallback_marker}\n",
     )
     (ws_root / "inputs").mkdir(exist_ok=True)
     (ws_root / "inputs" / "card.dat").write_text("output p\n")
@@ -1257,6 +1278,7 @@ def test_run_proc_cards_mg_failure_skips_invocations(tmp_path):
     mb.run(test_file)
 
     assert not marker.exists()  # script never ran
+    assert not fallback_marker.exists()
     rows = (try_dir(ws_root, "mgfail") / "results.csv").read_text().splitlines()
     header = rows[0].split(",")
     ec_idx = header.index("exit_code")

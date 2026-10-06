@@ -22,6 +22,7 @@ from .utils import (
 from .workspace import (
     WorkspaceConfig,
     find_workspace,
+    resolve_mg_bin,
     resolve_plot_module,
     resolve_script,
     stage_inputs,
@@ -816,13 +817,10 @@ class MadBench:
             return workdir_base / f"{test_name}_{timestamp}"
         return workdir_base / mg_version / f"{test_name}_{timestamp}"
 
-    def _resolve_mg_bin(self, mg_version: str) -> Optional[Path]:
-        """Return MadGraph/<mg_version>/bin/mg5_aMC, or None when version is
-        the "none" sentinel. Does not check existence — that is the caller's
-        job once MG is actually required (step 2: proc_card generation)."""
-        if mg_version == MG_VERSION_NONE:
-            return None
-        return self.workspace.root / "MadGraph" / mg_version / "bin" / "mg5_aMC"
+    def _resolve_mg_bin(
+        self, mg_version: str, *, required: bool = False,
+    ) -> Optional[Path]:
+        return resolve_mg_bin(self.workspace, mg_version, required=required)
 
     def _generate_processes(
         self,
@@ -840,7 +838,11 @@ class MadBench:
         Returns True on success, False on any failure (missing binary,
         missing card, non-zero MG exit).
         """
-        mg_bin = self._resolve_mg_bin(mg_version)
+        try:
+            mg_bin = self._resolve_mg_bin(mg_version, required=True)
+        except (FileNotFoundError, PermissionError) as exc:
+            tee.log(f"[madbench] ERROR: {exc}")
+            return False
         if mg_bin is None:
             tee.log(
                 "[madbench] ERROR: 'proc_cards' is set but mg_version is "
@@ -848,12 +850,7 @@ class MadBench:
                 "folder to enable process generation."
             )
             return False
-        if not mg_bin.exists():
-            tee.log(
-                f"[madbench] ERROR: MadGraph binary not found at {mg_bin} "
-                f"(required by mg_version='{mg_version}')."
-            )
-            return False
+        tee.log(f"[madbench] MadGraph binary (mg_version={mg_version}): {mg_bin}")
 
         processes_dir = run_dir / "processes"
         processes_dir.mkdir(parents=True, exist_ok=True)
@@ -1642,6 +1639,8 @@ class MadBench:
                     )
                     tee.log(f"  stdout: {stdout_log}")
                     tee.log(f"  stderr: {stderr_log}")
+                    if env["MG_BIN"]:
+                        tee.log(f"  MG_BIN: {env['MG_BIN']}")
 
                     invocation_ts = get_timestamp()
                     cmd_start = time.monotonic()
