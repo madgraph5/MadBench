@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import tarfile
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Optional
@@ -20,14 +22,18 @@ class MainLog:
     straightforward: each worker writes to disjoint files, and only the
     single shared ``main.log`` line needs locking.
 
+    Logs are staged under the selected work root. ``publish`` and ``capture``
+    synchronously retain snapshots in the workspace between executions.
+
     Usage::
 
         with MainLog(main_log_path) as tee:
             tee.log("[madbench] starting")
     """
 
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, log_path: Path, published_path: Optional[Path] = None) -> None:
         self.log_path = log_path
+        self.published_path = published_path
         self._fh: Optional[IO[str]] = None
         self._lock = threading.Lock()
 
@@ -41,6 +47,25 @@ class MainLog:
             if self._fh is not None:
                 self._fh.close()
                 self._fh = None
+        self.publish()
+
+    def publish(self) -> None:
+        """Synchronously refresh the durable main log outside execution timers."""
+        with self._lock:
+            if self._fh is not None:
+                self._fh.flush()
+            if self.published_path is not None:
+                publish_logs(self.log_path, self.published_path)
+
+    @contextmanager
+    def capture(self, relative: Path):
+        """Retain a completed (or interrupted) execution's local logs."""
+        local = self.log_path.parent / relative
+        try:
+            yield local
+        finally:
+            if self.published_path is not None and local.exists():
+                publish_logs(local, self.published_path.parent / relative)
 
     def log(self, msg: str = "") -> None:
         """Write a timestamped line (newline appended) to both stdout and
@@ -64,6 +89,17 @@ class MainLog:
             if self._fh is not None:
                 self._fh.write(line)
                 self._fh.flush()
+
+
+def publish_logs(source: Path, destination: Path) -> None:
+    """Copy closed local logs synchronously to their workspace destination."""
+    if source.resolve() == destination.resolve():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+    else:
+        shutil.copy2(source, destination)
 
 
 def bundle_logs(

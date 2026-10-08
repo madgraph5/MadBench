@@ -769,7 +769,8 @@ def test_pipeline_reports_live_progress_and_writes_logs_outside_results(
     assert len(log_dirs) == 1
     main_log = (log_dirs[0] / "main.log").read_text()
     assert "Running run execution 1/1" in main_log
-    assert str(log_dirs[0] / "run") in main_log
+    local_main = next((root / "scratch").rglob("main.log"))
+    assert str(local_main.parent / "run") in main_log
     assert list((log_dirs[0] / "run").rglob("stdout.log"))
     result_dir = only_result_dir(root, "logged")
     assert not (result_dir / "logs").exists()

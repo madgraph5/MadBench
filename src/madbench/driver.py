@@ -27,7 +27,7 @@ from .workspace import (
     resolve_script,
     stage_inputs,
 )
-from ._logging import MainLog, bundle_logs
+from ._logging import MainLog, bundle_logs, publish_logs
 from .results import append_row, select_results_csv
 from .pipeline import PipelineDefinition, PipelineRunner, parse_pipeline
 
@@ -879,7 +879,12 @@ class MadBench:
                         cwd=processes_dir,
                         close_fds=True,
                     )
-                    exit_code = proc.wait()
+                    try:
+                        exit_code = proc.wait()
+                    except KeyboardInterrupt:
+                        proc.terminate()
+                        proc.wait()
+                        raise
             except OSError as e:
                 tee.log(f"[madbench] ERROR: failed to invoke MadGraph: {e}")
                 return False
@@ -1460,6 +1465,11 @@ class MadBench:
         prev_csv_rows = prev_csv_rows or []
         try_dir = result_dir / f"try_{try_n}"
         try_log_dir = run_log_dir / f"try_{try_n}"
+        # Use the same selected work root for all logs, including main.log.
+        # A retry reuses the original run's scratch tree with a new try slice.
+        local_log_dir = (
+            next(iter(run_dirs.values())) / "logs" / f"try_{try_n}"
+        )
 
         # Prepare per-version run dirs + inputs + processes (once per
         # version actually exercised by this set of units).
@@ -1480,8 +1490,7 @@ class MadBench:
             initial_hardware=hardware,
         )
         try_dir.mkdir(parents=True, exist_ok=True)
-        run_log_dir.mkdir(parents=True, exist_ok=True)
-        try_log_dir.mkdir(parents=True, exist_ok=True)
+        local_log_dir.mkdir(parents=True, exist_ok=True)
         for mgv, rd in run_dirs.items():
             rd.mkdir(parents=True, exist_ok=True)
             inputs_dir = rd / STAGED_DIR_NAME
@@ -1494,7 +1503,7 @@ class MadBench:
         csv_header = self._csv_header(test)
         csv_path, write_header = select_results_csv(try_dir, csv_header)
 
-        main_log = try_log_dir / "main.log"
+        main_log = local_log_dir / "main.log"
         archive_path = (
             self.workspace.logs_dir / test.name
             / f"{result_dir.name}_try{try_n}.tar.gz"
@@ -1514,7 +1523,8 @@ class MadBench:
         script_idx = 0
 
         try:
-            with MainLog(main_log) as tee:
+            with MainLog(main_log, try_log_dir / "main.log") as tee:
+                tee.log(f"[madbench] Main log: {main_log}")
                 tee.log(f"[madbench] Host: {format_hardware_summary(hardware)}")
                 tee.log(f"[madbench] Toolchain: {format_software_summary(software)}")
                 # Dump the full run metadata (hardware block included) up
@@ -1551,11 +1561,15 @@ class MadBench:
                 proc_gen_status: dict[str, bool] = {}
                 for mgv in mg_versions_in_units:
                     if test.proc_cards:
-                        log_version_dir = self._version_log_dir(try_log_dir, mgv)
-                        proc_gen_status[mgv] = self._generate_processes(
-                            test, mgv, run_dirs[mgv], tee,
-                            log_version_dir / "proc_gen",
+                        relative_logs = (
+                            self._version_log_dir(Path(), mgv) / "proc_gen"
                         )
+                        with tee.capture(relative_logs) as proc_gen_log_dir:
+                            proc_gen_status[mgv] = self._generate_processes(
+                                test, mgv, run_dirs[mgv], tee,
+                                proc_gen_log_dir,
+                            )
+                        tee.publish()
                     else:
                         proc_gen_status[mgv] = True
 
@@ -1572,7 +1586,7 @@ class MadBench:
                     inputs_dir = run_dir / STAGED_DIR_NAME
                     processes_dir = run_dir / "processes"
                     result_version_dir = self._version_result_dir(result_dir, mgv)
-                    log_version_dir = self._version_log_dir(try_log_dir, mgv)
+                    log_version_dir = self._version_log_dir(local_log_dir, mgv)
 
                     rep_dir = run_dir / invocation_id / rep_id
                     # On retries (try_n > 0) wipe any leftover scratch from
@@ -1616,6 +1630,7 @@ class MadBench:
                             test, result_dir,
                             self._merge_rows(prev_csv_rows, csv_rows),
                         )
+                        tee.publish()
                         continue
 
                     env = os.environ.copy()
@@ -1656,6 +1671,7 @@ class MadBench:
                                 close_fds=True,
                             )
                             exit_code = proc.wait()
+                        wall_time = time.monotonic() - cmd_start
                     except KeyboardInterrupt:
                         proc.terminate()
                         proc.wait()
@@ -1685,8 +1701,12 @@ class MadBench:
                         )
                         tee.log("\n[madbench] Interrupted by user.")
                         raise
-
-                    wall_time = time.monotonic() - cmd_start
+                    finally:
+                        publish_logs(
+                            rep_log_dir,
+                            self._version_log_dir(try_log_dir, mgv)
+                            / invocation_id / rep_id,
+                        )
                     row = self._finalize_invocation(
                         test, combo, mgv, invocation_id, rep_id,
                         rep_dir, output_file,
@@ -1712,6 +1732,7 @@ class MadBench:
                         test, result_dir,
                         self._merge_rows(prev_csv_rows, csv_rows),
                     )
+                    tee.publish()
 
                 # ``summary.csv`` is already up-to-date from the live
                 # updates above; only ``failed.yml`` still needs writing

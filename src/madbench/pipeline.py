@@ -1294,11 +1294,14 @@ class PipelineRunner:
             "steps": [],
         }
 
-        with MainLog(log_dir / "main.log") as progress:
+        local_log_dir = run_dir / "logs"
+        with MainLog(local_log_dir / "main.log", log_dir / "main.log") as progress:
             progress.log(f"[madbench] Pipeline: {pipeline.name}")
             progress.log(f"[madbench] Workdir: {run_dir}")
             progress.log(f"[madbench] Results: {result_dir}")
             progress.log(f"[madbench] Logs: {log_dir}")
+            progress.log(f"[madbench] Local logs: {local_log_dir}")
+            progress.log(f"[madbench] Main log: {progress.log_path}")
             try:
                 result_index, all_results = self._run_steps(
                     pipeline=pipeline,
@@ -1409,7 +1412,7 @@ class PipelineRunner:
                         )
                     else:
                         execution_log_dir = (
-                            log_dir / step.id / execution.identity
+                            progress.log_path.parent / step.id / execution.identity
                             / f"{execution.repetition:02d}"
                         )
                         progress.log(f"[madbench] Running {execution_label}")
@@ -1421,20 +1424,26 @@ class PipelineRunner:
                             f"[madbench]   stderr: "
                             f"{execution_log_dir / 'stderr.log'}"
                         )
-                        result = self._execute(
-                            pipeline=pipeline,
-                            execution=execution,
-                            upstream=upstream,
-                            run_dir=run_dir,
-                            staged_dir=staged_dir,
-                            result_dir=result_dir,
-                            log_dir=log_dir,
-                            progress=progress,
+                        relative_logs = (
+                            Path(step.id) / execution.identity
+                            / f"{execution.repetition:02d}"
                         )
+                        with progress.capture(relative_logs):
+                            result = self._execute(
+                                pipeline=pipeline,
+                                execution=execution,
+                                upstream=upstream,
+                                run_dir=run_dir,
+                                staged_dir=staged_dir,
+                                result_dir=result_dir,
+                                log_dir=log_dir,
+                                progress=progress,
+                            )
                 progress.log(
                     f"[madbench]   {result.status}; cache={result.cache}; "
                     f"total={result.total_time:.4f}s"
                 )
+                progress.publish()
                 step_results.append(result)
                 all_results.append(result)
                 result_index[step.id] = step_results
@@ -1825,10 +1834,12 @@ class PipelineRunner:
             "MG_VERSION": mg_version,
             "MG_BIN": str(mg_bin or ""),
         })
-        execution_log_dir = log_dir / step.id / execution.identity / rep
+        execution_log_dir = (
+            progress.log_path.parent / step.id / execution.identity / rep
+        )
         execution_log_dir.mkdir(parents=True, exist_ok=True)
-        stdout = execution_log_dir / "stdout.log"
-        stderr = execution_log_dir / "stderr.log"
+        stdout = log_dir / step.id / execution.identity / rep / "stdout.log"
+        stderr = log_dir / step.id / execution.identity / rep / "stderr.log"
 
         cache_key = self._cache_key(
             pipeline, execution, arguments, upstream,
@@ -1871,7 +1882,8 @@ class PipelineRunner:
         if mg_bin is not None:
             progress.log(f"[madbench]   MG_BIN: {mg_bin}")
         execution_started = time.monotonic()
-        with open(stdout, "w") as stdout_file, open(stderr, "w") as stderr_file:
+        with open(execution_log_dir / "stdout.log", "w") as stdout_file, \
+                open(execution_log_dir / "stderr.log", "w") as stderr_file:
             if step.script is not None:
                 script = resolve_script(self.workspace, step.script)
                 cmd = [str(script)] + [
@@ -1882,15 +1894,13 @@ class PipelineRunner:
                     )
                     for value in arguments.values()
                 ]
-                completed = subprocess.run(
+                exit_code = self._run_subprocess(
                     cmd,
                     cwd=workdir,
                     env=env,
                     stdout=stdout_file,
                     stderr=stderr_file,
-                    check=False,
                 )
-                exit_code = completed.returncode
             else:
                 exit_code = self._run_action(
                     step, arguments, workdir, env, stdout_file, stderr_file,
@@ -1977,15 +1987,24 @@ class PipelineRunner:
             raise FileNotFoundError(f"MadGraph binary not found: {mg_bin}")
         process_workspace = workdir / "process_workspace"
         process_workspace.mkdir()
-        completed = subprocess.run(
+        return self._run_subprocess(
             [str(mg_bin), proc_card],
             cwd=process_workspace,
             env=env,
             stdout=stdout,
             stderr=stderr,
-            check=False,
         )
-        return completed.returncode
+
+    @staticmethod
+    def _run_subprocess(cmd: list[str], **kwargs: Any) -> int:
+        """Wait for log writers to stop before retaining interrupted logs."""
+        proc = subprocess.Popen(cmd, **kwargs)
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            proc.wait()
+            raise
 
     @staticmethod
     def _write_madgraph_cards(

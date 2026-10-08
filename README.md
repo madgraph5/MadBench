@@ -120,8 +120,16 @@ Relative `workdir` values are resolved from the workspace root. When it is
 omitted, the workspace-level `workspace.scratch_dir` setting in
 `madbench.yml` is used.
 
-This setting does not move durable run records. Result JSON, CSV files, logs,
-and published artifacts remain under the workspace's configured `results_dir`.
+Logs, including `main.log`, are first written below the selected work root.
+After each execution finishes and its timers stop, MadBench synchronously
+copies its stdout/stderr logs to the workspace's `logs_dir` and refreshes the
+workspace copy of `main.log`. These copies finish before the next execution
+starts. Local logs remain available in the work tree, including on failures
+and handled interruptions. Select node-local storage for `workdir` to keep
+network log writes outside benchmark timing windows.
+
+Durable result JSON, CSV files, and published artifacts remain under the
+workspace's configured `results_dir`; retained logs use `logs_dir`.
 A step-level `cache.path` still overrides the default cache location for that
 step.
 
@@ -1102,9 +1110,15 @@ information do not have to ship or parse the full report.
 
 During execution, `main.log` is mirrored to the terminal. It announces each
 step and execution with its matrix dimensions, repetition, cache result,
-timing, and exact stdout/stderr paths before the subprocess starts, making
-long-running logs immediately tail-able. Hashed execution directories remain
-stable internal identities; `main.log` is their human-readable index.
+timing, and live local stdout/stderr paths before the subprocess starts.
+The console also prints the live local `main.log` path for tailing.
+During a long execution, tail the local logs under `<run-workdir>/logs/`.
+The workspace stdout/stderr copies become available after that execution;
+the workspace `main.log` is refreshed between executions and at run exit.
+Log transfers happen after all per-execution timers stop, including
+`execution_time` and `total_time`, and before the next execution starts.
+Hashed execution directories remain stable internal identities; `main.log`
+is their human-readable index.
 
 Each step receives a `results_<step-id>.csv` readily plottable observation
 view. It contains one row for every execution and repetition of that step
