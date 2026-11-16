@@ -94,6 +94,24 @@ def test_parse_infers_dimensions_and_projects_matrix():
     assert len(expanded["benchmark"]) == 8
 
 
+@pytest.mark.parametrize("cleanup", [None, False, True])
+def test_parse_step_cleanup(cleanup):
+    step = {"id": "run", "script": "run.sh"}
+    if cleanup is not None:
+        step["cleanup"] = cleanup
+    pipeline = parse_pipeline({"name": "p", "steps": [step]}, source="test")
+    assert pipeline.steps[0].cleanup is (cleanup is True)
+
+
+@pytest.mark.parametrize("cleanup", [None, "true", "false", 0, 1, [], {}])
+def test_parse_rejects_non_boolean_cleanup(cleanup):
+    with pytest.raises(ValueError, match="'cleanup' must be boolean"):
+        parse_pipeline({
+            "name": "p",
+            "steps": [{"id": "run", "script": "run.sh", "cleanup": cleanup}],
+        }, source="test")
+
+
 def test_repetitions_are_scheduled_outermost():
     pipeline = parse_pipeline({
         "name": "p",
@@ -1451,10 +1469,221 @@ def test_test_workdir_contains_work_and_default_cache(tmp_path):
     assert not (root / "scratch" / ".madbench-cache").exists()
 
 
+@pytest.mark.parametrize("cleanup", [None, False, True])
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_cleanup_removes_each_realization_and_retains_logs(
+    tmp_path, cleanup, exit_code,
+):
+    root = make_workspace(tmp_path)
+    previous_check = "! -e" if cleanup else "-d"
+    make_script(
+        root, "run.sh",
+        'mkdir temporary\nprintf large > temporary/data\n'
+        'echo diagnostic\n'
+        'if [ "$MADBENCH_REPETITION" = 02 ]; then\n'
+        f'  test {previous_check} "$MADBENCH_WORKDIR/../01"\n'
+        'fi\n'
+        f'exit {exit_code}\n',
+    )
+    step = {"id": "run", "script": "run.sh", "repeat": 2}
+    if cleanup is not None:
+        step["cleanup"] = cleanup
+    path = make_pipeline(root, {"name": "clean", "steps": [step]})
+
+    MadBench(find_workspace(root)).run(path)
+
+    report = json.loads((only_result_dir(root, "clean") / "report.json").read_text())
+    assert len(report["steps"]) == 2
+    for result in report["steps"]:
+        assert result["exit_code"] == exit_code
+        workdir = Path(result["workdir"])
+        assert workdir.exists() is (cleanup is not True)
+        assert Path(result["stdout"]).read_text() == "diagnostic\n"
+        assert Path(result["stderr"]).is_file()
+    assert len(list((root / "scratch").rglob("main.log"))) == 1
+    assert len(list((root / "scratch").rglob("staged"))) == 1
+
+
+@pytest.mark.parametrize("cache", [False, True])
+def test_cleanup_preserves_artifacts_for_downstream_and_cache(tmp_path, cache):
+    root = make_workspace(tmp_path)
+    counter = root / "build-count"
+    make_script(
+        root, "build.sh",
+        f'echo built >> "{counter}"\n'
+        'mkdir bundle\nprintf "%s" "$1" > bundle/value\n'
+        'chmod 755 bundle/value\nln -s value bundle/link\n'
+        'printf "%s" "$1" > pack.bin\n'
+        'mkdir temporary\nprintf large > temporary/data\n'
+        'printf \'{"built": 7}\' > "$MADBENCH_OUTPUT_FILE"\n',
+    )
+    make_script(
+        root, "consume.sh",
+        'test "$(cat "$2/link")" = "$1"\n'
+        'test "$(cat "$3")" = "$1"\n'
+        'test "$(cat "$4")" = "$1"\n'
+        'test "$5" = 7\n',
+    )
+    path = make_pipeline(root, {
+        "name": "retained",
+        "workdir": "local-work",
+        "matrix": {"process": ["one", "two"]},
+        "steps": [
+            {
+                "id": "build", "script": "build.sh", "cleanup": True,
+                "cache": cache,
+                "with": {"process": "${{ matrix.process }}"},
+                "outputs": {"built": "number"},
+                "artifacts": {
+                    "bundle": {"path": "bundle"},
+                    "value": {"path": "bundle/value"},
+                    "alias": {"path": "bundle/value"},
+                    "gridpack": {
+                        "path": "pack.bin",
+                        "publish": "packs/${{ matrix.process }}.bin",
+                    },
+                },
+            },
+            {
+                "id": "consume", "script": "consume.sh", "cleanup": True,
+                "repeat": 2,
+                "with": {
+                    "process": "${{ matrix.process }}",
+                    "bundle": "${{ steps.build.artifacts.bundle }}",
+                    "value": "${{ steps.build.artifacts.value }}",
+                    "gridpack": "${{ steps.build.artifacts.gridpack }}",
+                    "built": "${{ steps.build.outputs.built }}",
+                },
+            },
+        ],
+    })
+    runner = MadBench(find_workspace(root))
+    runner.run(path)
+    runner.run(path)
+
+    assert len(counter.read_text().splitlines()) == (2 if cache else 4)
+    result_dirs = sorted((root / "results" / "retained").iterdir())
+    for index, result_dir in enumerate(result_dirs):
+        report = json.loads((result_dir / "report.json").read_text())
+        assert len(report["steps"]) == 6
+        for result in report["steps"]:
+            assert result["status"] == "success"
+            assert not Path(result["workdir"]).exists()
+            if result["step_id"] != "build":
+                continue
+            assert result["cache"] == (
+                "hit" if cache and index else "miss" if cache else "disabled"
+            )
+            artifacts = result["artifacts"]
+            bundle = Path(artifacts["bundle"]["path"])
+            assert bundle.is_relative_to(root / "local-work")
+            assert (bundle / "link").is_symlink()
+            assert (bundle / "value").stat().st_mode & stat.S_IXUSR
+            assert Path(artifacts["value"]["path"]) == bundle / "value"
+            assert artifacts["value"] == artifacts["alias"]
+            gridpack = artifacts["gridpack"]
+            assert Path(gridpack["path"]).read_text() == result["dimensions"]["process"]
+            assert Path(gridpack["published_path"]).read_bytes() == Path(
+                gridpack["path"]
+            ).read_bytes()
+            assert artifacts["bundle"]["published_path"] is None
+    assert not list((root / "local-work").rglob("temporary"))
+    archives = list((root / "local-work" / ".madbench-cache").rglob("artifacts.tar.gz"))
+    assert len(archives) == (2 if cache else 0)
+
+
+def test_cleanup_policy_does_not_invalidate_cache(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(root, "build.sh", 'printf built > product\n')
+    raw = {
+        "name": "policy",
+        "steps": [{
+            "id": "build", "script": "build.sh", "cache": True,
+            "artifacts": {"product": {"path": "product"}},
+        }],
+    }
+    runner = MadBench(find_workspace(root))
+    for cleanup in [None, True, False]:
+        if cleanup is not None:
+            raw["steps"][0]["cleanup"] = cleanup
+        runner.run(make_pipeline(root, raw))
+
+    results = [
+        json.loads((directory / "report.json").read_text())["steps"][0]
+        for directory in sorted((root / "results" / "policy").iterdir())
+    ]
+    assert [result["cache"] for result in results] == ["miss", "hit", "hit"]
+    assert [Path(result["workdir"]).exists() for result in results] == [True, False, True]
+    assert all(Path(result["artifacts"]["product"]["path"]).is_file() for result in results)
+
+
+def test_cleanup_can_retain_the_whole_workdir_as_an_artifact(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(root, "build.sh", 'printf built > product\n')
+    path = make_pipeline(root, {
+        "name": "whole",
+        "steps": [{
+            "id": "build", "script": "build.sh", "cleanup": True,
+            "artifacts": {
+                "product": {"path": "product"},
+                "whole": {"path": "."},
+            },
+        }],
+    })
+
+    MadBench(find_workspace(root)).run(path)
+
+    report = json.loads((only_result_dir(root, "whole") / "report.json").read_text())
+    result = report["steps"][0]
+    assert not Path(result["workdir"]).exists()
+    retained = Path(result["artifacts"]["whole"]["path"])
+    assert (retained / "product").read_text() == "built"
+    assert Path(result["artifacts"]["product"]["path"]) == retained / "product"
+
+
+@pytest.mark.parametrize("failure", ["outputs", "artifacts", "publish", "cache"])
+def test_cleanup_preserves_workdir_when_saving_results_fails(
+    tmp_path, monkeypatch, failure,
+):
+    root = make_workspace(tmp_path)
+    make_script(
+        root, "build.sh",
+        'printf built > product\nprintf large > temporary\n',
+    )
+    step = {"id": "build", "script": "build.sh", "cleanup": True}
+    if failure == "outputs":
+        step["outputs"] = {"missing": "number"}
+    elif failure == "artifacts":
+        step["artifacts"] = {"missing": {"path": "missing"}}
+    elif failure == "publish":
+        step["artifacts"] = {
+            "one": {"path": "product", "publish": "product"},
+            "two": {"path": "product", "publish": "product"},
+        }
+    else:
+        step["artifacts"] = {"product": {"path": "product", "publish": "product"}}
+        step["cache"] = True
+
+        def fail_store(*args):
+            raise OSError("cache full")
+
+        monkeypatch.setattr(PipelineRunner, "_store_cache", fail_store)
+    path = make_pipeline(root, {"name": "failed-save", "steps": [step]})
+
+    with pytest.raises((ValueError, FileNotFoundError, OSError)):
+        MadBench(find_workspace(root)).run(path)
+
+    workdirs = list((root / "scratch").glob("failed-save_*/steps/build/*/01"))
+    assert len(workdirs) == 1
+    assert (workdirs[0] / "product").read_text() == "built"
+    assert (workdirs[0] / "temporary").read_text() == "large"
+
+
 @pytest.mark.parametrize(
     "binaries", [("madgraph",), ("mg5_aMC",), ("madgraph", "mg5_aMC")],
 )
-def test_madgraph_process_action(tmp_path, binaries, capsys):
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_madgraph_process_action(tmp_path, binaries, capsys, cleanup):
     root = make_workspace(tmp_path)
     card_dir = root / "inputs"
     card_dir.mkdir()
@@ -1482,6 +1711,7 @@ def test_madgraph_process_action(tmp_path, binaries, capsys):
         "steps": [{
             "id": "generate",
             "action": "madgraph/process",
+            "cleanup": cleanup,
             "with": {
                 "proc_card": {"input": "${{ matrix.proc_card }}"},
             },
@@ -1495,6 +1725,7 @@ def test_madgraph_process_action(tmp_path, binaries, capsys):
     result = json.loads((result_dir / "report.json").read_text())
     step = result["steps"][0]
     assert step["cache"] == "hit"
+    assert Path(step["workdir"]).exists() is (not cleanup)
     workspace = Path(step["artifacts"]["process_workspace"]["path"])
     assert (workspace / "generated" / "value").read_text() == "process"
     assert (workspace / "generated" / "value-link").is_symlink()
@@ -1663,7 +1894,8 @@ def test_artifact_allow_external_symlinks_must_be_boolean(value):
         }, source="test")
 
 
-def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path, cleanup):
     root = make_workspace(tmp_path)
     make_script(
         root,
@@ -1689,6 +1921,7 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
             {
                 "id": "cards",
                 "action": "madgraph/cards",
+                "cleanup": cleanup,
                 "with": {
                     "process": "${{ matrix.process }}",
                     "proc_card_preamble": ["define inherited = u u~"],
@@ -1709,6 +1942,7 @@ def test_madgraph_cards_action_materializes_cards_for_downstream_step(tmp_path):
         (only_result_dir(root, "cards") / "report.json").read_text()
     )
     assert [step["status"] for step in result["steps"]] == ["success", "success"]
+    assert Path(result["steps"][0]["workdir"]).exists() is (not cleanup)
 
 
 def test_madgraph_cards_action_rejects_model_field(tmp_path):

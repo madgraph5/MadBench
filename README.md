@@ -133,6 +133,41 @@ workspace's configured `results_dir`; retained logs use `logs_dir`.
 A step-level `cache.path` still overrides the default cache location for that
 step.
 
+### Step cleanup
+
+Set `cleanup: true` on any script or action step to remove its isolated
+workdir after each realization, including each repetition and cache hit:
+
+```yaml
+steps:
+  - id: generate
+    script: generate.sh
+    cleanup: true
+    cache: true
+    artifacts:
+      gridpack:
+        path: gridpack.tar.gz
+        publish: gridpack.tar.gz
+```
+
+The default is `cleanup: false`, which keeps the workdir. Only YAML booleans
+are accepted. Cleanup runs after outputs have been read, artifacts published,
+and any cache entry saved. Declared local artifacts are moved to
+`<run-workdir>/artifacts/<step>/<execution-id>/<repetition>/`, preserving
+their paths relative to the producer workdir. Downstream artifact references
+resolve to these retained paths, so they remain usable without a cache or a
+`publish` declaration. This move does not create another artifact copy.
+Changing `cleanup` does not invalidate existing caches.
+
+Cleanup deletes all remaining files in that realization's workdir. Declared
+artifacts, caches, results, staged inputs, other realizations, and logs are
+retained. External symbolic links allowed by `allow_external_symlinks` may
+become dangling if their targets are deleted with the workdir.
+
+A nonzero script or action exit also triggers cleanup; its diagnostic logs
+remain available. If output validation, artifact publication, or cache saving
+raises an error, or execution is interrupted, the workdir is kept for recovery.
+
 ## Matrix expansion
 
 List-valued matrix entries form a Cartesian product:
@@ -870,7 +905,7 @@ ${{ steps.<step-id>.artifacts.<artifact-id> }}
 
 `path` is always interpreted relative to the producing step's isolated
 workdir. The reference resolves to the corresponding absolute local path,
-not to the literal value written under `path`. For example:
+not to the literal value written under `path`. Without cleanup, for example:
 
 ```yaml
 artifacts:
@@ -884,12 +919,17 @@ may resolve downstream as:
 /scratch/<pipeline-run>/steps/generate_process/<execution>/01/process_workspace
 ```
 
+With `cleanup: true`, the same reference resolves below
+`/scratch/<pipeline-run>/artifacts/generate_process/<execution>/01/` after
+the artifact has been moved out of the producer workdir.
+
 When `publish` is omitted, the artifact is transient:
 
 - It remains available to all downstream steps in the same pipeline run.
 - It remains in the pipeline scratch workdir.
 - If the producing step is cached, it is stored in the cache and restored
-  into the current run's equivalent producer workdir on a cache hit.
+  into the current run on a cache hit, then moved out of the producer workdir
+  when `cleanup: true`.
 - It is not copied into the permanent `results/.../artifacts/` tree.
 
 Downstream references behave identically after normal execution and cache
@@ -1139,7 +1179,7 @@ dimensions, status, cache state, and three timing fields:
   It is empty when the step executes normally.
 - `total_time`: complete time spent handling the step, including workdir and
   argument preparation, execution or cache restoration, output validation,
-  artifact collection, and cache storage where applicable.
+  artifact collection, cache storage, and cleanup where applicable.
 
 The same fields are retained for every execution in `report.json`. Blocked
 steps have no execution or materialization duration and a zero total because

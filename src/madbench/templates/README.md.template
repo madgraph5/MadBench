@@ -57,6 +57,15 @@ keeps it available to downstream steps and caches without copying it into
 permanent results. Adding a safe relative `publish` path copies it to
 `results/.../artifacts/<step>/<mg_version>/<rep>/<publish>`.
 
+Set `cleanup: true` on a step to remove its workdir after each realization
+(including repetitions and cache hits). The default, `cleanup: false`, keeps
+it. Outputs, published artifacts, and caches are saved first. Declared local
+artifacts are moved to the run's `artifacts/<step>/<execution-id>/<repetition>/`
+scratch area so downstream references still work; other workdir contents are
+deleted. Logs and staged inputs remain available. Nonzero exits also trigger
+cleanup, but an interruption or an error saving results keeps the workdir for
+recovery. Changing `cleanup` does not invalidate caches.
+
 To keep a test's execution work and cache outside the workspace, set its work
 root:
 

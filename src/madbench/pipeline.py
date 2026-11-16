@@ -111,6 +111,7 @@ class StepDefinition:
     stats: list[str]
     needs: list[str]
     raw: dict[str, Any]
+    cleanup: bool = False
     direct_dimensions: list[str] = field(default_factory=list)
     dimensions: list[str] = field(default_factory=list)
     upstream_steps: list[str] = field(default_factory=list)
@@ -827,6 +828,9 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
                 f"{sorted(unknown_needs)}"
             )
         repeat = _positive_int(step_raw.get("repeat"), f"steps.{step_id}.repeat")
+        cleanup = step_raw.get("cleanup", False)
+        if not isinstance(cleanup, bool):
+            raise ValueError(f"step {step_id!r} 'cleanup' must be boolean")
         outputs = _normalize_outputs(step_raw.get("outputs"), step_id)
         stats = _string_list(step_raw.get("stats"), f"steps.{step_id}.stats")
         missing_stats = set(stats) - set(outputs)
@@ -848,6 +852,7 @@ def parse_pipeline(raw: dict[str, Any], *, source: str) -> PipelineDefinition:
             stats=stats,
             needs=needs,
             raw=step_raw,
+            cleanup=cleanup,
             direct_dimensions=direct_dimensions,
             upstream_steps=list(dict.fromkeys(referenced_steps + needs)),
         ))
@@ -1439,6 +1444,13 @@ class PipelineRunner:
                                 log_dir=log_dir,
                                 progress=progress,
                             )
+                            if step.cleanup:
+                                cleanup_started = time.monotonic()
+                                self._cleanup_workdir(result, run_dir)
+                                result.total_time = round(
+                                    result.total_time
+                                    + time.monotonic() - cleanup_started, 4,
+                                )
                 progress.log(
                     f"[madbench]   {result.status}; cache={result.cache}; "
                     f"total={result.total_time:.4f}s"
@@ -1956,6 +1968,36 @@ class PipelineRunner:
             argument_schedules=argument_schedules,
         )
 
+    @staticmethod
+    def _cleanup_workdir(result: ExecutionResult, run_dir: Path) -> None:
+        """Retain declared artifacts before deleting this realization's work."""
+        workdir = Path(result.workdir).resolve()
+        retained_dir = (
+            run_dir / "artifacts" / result.step_id / result.identity
+            / f"{result.repetition:02d}"
+        )
+        paths = {
+            name: Path(path).relative_to(workdir)
+            for name, path in result.artifacts.items()
+        }
+        moved: list[Path] = []
+        for path in sorted(set(paths.values()), key=lambda p: len(p.parts)):
+            # A directory may also be declared alongside one of its children,
+            # or under several artifact names. Move each root only once.
+            if any(parent in path.parents for parent in moved):
+                continue
+            destination = retained_dir / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            (workdir / path).rename(destination)
+            moved.append(path)
+        result.artifacts = {
+            name: str((retained_dir / path).resolve())
+            for name, path in paths.items()
+        }
+        # An artifact with path '.' has already moved the entire directory.
+        if workdir.exists():
+            shutil.rmtree(workdir)
+
     def _mg_bin(
         self, mg_version: str, *, required: bool = False,
     ) -> Optional[Path]:
@@ -2354,7 +2396,11 @@ class PipelineRunner:
         payload = {
             "schema": 1,
             "pipeline": pipeline.name,
-            "step": step.raw,
+            # Retention policy does not change the step's computed results.
+            "step": {
+                name: value for name, value in step.raw.items()
+                if name != "cleanup"
+            },
             "version": step.cache.version,
             "dimensions": execution.values,
             "repetition": execution.repetition,
@@ -2827,6 +2873,7 @@ class PipelineRunner:
                 print(f"  skipped runs: {len(expanded[step.id]) - len(eligible)}")
             print(f"  upstream: {step.upstream_steps}")
             print(f"  cache: {'enabled' if step.cache.enabled else 'disabled'}")
+            print(f"  cleanup: {'enabled' if step.cleanup else 'disabled'}")
             if step.artifacts:
                 print("  artifacts:")
                 for name, artifact in step.artifacts.items():
