@@ -586,7 +586,7 @@ def test_labelled_input_can_feed_matrix_and_json_arguments(tmp_path):
     )
 
 
-def test_json_matrix_ids_are_used_in_every_csv_view(tmp_path):
+def test_json_matrix_fields_are_used_in_every_csv_view(tmp_path):
     root = make_workspace(tmp_path)
     inputs = root / "inputs"
     inputs.mkdir()
@@ -643,10 +643,13 @@ def test_json_matrix_ids_are_used_in_every_csv_view(tmp_path):
         timing_rows = list(csv.DictReader(file))
 
     expected_ids = {"dy_legacy", "dy_avx2"}
-    assert {row["process"] for row in result_rows} == expected_ids
-    assert {row["process"] for row in summary_rows} == expected_ids
-    assert {row["process"] for row in timing_rows} == expected_ids
+    assert {row["process.id"] for row in result_rows} == expected_ids
+    assert {row["process.id"] for row in summary_rows} == expected_ids
+    assert {row["process.id"] for row in timing_rows} == expected_ids
     assert all(row["n_successful"] == "2" for row in summary_rows)
+    for rows in (result_rows, summary_rows, timing_rows):
+        assert all(json.loads(row["process.process"]) == ["p p > l+ l-"] for row in rows)
+        assert {row["process.launch.cudacpp_backend"] for row in rows} == {"", "cppavx2"}
 
     retained_source = (
         result_dir / "matrix_inputs" / "inputs" / "processes.json"
@@ -667,6 +670,116 @@ def test_json_matrix_ids_are_used_in_every_csv_view(tmp_path):
                for step in report["steps"])
     assert all(isinstance(step["arguments"]["process"], dict)
                for step in report["steps"])
+
+
+@pytest.mark.parametrize("source", ["json", "inline_array", "inline_mapping"])
+def test_structured_matrix_columns_depend_on_values_not_input_source(tmp_path, source):
+    root = make_workspace(tmp_path)
+    definition = {"id": "jets", "settings": {"events": 100}, "channels": [1, 2]}
+    (root / "inputs").mkdir()
+    (root / "inputs/processes.json").write_text(json.dumps({"processes": [definition]}))
+    value = {
+        "json": {"from": {"json": "inputs/processes.json", "field": "processes"}},
+        "inline_array": [definition],
+        "inline_mapping": definition,
+    }[source]
+    make_script(root, "run.sh", "printf '{\"runtime\":1}' > \"$MADBENCH_OUTPUT_FILE\"\n")
+    path = make_pipeline(root, {
+        "name": "same_values",
+        "inputs": ["inputs/processes.json"],
+        "matrix": {"process": value, "backend": "cpu"},
+        "steps": [{"id": "run", "script": "run.sh", "with": ["process", "backend"],
+                   "outputs": {"runtime": "number"}, "repeat": 2}],
+    })
+    MadBench(find_workspace(root)).run(path)
+    result_dir = only_result_dir(root, "same_values")
+    for filename in ("results_run.csv", "summary_run.csv", "step_timings.csv"):
+        with open(result_dir / filename, newline="") as file:
+            rows = list(csv.DictReader(file))
+        for row in rows:
+            assert row["process.id"] == "jets"
+            assert row["process.settings.events"] == "100"
+            assert json.loads(row["process.channels"]) == [1, 2]
+            assert row["backend"] == "cpu"
+            assert "process" not in row
+
+
+@pytest.mark.parametrize("kind", [None, "object"])
+def test_mapping_outputs_flatten_without_losing_scalars_or_failed_rows(tmp_path, kind):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", '''case "$1" in
+    failed) exit 7;;
+    empty) printf '{"process":{},"run_times":{},"runtime":1}' ;;
+    a) printf '{"process":{"count":1,"done":true,"extra":2},"run_times":{"generate":{"cpu_time_sec":4}},"runtime":1}' ;;
+    b) printf '{"process":{"count":3,"done":true},"run_times":{"generate":{"wall_time_sec":2}},"runtime":1}' ;;
+esac > "$MADBENCH_OUTPUT_FILE"
+''')
+    path = make_pipeline(root, {
+        "name": "mapping_outputs", "matrix": {"process": ["failed", "empty", "a", "b"]},
+        "steps": [{"id": "run", "script": "run.sh", "with": ["process"], "repeat": 2,
+                   "outputs": {"process": kind, "run_times": kind, "runtime": "number"},
+                   "stats": ["runtime"]}],
+    })
+    MadBench(find_workspace(root)).run(path)
+    result_dir = only_result_dir(root, "mapping_outputs")
+    with open(result_dir / "results_run.csv", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert len(rows) == 8
+    for row in rows:
+        if row["process"] in {"failed", "empty"}:
+            assert row["status"] == ("failed" if row["process"] == "failed" else "success")
+            assert row["process.count"] == row["run_times.generate.cpu_time_sec"] == ""
+        else:
+            assert row["process.count"] == ("1" if row["process"] == "a" else "3")
+            assert row["process.done"] == "True"
+            assert row["process.extra"] == ("2" if row["process"] == "a" else "")
+    with open(result_dir / "summary_run.csv", newline="") as file:
+        summaries = list(csv.DictReader(file))
+    assert all(row["runtime_mean"] == "1.0" for row in summaries if row["process"] != "failed")
+    assert "process_mean" not in summaries[0]
+    report = json.loads((result_dir / "report.json").read_text())
+    assert any(isinstance(step["outputs"].get("process"), dict) for step in report["steps"])
+    assert any(step["outputs"].get("process") == {} for step in report["steps"])
+
+
+def test_object_outputs_validate_type_and_are_excluded_from_default_stats(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "printf '{\"info\":{\"mean\":1}}' > \"$MADBENCH_OUTPUT_FILE\"\n")
+    path = make_pipeline(root, {
+        "name": "object_default", "steps": [{"id": "run", "script": "run.sh",
+        "outputs": {"info": "object"}, "repeat": 2}],
+    })
+    MadBench(find_workspace(root)).run(path)
+    result_dir = only_result_dir(root, "object_default")
+    assert "info_mean" not in (result_dir / "summary_run.csv").read_text().splitlines()[0]
+    PipelineRunner._validate_output_type("run", "info", {}, "object")
+    with pytest.raises(ValueError, match="expected object"):
+        PipelineRunner._validate_output_type("run", "info", [], "object")
+
+
+@pytest.mark.parametrize("matrix", [
+    {"config": {"a.b": 1, "a": {"b": 2}}},
+    {"status": ["success"]},
+])
+def test_ambiguous_csv_columns_are_rejected_before_scripts_run(tmp_path, matrix):
+    root = make_workspace(tmp_path)
+    marker = root / "ran"
+    make_script(root, "run.sh", f'touch "{marker}"\n')
+    path = make_pipeline(root, {"name": "collision", "matrix": matrix,
+        "steps": [{"id": "run", "script": "run.sh", "with": list(matrix)}]})
+    with pytest.raises(ValueError, match="CSV.*column"):
+        MadBench(find_workspace(root)).run(path)
+    assert not marker.exists()
+
+
+def test_flattened_output_leaf_collision_is_reported(tmp_path):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "printf '{\"process\":{\"id\":\"jets\"}}' > \"$MADBENCH_OUTPUT_FILE\"\n")
+    path = make_pipeline(root, {"name": "output_collision", "matrix": {"process": {"id": "jets"}},
+        "steps": [{"id": "run", "script": "run.sh", "with": ["process"],
+                   "outputs": {"process": "object"}}]})
+    with pytest.raises(ValueError, match="column collision.*process.id"):
+        MadBench(find_workspace(root)).run(path)
 
 
 def test_labelled_inputs_reject_unknown_references():
@@ -2003,7 +2116,7 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
         'if test "$proc_id" = fcc_ee_zh; then events=20000; '
         'else events=10000; fi\n'
         'grep -q "^set generation.events ${events}$" "$2"\n'
-        'printf \'{"id": "%s", "backend": "%s"}\' "$proc_id" "$3" '
+        'printf \'{"id": "%s", "recorded_backend": "%s"}\' "$proc_id" "$3" '
         '> "$MADBENCH_OUTPUT_FILE"\n',
     )
     path = make_pipeline(root, {
@@ -2046,7 +2159,7 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
                     "launch_card": "${{ steps.cards.artifacts.launch_card }}",
                     "backend": "${{ matrix.backend }}",
                 },
-                "outputs": {"id": "string", "backend": "string"},
+                "outputs": {"id": "string", "recorded_backend": "string"},
             },
         ],
     })
@@ -2081,7 +2194,7 @@ def test_json_process_file_fans_out_paired_cards_to_downstream_steps(tmp_path):
         "output standalone fcc_ee_zh\n"
     )
     assert {
-        (step["outputs"]["id"], step["outputs"]["backend"])
+        (step["outputs"]["id"], step["outputs"]["recorded_backend"])
         for step in consumers
     } == {
         ("pp_jets", "cpp"),

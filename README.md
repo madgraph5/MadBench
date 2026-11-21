@@ -697,9 +697,10 @@ used in step arguments and artifact paths, for example
 `${{ matrix.process.id }}` and
 `gridpacks/${{ matrix.process.output }}.tar.gz`. Member access may be nested
 further and fails clearly when a member is absent or an intermediate value is
-not an object. CSV result, summary, and timing views use the entry's `id` as
-the compact value of that matrix dimension instead of serializing the full
-object. The full object remains available during execution and is retained in
+not an object. CSV result, summary, and timing views expand the entry into
+dotted columns such as `process.id`, `process.output`, and
+`process.launch.generation.events`, using the same rules as inline mappings.
+The full object remains available during execution and is retained in
 `report.json`. MadBench also copies the exact source file below
 `matrix_inputs/` in the run's result directory, preserving its
 workspace-relative path. For this example the retained definition is
@@ -829,6 +830,7 @@ outputs:
   registers: integer
   successful: boolean
   compiler: string
+  process: object
 ```
 
 The script writes exactly the declared keys:
@@ -838,12 +840,20 @@ printf '{
   "runtime": 1.25,
   "registers": 128,
   "successful": true,
-  "compiler": "nvcc"
+  "compiler": "nvcc",
+  "process": {"mean": 42.5, "done": true}
 }' > "$MADBENCH_OUTPUT_FILE"
 ```
 
-Missing or undeclared keys are errors. In results, output names are qualified
-by step, for example `compile.registers` and `benchmark.runtime`.
+Missing or undeclared keys are errors. `object` requires a JSON object;
+its nested fields become dotted CSV columns such as `process.mean` and
+`process.done`. Untyped mapping outputs use the same representation. Scalar
+outputs retain their declared column names in `results_<step-id>.csv`.
+Object columns are discovered from recorded observations; live views are
+rewritten with the union of observed fields, leaving missing values and
+failed rows empty. Arrays stay in one cell as valid JSON. Outputs declared
+as `object` are excluded from default summary statistics; declare scalar outputs for metrics
+you want to aggregate. The deep report and cache retain the original objects.
 
 ## Artifacts
 
@@ -1167,6 +1177,17 @@ effective values of any per-repeat arguments, declared outputs, status, exit
 code, cache state, timings, and execution ID.
 Output names are unqualified because the filename identifies their step.
 Upstream values are not copied or duplicated into downstream rows.
+
+Mapping-valued matrix dimensions use dotted leaf columns in every CSV view.
+For example, `gridpack: {id: jets, archive: jets.tar.gz}` produces
+`gridpack.id` and `gridpack.archive`. Nested mappings are expanded recursively;
+arrays and empty mappings remain valid JSON cells. Scalars retain their
+original columns. These rules depend on resolved values, whether they came
+from a JSON file, an inline mapping, or a list of mappings. Matrix columns
+include fields from all planned values, so optional fields have empty cells
+and the header remains stable while the run progresses. Column-name
+collisions, including ambiguous dotted paths, are errors. Original structured
+values and execution identities remain unchanged in `report.json`.
 
 `step_timings.csv` is the live CI-like timing view. It contains one row for
 every step execution and repetition recorded so far, including its matrix

@@ -274,7 +274,7 @@ def _normalize_outputs(value: Any, step_id: str) -> dict[str, Optional[str]]:
     if isinstance(value, list) and all(isinstance(x, str) for x in value):
         return {x: None for x in value}
     if isinstance(value, dict):
-        allowed = {"number", "integer", "boolean", "string"}
+        allowed = {"number", "integer", "boolean", "string", "object"}
         normalized: dict[str, Optional[str]] = {}
         for name, output_type in value.items():
             if not isinstance(name, str):
@@ -1050,13 +1050,141 @@ def _short_identity(step_id: str, values: dict[str, Any]) -> str:
     return f"{step_id}-{digest}"
 
 
-def _csv_dimension_value(
-    pipeline: PipelineDefinition, name: str, value: Any,
-) -> Any:
-    """Return the compact CSV label for one matrix dimension value."""
-    if name in pipeline.json_matrix_sources and isinstance(value, dict):
-        return value["id"]
-    return value
+def _csv_dimension_items(
+    path: tuple[str, ...], value: Any,
+) -> list[tuple[tuple[str, ...], Any]]:
+    """Flatten mappings, retaining arrays and empty mappings as JSON cells."""
+    if isinstance(value, dict) and value:
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("CSV matrix mapping keys must be strings")
+        return [
+            item
+            for key in sorted(value)
+            for item in _csv_dimension_items((*path, key), value[key])
+        ]
+    if isinstance(value, (dict, list, tuple)):
+        value = _canonical(value)
+    return [(path, value)]
+
+
+def _csv_dimension_columns(
+    pipeline: PipelineDefinition, names: list[str],
+) -> list[str]:
+    """Use every planned value so live CSV headers do not grow mid-run."""
+    axes = {
+        name: value if isinstance(value, list) else [value]
+        for name, value in pipeline.matrix.items()
+    }
+    return _csv_mapping_columns(names, axes)
+
+
+def _csv_mapping_columns(
+    names: list[str], axes: dict[str, list[Any]],
+) -> list[str]:
+    columns: dict[str, tuple[str, ...]] = {}
+    for name in names:
+        dimension_columns: dict[str, tuple[str, ...]] = {}
+        for value in axes.get(name, []):
+            for path, _ in _csv_dimension_items((name,), value):
+                column = ".".join(path)
+                previous = columns.get(column, dimension_columns.get(column))
+                if previous is not None and previous != path:
+                    raise ValueError(f"ambiguous CSV matrix column {column!r}")
+                dimension_columns[column] = path
+        for column in sorted(dimension_columns):
+            columns[column] = dimension_columns[column]
+    return list(columns)
+
+
+def _csv_dimension_row(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        ".".join(path): value
+        for name, item in values.items()
+        for path, value in _csv_dimension_items((name,), item)
+    }
+
+
+def _csv_fieldnames(
+    pipeline: PipelineDefinition, names: list[str], other_columns: list[str],
+) -> list[str]:
+    fieldnames = _csv_dimension_columns(pipeline, names) + other_columns
+    seen: set[str] = set()
+    for column in fieldnames:
+        if column in seen:
+            raise ValueError(f"CSV matrix/output/reserved column collision: {column!r}")
+        seen.add(column)
+    return fieldnames
+
+
+def _result_csv_columns(
+    step: StepDefinition, output_columns: Optional[list[str]] = None,
+) -> list[str]:
+    return (
+        ["repetition"]
+        + [f"{name}_effective" for name in step.per_repeat_arguments()]
+        + (output_columns if output_columns is not None else [
+            name for name, kind in step.outputs.items()
+            if kind not in {None, "object"}
+        ])
+        + ["status", "exit_code", "cache", "execution_time",
+           "materialization_time", "total_time", "execution_id"]
+    )
+
+
+def _summary_csv_columns(step: StepDefinition) -> list[str]:
+    stats = step.stats or [
+        name for name, kind in step.outputs.items()
+        if kind in {None, "number", "integer"}
+    ]
+    return (
+        [f"{name}_{suffix}" for name in step.per_repeat_arguments()
+         for suffix in ("start", "step", "count")]
+        + [f"{name}_{suffix}" for name in stats for suffix in ("mean", "std")]
+        + ["n_successful", "n_failed", "n_blocked", "n_skipped",
+           "n_completed", "n_expected", "complete", "execution_id"]
+    )
+
+
+TIMING_CSV_COLUMNS = [
+    "step_id", "execution_id", "repetition", "status", "exit_code", "cache",
+    "execution_time", "materialization_time", "total_time",
+]
+
+
+def _validate_csv_view_columns(pipeline: PipelineDefinition) -> None:
+    _csv_fieldnames(pipeline, list(pipeline.matrix), TIMING_CSV_COLUMNS)
+    for step in pipeline.steps:
+        _csv_fieldnames(pipeline, step.dimensions, _result_csv_columns(step))
+        if step.repeat > 1:
+            _csv_fieldnames(pipeline, step.dimensions, _summary_csv_columns(step))
+
+
+def _csv_output_columns(
+    step: StepDefinition, results: list[ExecutionResult], occupied: list[str],
+) -> list[str]:
+    observed = {
+        name: [result.outputs[name] for result in results if name in result.outputs]
+        for name in step.outputs
+    }
+    axes = {
+        name: [value for value in values if not isinstance(value, dict) or value]
+        for name, values in observed.items()
+    }
+    for name, values in axes.items():
+        # Object leaves are discovered from actual results. Failed runs and
+        # cache misses can be written before any such schema is available.
+        if not observed[name] and step.outputs[name] != "object" and name not in occupied:
+            values.append("")
+    return _csv_mapping_columns(list(step.outputs), axes)
+
+
+def _csv_output_row(outputs: dict[str, Any]) -> dict[str, Any]:
+    # An empty object has no fields; keep its CSV leaves blank while retaining
+    # the original {} in the deep report and cache.
+    return _csv_dimension_row({
+        name: value for name, value in outputs.items()
+        if not isinstance(value, dict) or value
+    })
 
 
 def build_step_executions(
@@ -1233,6 +1361,7 @@ class PipelineRunner:
         note: Optional[str] = None,
     ) -> None:
         pipeline = self._resolve_matrix_sources(pipeline)
+        _validate_csv_view_columns(pipeline)
         expanded = build_step_executions(pipeline)
         matrix_points = build_matrix_points(pipeline)
         if dry_run:
@@ -2234,6 +2363,7 @@ class PipelineRunner:
             "integer": isinstance(value, int) and not isinstance(value, bool),
             "boolean": isinstance(value, bool),
             "string": isinstance(value, str),
+            "object": isinstance(value, dict),
         }[expected]
         if not valid:
             raise ValueError(
@@ -2621,37 +2751,26 @@ class PipelineRunner:
     ) -> None:
         """Write one native observation row per execution of one step."""
         per_repeat_arguments = step.per_repeat_arguments()
-        fieldnames = (
-            list(step.dimensions)
-            + ["repetition"]
-            + [f"{name}_effective" for name in per_repeat_arguments]
-            + list(step.outputs)
-            + [
-                "status",
-                "exit_code",
-                "cache",
-                "execution_time",
-                "materialization_time",
-                "total_time",
-                "execution_id",
-            ]
+        dimension_columns = _csv_dimension_columns(pipeline, step.dimensions)
+        output_columns = _csv_output_columns(
+            step, results, dimension_columns + _result_csv_columns(step, []),
+        )
+        fieldnames = _csv_fieldnames(
+            pipeline, step.dimensions, _result_csv_columns(step, output_columns),
         )
         temporary = path.with_name(f".{path.name}.tmp")
         with open(temporary, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             for result in results:
-                row: dict[str, Any] = {
-                    key: _csv_dimension_value(
-                        pipeline, key, result.dimensions.get(key, ""),
-                    )
-                    for key in step.dimensions
-                }
+                row = _csv_dimension_row({
+                    key: result.dimensions[key]
+                    for key in step.dimensions if key in result.dimensions
+                })
                 row["repetition"] = result.repetition
                 for name in per_repeat_arguments:
                     row[f"{name}_effective"] = result.arguments.get(name, "")
-                for name in step.outputs:
-                    row[name] = result.outputs.get(name, "")
+                row.update(_csv_output_row(result.outputs))
                 row.update({
                     "status": result.status,
                     "exit_code": result.exit_code,
@@ -2671,20 +2790,10 @@ class PipelineRunner:
         results: list[ExecutionResult],
     ) -> None:
         """Write a CI-like timing view with one row per step execution."""
-        fieldnames = (
-            [
-                "step_id",
-                "execution_id",
-                "repetition",
-                "status",
-                "exit_code",
-                "cache",
-                "execution_time",
-                "materialization_time",
-                "total_time",
-            ]
-            + list(pipeline.matrix)
-        )
+        # Timings retain their framework columns first, as before.
+        dimension_columns = _csv_dimension_columns(pipeline, list(pipeline.matrix))
+        _csv_fieldnames(pipeline, list(pipeline.matrix), TIMING_CSV_COLUMNS)
+        fieldnames = TIMING_CSV_COLUMNS + dimension_columns
         temporary = path.with_name(f".{path.name}.tmp")
         with open(temporary, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -2701,12 +2810,10 @@ class PipelineRunner:
                     "materialization_time": result.materialization_time,
                     "total_time": result.total_time,
                 }
-                row.update({
-                    name: _csv_dimension_value(
-                        pipeline, name, result.dimensions.get(name, ""),
-                    )
-                    for name in pipeline.matrix
-                })
+                row.update(_csv_dimension_row({
+                    name: result.dimensions[name]
+                    for name in pipeline.matrix if name in result.dimensions
+                }))
                 writer.writerow(row)
         os.replace(temporary, path)
 
@@ -2740,25 +2847,9 @@ class PipelineRunner:
             if kind in {None, "number", "integer"}
         ]
         per_repeat_arguments = step.per_repeat_arguments()
-        fieldnames = list(step.dimensions)
-        for name in per_repeat_arguments:
-            fieldnames.extend([
-                f"{name}_start",
-                f"{name}_step",
-                f"{name}_count",
-            ])
-        for name in stats:
-            fieldnames.extend([f"{name}_mean", f"{name}_std"])
-        fieldnames.extend([
-            "n_successful",
-            "n_failed",
-            "n_blocked",
-            "n_skipped",
-            "n_completed",
-            "n_expected",
-            "complete",
-            "execution_id",
-        ])
+        fieldnames = _csv_fieldnames(
+            pipeline, step.dimensions, _summary_csv_columns(step),
+        )
         groups: dict[str, list[ExecutionResult]] = {}
         for result in results:
             groups.setdefault(result.identity, []).append(result)
@@ -2780,12 +2871,10 @@ class PipelineRunner:
                     result for result in results if result.status == "skipped"
                 ]
                 row: dict[str, Any] = {
-                    **{
-                        name: _csv_dimension_value(
-                            pipeline, name, results[0].dimensions[name],
-                        )
+                    **_csv_dimension_row({
+                        name: results[0].dimensions[name]
                         for name in step.dimensions
-                    },
+                    }),
                     "n_successful": len(successful),
                     "n_failed": len(failed),
                     "n_blocked": len(blocked),
