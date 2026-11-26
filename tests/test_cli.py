@@ -22,8 +22,8 @@ def test_run_cpu_affinity_cli_aliases(monkeypatch, affinity_args):
     events = []
 
     class FakeMadBench:
-        def run(self, test, *, dry_run, note):
-            events.append(("run", test, dry_run, note))
+        def run(self, test, *, dry_run, short_note, message):
+            events.append(("run", test, dry_run, short_note, message))
 
     monkeypatch.setattr(driver, "MadBench", FakeMadBench)
     monkeypatch.setattr(
@@ -41,8 +41,48 @@ def test_run_cpu_affinity_cli_aliases(monkeypatch, affinity_args):
 
     assert events == [
         ("affinity", "2,4"),
-        ("run", Path("tests/test.yml"), False, None),
+        ("run", Path("tests/test.yml"), False, None, None),
     ]
+
+
+@pytest.mark.parametrize("message_flag", ["--message", "--note", "--notes"])
+def test_run_annotation_options(monkeypatch, message_flag):
+    calls = []
+
+    class FakeMadBench:
+        def run(self, test, **kwargs):
+            calls.append((test, kwargs))
+
+    monkeypatch.setattr(driver, "MadBench", FakeMadBench)
+    monkeypatch.setattr(sys, "argv", [
+        "madbench", "run", "tests/test.yml", "--short-note", "cuda-baseline",
+        message_flag, "Comparison with the previous release", "--dry-run",
+    ])
+
+    cli.main()
+
+    assert calls == [(Path("tests/test.yml"), {
+        "dry_run": True,
+        "short_note": "cuda-baseline",
+        "message": "Comparison with the previous release",
+    })]
+
+
+@pytest.mark.parametrize("short_note", ["", "two words", "two\twords", "a/b", "a\\b"])
+def test_cli_rejects_invalid_short_note_before_initializing_runner(
+    monkeypatch, capsys, short_note,
+):
+    def unexpected_runner():
+        pytest.fail("An invalid keyword must be rejected before runner initialization")
+
+    monkeypatch.setattr(driver, "MadBench", unexpected_runner)
+    monkeypatch.setattr(sys, "argv", [
+        "madbench", "run", "tests/test.yml", "--short-note", short_note,
+    ])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    assert "--short-note must be a non-empty keyword" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(

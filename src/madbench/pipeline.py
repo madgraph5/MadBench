@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 import yaml
 
+from ._annotations import copy_test_definition, resolve_message, validate_short_note
 from ._logging import MainLog
 from .utils import (
     detect_hardware,
@@ -1359,13 +1360,21 @@ class PipelineRunner:
         *,
         dry_run: bool = False,
         note: Optional[str] = None,
+        short_note: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> None:
+        short_note = validate_short_note(short_note)
+        message = resolve_message(note, message)
         pipeline = self._resolve_matrix_sources(pipeline)
         _validate_csv_view_columns(pipeline)
         expanded = build_step_executions(pipeline)
         matrix_points = build_matrix_points(pipeline)
         if dry_run:
             self._print_dry_run(pipeline, expanded, matrix_points)
+            if short_note is not None:
+                print(f"[madbench] Short note: {short_note}")
+            if message is not None:
+                print(f"[madbench] Message: {message}")
             return
 
         timestamp_base = get_timestamp()
@@ -1373,22 +1382,24 @@ class PipelineRunner:
         software = detect_software_versions()
         hostname = hardware["hostname"]
         timestamp = timestamp_base
+        note_suffix = f"_{short_note}" if short_note is not None else ""
         result_dir = (
-            self.workspace.results_dir / pipeline.name / f"{hostname}_{timestamp}"
+            self.workspace.results_dir / pipeline.name
+            / f"{hostname}_{timestamp}{note_suffix}"
         )
         suffix = 1
         while result_dir.exists():
             timestamp = f"{timestamp_base}_{suffix:02d}"
             result_dir = (
                 self.workspace.results_dir / pipeline.name
-                / f"{hostname}_{timestamp}"
+                / f"{hostname}_{timestamp}{note_suffix}"
             )
             suffix += 1
         log_dir = (
-            self.workspace.logs_dir / pipeline.name / f"{hostname}_{timestamp}"
+            self.workspace.logs_dir / pipeline.name / result_dir.name
         )
         base = self._workdir_base(pipeline)
-        run_dir = base / f"{pipeline.name}_{timestamp}"
+        run_dir = base / f"{pipeline.name}_{timestamp}{note_suffix}"
         staged_dir = run_dir / STAGED_DIR_NAME
         attempt_dir = result_dir / "attempts" / "try_0"
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -1405,14 +1416,14 @@ class PipelineRunner:
         else:
             staged_dir.mkdir(parents=True, exist_ok=True)
         self._validate_labelled_inputs(pipeline, staged_dir)
-        shutil.copyfile(test_yml, result_dir / "test.yml")
+        copy_test_definition(test_yml, result_dir / "test.yml", message=message)
 
         manifest: dict[str, Any] = {
             "schema_version": 1,
             "name": pipeline.name,
             "description": pipeline.description,
             "timestamp": timestamp,
-            "note": note,
+            "note": message,
             "git_sha": get_git_sha(self.workspace.root),
             "hardware": hardware,
             "software": software,
@@ -1427,6 +1438,8 @@ class PipelineRunner:
             }],
             "steps": [],
         }
+        if short_note is not None:
+            manifest["short_note"] = short_note
 
         local_log_dir = run_dir / "logs"
         with MainLog(local_log_dir / "main.log", log_dir / "main.log") as progress:

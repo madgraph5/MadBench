@@ -4,6 +4,16 @@ import argparse
 import sys
 from pathlib import Path
 
+from ._annotations import validate_short_note
+
+
+def _parse_short_note(value: str) -> str:
+    try:
+        validate_short_note(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
 
 def main() -> None:
     """Entrypoint for the ``madbench`` CLI."""
@@ -32,10 +42,19 @@ def main() -> None:
         help="Print commands without executing them",
     )
     run_parser.add_argument(
+        "--message",
         "--note",
+        "--notes",
         type=str,
         default=None,
-        help="Free-form note recorded in metadata.yml for this run",
+        help="Free-form message added to the saved results/test.yml and run metadata",
+    )
+    run_parser.add_argument(
+        "--short-note",
+        type=_parse_short_note,
+        metavar="KEYWORD",
+        default=None,
+        help="Append _KEYWORD to the run folder name (no whitespace or path separators)",
     )
     run_parser.add_argument(
         "-c",
@@ -120,7 +139,10 @@ def _cmd_run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        mb.run(args.test, dry_run=args.dry_run, note=args.note)
+        mb.run(
+            args.test, dry_run=args.dry_run,
+            short_note=args.short_note, message=args.message,
+        )
     except (FileNotFoundError, PermissionError, ValueError) as e:
         print(f"[madbench] Error: {e}", file=sys.stderr)
         sys.exit(1)

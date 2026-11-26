@@ -2020,7 +2020,8 @@ def test_run_inputs_staged_per_version(tmp_path):
 # -----------------------------------------------------------------------
 
 
-def test_run_copies_test_yml_into_result_dir_verbatim(tmp_path):
+@pytest.mark.parametrize("short_note", [None, "baseline"])
+def test_run_copies_test_yml_into_result_dir_verbatim(tmp_path, short_note):
     """The per-run dir gets a byte-for-byte copy of the source test YAML
     so the committed artifacts make it obvious what was run (including any
     per-machine tweaks made before the run)."""
@@ -2039,11 +2040,67 @@ def test_run_copies_test_yml_into_result_dir_verbatim(tmp_path):
         )
     test_file = ws_root / "tests" / "tyml.yml"
     test_file.write_text(yml_body)
-    mb.run(test_file)
+    mb.run(test_file, short_note=short_note)
 
     copied = run_dir(ws_root, "tyml") / "test.yml"
     assert copied.exists()
     assert copied.read_text() == yml_body  # byte-for-byte, including comment
+
+
+@pytest.mark.parametrize("message_option", ["message", "note"])
+def test_run_saves_message_and_short_note(tmp_path, message_option):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    mb = MadBench(find_workspace(ws_root))
+    # Flow-style YAML and an explicit document ending must remain valid.
+    original = (
+        '# original comment\n'
+        '{name: annotated, script: hello.sh, args: {}, message: old}\n...\n'
+    )
+    test_file = ws_root / "tests" / "test.yml"
+    test_file.write_text(original)
+    message = 'Comparison: "old" vs new\nUnicode: café; # literal text\n'
+    mb.run(test_file, short_note="cuda_baseline", **{message_option: message})
+
+    rd = run_dir(ws_root, "annotated")
+    assert rd.name.endswith("_cuda_baseline")
+    assert (ws_root / "logs" / "annotated" / rd.name).is_dir()
+    assert test_file.read_text() == original
+    saved = yaml.safe_load((rd / "test.yml").read_text())
+    assert saved == {**yaml.safe_load(original), "message": message}
+    meta = yaml.safe_load((rd / "try_0" / "try.yml").read_text())
+    assert meta["note"] == message
+    assert meta["short_note"] == "cuda_baseline"
+
+
+@pytest.mark.parametrize("short_note", [
+    "", "two words", "two\twords", "two\nwords", "a\u00a0b", "a/b", "a\\b",
+    "a\x00b", "a\x1bb", "a\x7fb",
+])
+def test_run_rejects_invalid_short_note_without_side_effects(tmp_path, short_note):
+    ws_root = make_workspace(tmp_path)
+    mb = MadBench(find_workspace(ws_root))
+    with pytest.raises(ValueError, match="--short-note"):
+        mb.run(ws_root / "tests" / "missing.yml", short_note=short_note)
+    for directory in ["results", "logs", "scratch"]:
+        assert list((ws_root / directory).iterdir()) == []
+
+
+def test_annotated_dry_run_has_no_side_effects(tmp_path, capsys):
+    ws_root = make_workspace(tmp_path)
+    make_script(ws_root)
+    test_file = make_test_yaml(ws_root, {
+        "name": "preview", "script": "hello.sh", "args": {},
+    })
+    original = test_file.read_bytes()
+    mb = MadBench(find_workspace(ws_root))
+    mb.run(test_file, dry_run=True, short_note="baseline", message="Long message")
+    output = capsys.readouterr().out
+    assert "_baseline" in output
+    assert "Long message" in output
+    assert test_file.read_bytes() == original
+    for directory in ["results", "logs", "scratch"]:
+        assert list((ws_root / directory).iterdir()) == []
 
 
 def test_run_metadata_yml_points_at_sibling_test_yml(tmp_path):
@@ -2160,6 +2217,37 @@ def test_retry_reruns_only_failed_combos_with_preserved_ids(tmp_path):
     assert cells[rep_idx] == "01"
     assert cells[exit_idx] == "0"
     assert cells[x_idx] == "2"
+
+
+def test_retry_preserves_short_note_message_and_scratch_directory(tmp_path, monkeypatch):
+    import madbench.driver as driver_module
+
+    ws_root = make_workspace(tmp_path)
+    _make_flaky_script(ws_root, fail_when="2")
+    mb = MadBench(find_workspace(ws_root))
+    test_file = make_test_yaml(ws_root, {
+        "name": "annotated_retry", "script": "hello.sh", "args": {"x": [1, 2]},
+    })
+    # A timestamp-like keyword must not be mistaken for the original timestamp.
+    monkeypatch.setattr(driver_module, "get_timestamp", lambda: "20261126T120000")
+    short_note = "trial_20250101T010101"
+    mb.run(test_file, short_note=short_note, message="Retry this comparison")
+    rd = run_dir(ws_root, "annotated_retry")
+    saved = (rd / "test.yml").read_bytes()
+    first_meta = yaml.safe_load((rd / "try_0" / "try.yml").read_text())
+    test_file.unlink()  # The saved definition is sufficient for retries.
+    make_script(ws_root)
+    monkeypatch.setattr(driver_module, "get_timestamp", lambda: "20261126T130000")
+
+    mb.retry(rd)
+
+    retry_meta = yaml.safe_load((rd / "try_1" / "try.yml").read_text())
+    assert retry_meta["run_dirs"] == first_meta["run_dirs"]
+    assert retry_meta["short_note"] == short_note
+    assert retry_meta["note"] == "Retry this comparison"
+    assert (rd / "test.yml").read_bytes() == saved
+    assert (ws_root / "logs" / "annotated_retry" / rd.name / "try_1").is_dir()
+    assert not (rd / "try_1" / "failed.yml").exists()
 
 
 def test_retry_preserves_effective_per_repeat_argument_without_double_step(

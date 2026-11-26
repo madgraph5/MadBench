@@ -872,6 +872,91 @@ def test_dry_run_reports_inferred_execution_counts(tmp_path, capsys):
     assert "error" not in listed[0]
 
 
+@pytest.mark.parametrize("message_option", ["message", "note"])
+def test_pipeline_saves_message_and_short_note(tmp_path, message_option):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "exit 0\n")
+    raw = {
+        "name": "annotated",
+        "message": "original message",
+        "steps": [{"id": "run", "script": "run.sh"}],
+    }
+    path = make_pipeline(root, raw)
+    original = path.read_bytes()
+    message = "Performance comparison: version A vs B.\nUnicode: café; # not a comment"
+    runner = PipelineRunner(find_workspace(root))
+    runner.run(
+        parse_pipeline(raw, source=str(path)), path,
+        short_note="cuda_baseline", **{message_option: message},
+    )
+
+    result_dir = only_result_dir(root, "annotated")
+    assert result_dir.name.endswith("_cuda_baseline")
+    assert (root / "logs" / "annotated" / result_dir.name / "main.log").is_file()
+    saved = yaml.safe_load((result_dir / "test.yml").read_text())
+    assert saved == {**raw, "message": message}
+    assert path.read_bytes() == original
+    report = json.loads((result_dir / "report.json").read_text())
+    assert report["note"] == message
+    assert report["short_note"] == "cuda_baseline"
+    assert set(yaml.safe_load((result_dir / "metadata.yml").read_text())) == {
+        "hardware", "software",
+    }
+
+
+def test_pipeline_short_note_collision_keeps_distinct_workdirs(tmp_path, monkeypatch):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "exit 0\n")
+    raw = {
+        "name": "annotated",
+        "steps": [{"id": "run", "script": "run.sh"}],
+    }
+    path = make_pipeline(root, raw)
+    path.write_text("# Retain this comment\n" + path.read_text())
+    monkeypatch.setattr("madbench.pipeline.get_timestamp", lambda: "20261126T120000")
+    runner = PipelineRunner(find_workspace(root))
+    definition = parse_pipeline(raw, source=str(path))
+    for short_note in [None, "baseline", "baseline", "candidate"]:
+        runner.run(definition, path, short_note=short_note)
+
+    result_dirs = sorted((root / "results" / "annotated").iterdir())
+    assert len(result_dirs) == 4
+    reports = [json.loads((directory / "report.json").read_text()) for directory in result_dirs]
+    hostname = reports[0]["hardware"]["hostname"]
+    assert {directory.name for directory in result_dirs} == {
+        f"{hostname}_20261126T120000",
+        f"{hostname}_20261126T120000_baseline",
+        f"{hostname}_20261126T120000_01_baseline",
+        f"{hostname}_20261126T120000_candidate",
+    }
+    assert len({report["steps"][0]["workdir"] for report in reports}) == 4
+    for directory in result_dirs:
+        assert (directory / "test.yml").read_bytes() == path.read_bytes()
+        assert (root / "logs" / "annotated" / directory.name / "main.log").exists()
+
+
+def test_pipeline_annotation_dry_run_has_no_side_effects(tmp_path, capsys):
+    root = make_workspace(tmp_path)
+    make_script(root, "run.sh", "exit 0\n")
+    raw = {"name": "annotated", "steps": [{"id": "run", "script": "run.sh"}]}
+    path = make_pipeline(root, raw)
+    original = path.read_bytes()
+    runner = PipelineRunner(find_workspace(root))
+    definition = parse_pipeline(raw, source=str(path))
+    runner.run(
+        definition, path, dry_run=True,
+        short_note="baseline", message="A detailed message",
+    )
+    output = capsys.readouterr().out
+    assert "Short note: baseline" in output
+    assert "Message: A detailed message" in output
+    with pytest.raises(ValueError, match="short.note"):
+        runner.run(definition, path, dry_run=True, short_note="two words")
+    assert path.read_bytes() == original
+    for name in ["results", "logs", "scratch"]:
+        assert list((root / name).iterdir()) == []
+
+
 def test_pipeline_reports_live_progress_and_writes_logs_outside_results(
     tmp_path, capsys,
 ):

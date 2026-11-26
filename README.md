@@ -268,6 +268,29 @@ Use `madbench run TEST.yml --dry-run` to inspect the global matrix size,
 inferred dimensions, execution count, repetitions, dependencies, and cache
 configuration before running anything.
 
+## Run notes
+
+Use a short keyword to identify a run's folders and a message to explain it:
+
+```bash
+madbench run tests/test.yml --short-note baseline \
+  --message "Baseline measurement with the default compiler settings."
+```
+
+- `--short-note KEYWORD` appends `_KEYWORD` to the results and retained-log
+  folder names, for example
+  `results/<test>/<hostname>_<timestamp>_baseline/`. The keyword must be
+  nonempty and cannot contain whitespace, path separators (`/` or `\`), or
+  control characters.
+- `--message TEXT` adds a top-level `message` field to the saved
+  `results/.../test.yml`. Spaces and multiline text are allowed. `--note`
+  and `--notes` are aliases for `--message`; the message is also retained
+  in the existing `note` field in pipeline reports or legacy try metadata.
+
+These options work independently for both pipelines and legacy tests.
+The source test YAML is unchanged. Without a message, the saved `test.yml`
+is copied verbatim; adding a message may change its formatting and comments.
+
 ## CPU affinity
 
 On Linux, a run can be pinned to selected logical CPUs with either CLI form:

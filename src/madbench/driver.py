@@ -28,6 +28,7 @@ from .workspace import (
     stage_inputs,
 )
 from ._logging import MainLog, bundle_logs, publish_logs
+from ._annotations import copy_test_definition, resolve_message, validate_short_note
 from .results import append_row, select_results_csv
 from .pipeline import PipelineDefinition, PipelineRunner, parse_pipeline
 
@@ -392,8 +393,16 @@ class MadBench:
         test_path: Path,
         dry_run: bool = False,
         note: Optional[str] = None,
+        *,
+        short_note: Optional[str] = None,
+        message: Optional[str] = None,
     ) -> None:
-        """Main entry point. Loads the test, builds commands, runs them."""
+        """Run a test with an optional folder keyword and saved YAML message.
+
+        ``note`` is the backward-compatible alias for ``message``.
+        """
+        validate_short_note(short_note)
+        message = resolve_message(note, message)
         test = self.load_test(test_path)
         test_yml_abs = (
             test_path if test_path.is_absolute() else Path.cwd() / test_path
@@ -403,7 +412,8 @@ class MadBench:
                 test,
                 test_yml_abs,
                 dry_run=dry_run,
-                note=note,
+                short_note=short_note,
+                message=message,
             )
             return
         script_path = resolve_script(self.workspace, test.script)
@@ -444,9 +454,10 @@ class MadBench:
         commands = [unit.cmd for unit in units]
 
         timestamp = get_timestamp()
+        run_stamp = timestamp if short_note is None else f"{timestamp}_{short_note}"
         workdir_base = self._resolve_workdir(test)
         run_dirs = {
-            mgv: self._version_run_dir(workdir_base, test.name, timestamp, mgv)
+            mgv: self._version_run_dir(workdir_base, test.name, run_stamp, mgv)
             for mgv in test.mg_version
         }
 
@@ -456,10 +467,10 @@ class MadBench:
         hostname = hardware["hostname"]
 
         result_dir = (
-            self.workspace.results_dir / test.name / f"{hostname}_{timestamp}"
+            self.workspace.results_dir / test.name / f"{hostname}_{run_stamp}"
         )
         run_log_dir = (
-            self.workspace.logs_dir / test.name / f"{hostname}_{timestamp}"
+            self.workspace.logs_dir / test.name / f"{hostname}_{run_stamp}"
         )
 
         metadata: dict[str, Any] = {
@@ -477,8 +488,10 @@ class MadBench:
             "result_dir": str(result_dir),
             "dry_run": dry_run,
         }
-        if note is not None:
-            metadata["note"] = note
+        if message is not None:
+            metadata["note"] = message
+        if short_note is not None:
+            metadata["short_note"] = short_note
 
         if dry_run:
             self._print_dry_run(test, script_path, run_dirs, result_dir, commands, metadata)
@@ -598,12 +611,22 @@ class MadBench:
         git_sha = get_git_sha(self.workspace.root)
         hostname = hardware["hostname"]
 
-        # The scratch dir is keyed off the *original* host/ts (from the
-        # result dir name) so reps land back at the same workdir as the
-        # original — even if the scratch tree was wiped, it gets rebuilt
+        # The scratch dir is keyed off the original timestamp and keyword
+        # so reps land back at the same workdir as the original — even if
+        # the scratch tree was wiped, it gets rebuilt
         # under the same path so artifacts/inputs/processes are
         # self-contained.
-        _, scratch_ts = self._parse_host_ts(result_dir)
+        inherited_short_note = self._read_original_annotation(result_dir, "short_note")
+        original_dir = result_dir
+        if inherited_short_note is not None:
+            validate_short_note(inherited_short_note)
+            suffix = f"_{inherited_short_note}"
+            if not result_dir.name.endswith(suffix):
+                raise ValueError("Result directory does not end with its recorded short note")
+            original_dir = result_dir.with_name(result_dir.name[:-len(suffix)])
+        _, scratch_ts = self._parse_host_ts(original_dir)
+        if inherited_short_note is not None:
+            scratch_ts = f"{scratch_ts}_{inherited_short_note}"
         workdir_base = self._resolve_workdir(test)
         run_dirs = {
             mgv: self._version_run_dir(workdir_base, test.name, scratch_ts, mgv)
@@ -642,9 +665,11 @@ class MadBench:
         # self-describing without having to chase the chain back. ``retry``
         # does not expose its own --note: the retried jobs are the same
         # jobs, so a fresh note would not mean anything new.
-        inherited_note = self._read_original_note(result_dir)
+        inherited_note = self._read_original_annotation(result_dir, "note")
         if inherited_note is not None:
             metadata["note"] = inherited_note
+        if inherited_short_note is not None:
+            metadata["short_note"] = inherited_short_note
 
         self._execute_units(
             test=test,
@@ -1015,8 +1040,8 @@ class MadBench:
         return row
 
     @staticmethod
-    def _read_original_note(result_dir: Path) -> Optional[str]:
-        """Return the ``note`` field from ``try_0/try.yml`` if any.
+    def _read_original_annotation(result_dir: Path, field: str) -> Optional[str]:
+        """Return a run annotation from ``try_0/try.yml`` if any.
 
         Used by ``retry`` so the carried note never blocks a retry when the
         original predates this field.
@@ -1030,8 +1055,8 @@ class MadBench:
             data = _yaml.safe_load(meta_path.read_text()) or {}
         except _yaml.YAMLError:
             return None
-        note = data.get("note") if isinstance(data, dict) else None
-        return note if isinstance(note, str) else None
+        value = data.get(field) if isinstance(data, dict) else None
+        return value if isinstance(value, str) else None
 
     @staticmethod
     def _find_latest_try_n(result_dir: Path) -> int:
@@ -1263,13 +1288,14 @@ class MadBench:
         try_dir: Path,
         retry_of: Optional[str] = None,
         note: Optional[str] = None,
+        short_note: Optional[str] = None,
     ) -> Path:
         """Write ``try.yml`` into ``try_dir`` (``result_dir/try_N/``).
 
         Each ``try_N/try.yml`` snapshots the environment that produced
         *that try's* CSV. The hostname lives once inside ``hardware`` (we
         don't duplicate it at the top), and ``repeat`` lives inside the
-        verbatim ``test.yml`` at the result_dir root so we don't
+        saved ``test.yml`` at the result_dir root so we don't
         duplicate it here either.
 
         ``retry_of`` (when set) records the *relative* path of the
@@ -1298,6 +1324,8 @@ class MadBench:
             run_meta["retry_of"] = retry_of
         if note is not None:
             run_meta["note"] = note
+        if short_note is not None:
+            run_meta["short_note"] = short_note
         try_dir.mkdir(parents=True, exist_ok=True)
         path = try_dir / "try.yml"
         path.write_text(
@@ -1474,13 +1502,15 @@ class MadBench:
         # Prepare per-version run dirs + inputs + processes (once per
         # version actually exercised by this set of units).
         result_dir.mkdir(parents=True, exist_ok=True)
-        # Drop a verbatim copy of the test YAML at the *top* of the result
+        # Save the test YAML and optional message at the *top* of the result
         # dir so all tries share one canonical reference. ``retry()`` reads
         # it back to rebuild the TestDefinition. Only copy on the first try
         # — subsequent retries inherit the original snapshot.
         top_test_yml = result_dir / "test.yml"
         if not top_test_yml.exists():
-            shutil.copyfile(test_yml_source, top_test_yml)
+            copy_test_definition(
+                test_yml_source, top_test_yml, message=metadata.get("note"),
+            )
         # Make the machine metadata inspectable in results before staging,
         # process generation, or any benchmark subprocess begins. At the end
         # of the try this is rebuilt with the completed try in its group.
@@ -1790,6 +1820,7 @@ class MadBench:
                 test, timestamp, git_sha, hardware, software,
                 run_dirs, try_dir, retry_of=retry_of,
                 note=metadata.get("note"),
+                short_note=metadata.get("short_note"),
             )
             metadata["try_yml_path"] = str(try_yml_path)
             # ``metadata.yml`` at the result_dir top is the per-run

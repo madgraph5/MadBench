@@ -12,6 +12,23 @@ madbench run tests/<name>.yml --dry-run
 madbench run tests/<name>.yml
 ```
 
+To label the run's folders and save a longer explanation:
+
+```bash
+madbench run tests/<name>.yml --short-note baseline \
+  --message "Baseline measurement with the default compiler settings."
+```
+
+`--short-note baseline` appends `_baseline` to the results and retained-log
+folder names, such as `results/<name>/<hostname>_<timestamp>_baseline/`.
+The keyword must be nonempty and contain no whitespace, path separators
+(`/` or `\`), or control characters. `--message` saves free-form text as
+the top-level `message` field in the result folder's `test.yml` and as
+`note` in pipeline reports or legacy try metadata. `--note` and `--notes`
+are aliases for `--message`. Both options work independently for pipelines
+and legacy tests. The source YAML is unchanged; the saved copy preserves
+formatting and comments unless a message is supplied.
+
 ## Workspace layout
 
 ```text
